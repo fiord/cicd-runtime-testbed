@@ -14,6 +14,28 @@
 #   その場所を custom-rule-file に明示的に渡す。live モードと同じ
 #   ルールセットで比較できるようにするため。
 #
+#   なぜ falco-version が 0.39.2 か: analyze action は使用イメージを
+#   `IMAGE="falcosecurity/falco-no-driver"` にハードコードしている
+#   (falco-actions/analyze/action.yaml)。このイメージは Docker Hub 上の
+#   数値バージョンタグの最大が `0.39.2` で止まっている (latest の最終 push も
+#   2024-11-21 で、事実上メンテナンスが止まっている)。falco 本体イメージ
+#   (falcosecurity/falco) は 0.44.1 まであるが、falco-actions はそちらを
+#   使わないためこのテストベッドから利用する手段が無い。以前は
+#   `falco-version: "0.43.0"` を指定していたが、これは
+#   `required_engine_version: 0.43.0` (falco_cicd_rules.yaml のルールエンジン
+#   バージョン宣言、Falco のリリースバージョンとは別系統) を Falco の
+#   リリース番号と取り違えた仕様策定時の誤りであり、実在しないタグを指定して
+#   `manifest unknown` (exit 125) で失敗していた。
+#
+#   さらに重要な点: `0.39.2` に直しても、`custom-rule-file` で渡す
+#   falco_cicd_rules.yaml 自体が `required_engine_version: 0.43.0` を宣言して
+#   いるため、falco エンジン 0.39.2 がこのルールファイルをロード時に拒否する
+#   (または警告のみで通す) 可能性がある。つまり「falco-actions は、自身の
+#   同梱 CI/CD ルールが要求するエンジンバージョンを満たすイメージを pull
+#   できない可能性が高い」という仮説が成り立つ。"Analyze capture" ステップに
+#   `continue-on-error: true` を付けて実際の成否を観測し、job summary と
+#   docs/RESULTS-TEMPLATE.md に記録する (下記ステップ参照)。
+#
 # 安全性 (docs/SPEC.md §1-6):
 #   falco-actions の stop action (analyze モード) は capture.scap を
 #   無条件に "capture" という名前のアーティファクトとしてアップロードする
@@ -225,11 +247,102 @@ jobs:
           ref: 558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: must match the same commit used for the uses: pins above, see README
           path: _falco-actions-src
 
+      - name: "Preflight: falcosecurity/falco-no-driver:0.39.2 タグの実在確認"
+        # analyze action もイメージを falcosecurity/falco-no-driver に
+        # ハードコードしている (falco-actions/analyze/action.yaml)。存在しない
+        # タグを指定すると action の奥深くで `docker: ... manifest unknown` と
+        # exit 125 になり原因がわかりにくい (今回報告された障害そのもの)。
+        # ここで先に Docker Hub のタグ API を叩いて実在を確認し、無ければ
+        # ここで明確に落とす。ネットワーク障害や rate limit で preflight 自体が
+        # 失敗した場合は、テストの可用性を落とさないよう警告のみで続行する。
+        shell: bash
+        env:
+          FALCO_VERSION: "0.39.2"
+        run: |
+          set -uo pipefail
+          API_URL="https://hub.docker.com/v2/repositories/falcosecurity/falco-no-driver/tags?page_size=100&ordering=last_updated"
+          RESPONSE_FILE="$(mktemp)"
+          HTTP_CODE="$(curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' --max-time 20 "$API_URL" 2>/dev/null)"
+          CURL_EXIT=$?
+          HTTP_CODE="${HTTP_CODE:-000}"
+
+          if [ "$CURL_EXIT" -ne 0 ] || [ "$HTTP_CODE" != "200" ]; then
+            echo "::warning title=falco-no-driver tag preflight skipped::Docker Hub API (${API_URL}) への接続に失敗しました (curl exit=${CURL_EXIT}, HTTP ${HTTP_CODE})。ネットワーク障害または rate limit の可能性があるため、preflight をスキップしてワークフローを続行します。falco-version=${FALCO_VERSION} が実在しない場合、後続のステップが manifest not found で失敗する可能性があります。"
+            {
+              echo "### preflight: falcosecurity/falco-no-driver:${FALCO_VERSION} (skipped)"
+              echo ""
+              echo "Docker Hub API への接続に失敗しました (curl exit=${CURL_EXIT}, HTTP ${HTTP_CODE})。"
+              echo "ネットワーク障害または rate limit の可能性があるため、確認をスキップして続行しました。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          python3 - "$FALCO_VERSION" "$RESPONSE_FILE" "$GITHUB_STEP_SUMMARY" <<'PYEOF'
+          import json
+          import re
+          import sys
+
+          falco_version, response_file, summary_file = sys.argv[1], sys.argv[2], sys.argv[3]
+
+          try:
+              with open(response_file, encoding="utf-8") as f:
+                  data = json.load(f)
+              results = data.get("results", [])
+              if not isinstance(results, list):
+                  raise ValueError("results is not a list")
+              tag_map = {t["name"]: t for t in results if isinstance(t, dict) and "name" in t}
+          except Exception as e:
+              msg = (
+                  f"Docker Hub API のレスポンス解析に失敗しました ({e})。"
+                  f"確認をスキップして続行します。"
+              )
+              print(f"::warning title=falco-no-driver tag preflight skipped::{msg}")
+              with open(summary_file, "a", encoding="utf-8") as s:
+                  s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version} (skipped)\n\n")
+                  s.write(f"{msg}\n")
+              sys.exit(0)
+
+          semver_re = re.compile(r"^\d+\.\d+\.\d+$")
+          numeric_tags = sorted(
+              (name for name in tag_map if semver_re.match(name)),
+              key=lambda v: [int(p) for p in v.split(".")],
+          )
+
+          if falco_version in tag_map:
+              tag = tag_map[falco_version]
+              last_pushed = tag.get("tag_last_pushed") or tag.get("last_updated") or "unknown"
+              print(f"preflight OK: falcosecurity/falco-no-driver:{falco_version} exists (tag_last_pushed={last_pushed})")
+              with open(summary_file, "a", encoding="utf-8") as s:
+                  s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version}\n\n")
+                  s.write(f"- Docker Hub にタグが実在することを確認しました。\n")
+                  s.write(f"- 最終 push (`tag_last_pushed`): `{last_pushed}`\n\n")
+              sys.exit(0)
+          else:
+              available = ", ".join(numeric_tags) if numeric_tags else "(取得できたページ内に数値タグが見つかりませんでした)"
+              msg = (
+                  f"falcosecurity/falco-no-driver:{falco_version} は Docker Hub に存在しません "
+                  f"(manifest unknown になります)。利用可能な数値タグ: {available}"
+              )
+              print(f"::error title=falco-no-driver tag not found::{msg}")
+              with open(summary_file, "a", encoding="utf-8") as s:
+                  s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version} (NOT FOUND)\n\n")
+                  s.write(f"- タグが存在しません。利用可能な数値タグ: {available}\n\n")
+              sys.exit(1)
+          PYEOF
+
       - name: Analyze capture
         id: analyze
+        # falco_cicd_rules.yaml (required_engine_version: 0.43.0) を
+        # falco-version: 0.39.2 (falco-no-driver で確認できる最新版) に
+        # 読ませる。0.39.2 < 0.43.0 のため、falco がルールファイルの
+        # ロードを拒否する可能性がある。continue-on-error はその「拒否」の
+        # 実際の挙動 (起動失敗/警告のみで動く等) を観測するためのもので、
+        # ジョブ全体を落とさない (下の "Record required_engine_version
+        # hypothesis outcome" ステップで結果を記録する)。
+        continue-on-error: true
         uses: falcosecurity/falco-actions/analyze@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README
         with:
-          falco-version: "0.43.0" # matches required_engine_version of the CI/CD rule file below
+          falco-version: "0.39.2" # falcosecurity/falco-no-driver の実際の上限 (メンテナンス終了)。ファイル冒頭のコメント参照
           # 明示的に渡さないと CI/CD 特化ルールが一切ロードされないため必須。
           # 絶対パスにしているのは、analyze action がこの値を
           # `docker run -v $CUSTOM_RULE_FILE:/etc/falco/rules.d/custom_rules.yaml`
@@ -246,6 +359,47 @@ jobs:
           extract-chisels: true
           extract-hashes: true
           verbose: true
+
+      - name: "Record required_engine_version hypothesis outcome (T1 中核観測)"
+        # falco_cicd_rules.yaml (required_engine_version: 0.43.0) を、
+        # falco-actions が実際に使える上限バージョン (falco-version: 0.39.2)
+        # のエンジンに読ませた結果を記録する。「falco-actions は自身の同梱
+        # CI/CD ルールが要求するエンジンバージョンを満たすイメージを pull
+        # できない可能性が高い」という仮説の検証データ。ロード成功/拒否/
+        # 警告のみのいずれだったかは "Analyze capture" ステップの生ログ
+        # (verbose: true) を目視確認する必要がある (falco の起動出力は
+        # ワークフロー側からファイルとして回収できないため)。ここでは
+        # ステップの outcome と、生成された telemetry の有無を手がかりとして
+        # job summary に残す。
+        if: always()
+        run: |
+          set -uo pipefail
+          PROC_HAS_CONTENT="unknown"
+          if [ -s /tmp/proc.txt ]; then
+            PROC_HAS_CONTENT="yes (/tmp/proc.txt is non-empty)"
+          elif [ -f /tmp/proc.txt ]; then
+            PROC_HAS_CONTENT="no (/tmp/proc.txt exists but is empty)"
+          else
+            PROC_HAS_CONTENT="no (/tmp/proc.txt was not created)"
+          fi
+          {
+            echo ""
+            echo "## required_engine_version 0.43.0 vs falco 0.39.2 (T1 中核観測)"
+            echo ""
+            echo "- falco-actions 同梱の CI/CD ルール (rules/falco_cicd_rules.yaml) の"
+            echo "  \`required_engine_version\`: \`0.43.0\`"
+            echo "- 実際に使ったエンジン (falco-version): \`0.39.2\`"
+            echo "  (falcosecurity/falco-no-driver で確認できる事実上の上限)"
+            echo "- \`Analyze capture\` ステップの outcome: \`${{ steps.analyze.outcome }}\`"
+            echo "- 傍証: sysdig capture から抽出された \`/tmp/proc.txt\` の有無: ${PROC_HAS_CONTENT}"
+            echo "  (falco 自体が起動・ルール評価を完了していれば、通常はここが"
+            echo "  空でなくなるはず。空、またはステップ自体が failure の場合は"
+            echo "  required_engine_version による拒否を疑う根拠になる)"
+            echo ""
+            echo "**要手動確認**: \`Analyze capture\` ステップの生ログ (verbose 出力) に"
+            echo "\`required_engine_version\` / \`engine version\` に関する記述が無いか確認し、"
+            echo "docs/RESULTS-TEMPLATE.md の該当欄 (ロード成功 / 拒否 / 警告のみで通過) を埋めること。"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Collect telemetry (T2)
         if: always()

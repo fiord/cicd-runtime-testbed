@@ -68,7 +68,7 @@
 
 | ワークフロー | 生成する telemetry アーティファクト | 検証目的 |
 | --- | --- | --- |
-| `falco-live.yml` | `telemetry-falco-live-0.39.0`, `telemetry-falco-live-0.43.0` | T1 (live 検知)、engine-version 不整合の実害確認 |
+| `falco-live.yml` | `telemetry-falco-live-0.39.0`, `telemetry-falco-live-0.39.2` | T1 (live 検知)、engine-version 不整合の実害確認 (falcosecurity/falco-no-driver の公開停止により `0.39.2` が事実上の上限。`0.43.0` は指定できない) |
 | `falco-analyze.yml` | `telemetry-falco-analyze` | T1 (analyze 検知)、T2 (抽出情報の網羅確認) |
 | `sensor-monitor.yml` | `telemetry-cicd-sensor-monitor` | T1 (検知、kill なし)、T2 |
 | `sensor-enforce.yml` | `telemetry-cicd-sensor-enforce` (+ `assert` ジョブの成否が T1 の kill 判定そのもの) | T1 (kill) |

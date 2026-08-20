@@ -43,6 +43,18 @@ webhook.site のような「送った内容を見せてくれる」サービス�
 変えないこと。特に「もう少しリアルにしたいから」という理由で実在のドメインや
 社内 webhook サービスに向けないこと。
 
+**補足 (preflight の Docker Hub API 呼び出しについて)**: `falco-live.yml` /
+`falco-analyze.yml` は、falco-actions の action を呼ぶ前に
+`https://hub.docker.com/v2/repositories/falcosecurity/falco-no-driver/tags`
+を叩く preflight ステップを持つ。これは検知シナリオが送信する「テスト対象の
+通信」ではなく、ワークフロー自身が使う Docker イメージのタグが実在するかを
+確認する**インフラ確認**であり、上記の「通信先は `example.com` /
+`*.test.invalid` に限定する」という制約の対象外として扱う。カナリア値・
+シークレット・シナリオ由来のデータは一切この API 呼び出しに含まれない
+(送るのは falco-version 文字列の照合のみ)。preflight が失敗 (ネットワーク
+障害・rate limit 等) しても、警告を出すだけでワークフローの実行自体は継続する
+(preflight がテストの可用性を下げないため)。
+
 ## 3. 実在の IOC を踏まない
 
 **やること**: cicd-sensor の `ioc.yaml` にある実際の悪性ドメイン・IP はテストに

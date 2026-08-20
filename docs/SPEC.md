@@ -424,8 +424,8 @@ CEL の制約に注意:
 
 | ワークフロー | runs-on | 目的 | 特記事項 |
 | --- | --- | --- | --- |
-| `falco-live.yml` | `ubuntu-latest` | falco live モードでの検知 | `falco-version` を `0.39.0` と `0.43.0` の matrix にし、**ルールの `required_engine_version: 0.43.0` との不整合が実際に問題になるかを確認**する。`fail-fast: false` |
-| `falco-analyze.yml` | `ubuntu-latest` | falco analyze モードでの検知と生キャプチャ | `custom-rule-file` に CI/CD ルールを**明示的に渡す**（渡さないと効かないため）。`upload_raw_capture` 入力で scap のアップロードを制御（既定 `false`）。**ジョブを停止するガードは置かない**（§1-6）。public リポジトリで実行された場合は、`capture.scap` に何が入りうるかを `::warning::` と job summary で告知する情報提供ステップのみを置く |
+| `falco-live.yml` | `ubuntu-latest` | falco live モードでの検知 | `falco-version` を `0.39.0` と `0.39.2` の matrix にする。**falcosecurity/falco-no-driver イメージ (falco-actions がハードコードして使う) は Docker Hub 上の数値タグが `0.39.2` で公開停止しているため、`required_engine_version: 0.43.0` を満たすバージョンはそもそも指定できない。** 各ジョブは falco-actions を呼ぶ前に Docker Hub のタグ API を叩く preflight ステップでタグの実在を確認し、`0.39.x` エンジンが `required_engine_version: 0.43.0` のルールを実際にロードできたか/拒否したか/警告のみで通ったかを観測する。`fail-fast: false`（ただし preflight 自体がタグ不在で失敗した場合はそのジョブを fail-fast させてよい。原因が明確なため） |
+| `falco-analyze.yml` | `ubuntu-latest` | falco analyze モードでの検知と生キャプチャ | `custom-rule-file` に CI/CD ルールを**明示的に渡す**（渡さないと効かないため）。`falco-version` は `0.39.2`（falcosecurity/falco-no-driver の実際の上限。理由は上記と同じ）。`analyze` ジョブは falco-actions/analyze を呼ぶ前に同様の preflight ステップでタグの実在を確認する。`upload_raw_capture` 入力で scap のアップロードを制御（既定 `false`）。**ジョブを停止するガードは置かない**（§1-6）。public リポジトリで実行された場合は、`capture.scap` に何が入りうるかを `::warning::` と job summary で告知する情報提供ステップのみを置く |
 | `sensor-monitor.yml` | `ubuntu-24.04` | cicd-sensor の検知（kill なし） | `monitor_mode: true`。全シナリオを実行 |
 | `sensor-enforce.yml` | `ubuntu-24.04` | cicd-sensor の kill 動作 | `monitor_mode: false`。§5 の 2 ジョブ構成 |
 | `leak-scan.yml` | `ubuntu-latest` | 漏洩マトリクスの生成 | 入力で対象 run_id を受け取り、その run のアーティファクトを DL して走査 |
