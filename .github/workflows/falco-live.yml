@@ -1,0 +1,144 @@
+# .github/workflows/falco-live.yml
+#
+# 検証目的 (docs/SPEC.md T1 / §8):
+#   falco-actions の live モードで、cicd-runtime-testbed の検知シナリオ
+#   (scenarios/00〜06) を実行した際に何が検知されるかを確認する。
+#
+#   さらに、falco-actions が同梱する CI/CD ルール
+#   (falcosecurity/falco-actions の rules/falco_cicd_rules.yaml) は先頭に
+#   `required_engine_version: 0.43.0` を宣言している。このワークフローは
+#   `falco-version` を 0.39.0 / 0.43.0 の matrix にして、この
+#   required_engine_version の宣言と実際に使う falco エンジンのバージョンが
+#   食い違った場合に「実際に問題が起きるのか」(ルールが黙って無効化される/
+#   起動が失敗する/警告のみで動く、等)を実地で確認する。fail-fast は無効化し、
+#   片方の falco-version が失敗してももう片方の結果を必ず得られるようにする。
+#
+#   custom-rule-file は指定しない: start action の `cicd-rules` 入力は
+#   デフォルト true であり、live モードでは falco-actions 同梱の CI/CD
+#   ルールセットが自動的にマウントされる (falco-actions/start/action.yaml
+#   参照)。ここではその「デフォルト動作」をそのまま検証する。
+#
+# トリガーは workflow_dispatch のみ。public repo で push / PR に反応して
+# 不用意に起動しないようにするため (docs/SPEC.md §8)。
+
+name: "falco-live: detection scenarios (live mode, engine-version matrix)"
+
+on:
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  live:
+    name: "live / falco ${{ matrix.falco-version }}"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # falco-actions の stop action (live モード) は、Falco イベントを
+      # ジョブの各ステップに対応付けるため GitHub API (jobs) を呼ぶ。
+      # README の注記: "actions: read permission is used to contact a
+      # Github endpoint to perform a best-effort correlation".
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        falco-version: ["0.39.0", "0.43.0"]
+    steps:
+      - name: Checkout cicd-runtime-testbed
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start Falco (live mode)
+        id: start_falco
+        # required_engine_version との不整合が実際に何を起こすかを
+        # このワークフローで確認したいので、起動失敗そのものでジョブ全体を
+        # 落とさない。後続ステップは falco が起動していなくても実行され、
+        # 「検知されなかった」という結果自体が観測データになる。
+        continue-on-error: true
+        uses: falcosecurity/falco-actions/start@PIN_ME_SEE_README # UNPINNED: falco-actions has no git tags, see README
+        with:
+          mode: live
+          falco-version: ${{ matrix.falco-version }}
+          verbose: true
+
+      - name: Run detection scenarios
+        shell: bash
+        env:
+          # docs/SPEC.md §3: CANARY_ENV のみ GitHub Secrets 経由。
+          # Secret 未設定でも scenarios/lib/common.sh の load_canaries が
+          # フォールバックしてくれる (README 参照)。
+          CANARY_ENV: ${{ secrets.CANARY_ENV }}
+        run: |
+          set -uo pipefail
+          echo "::group::00-seed"
+          bash scenarios/00-seed.sh
+          echo "::endgroup::"
+
+          echo "::group::01-credential-access"
+          bash scenarios/01-credential-access.sh
+          echo "::endgroup::"
+
+          echo "::group::02-exfil"
+          bash scenarios/02-exfil.sh
+          echo "::endgroup::"
+
+          echo "::group::03-npm-postinstall"
+          npm install --no-audit --no-fund ./scenarios/03-npm-postinstall || true
+          echo "::endgroup::"
+
+          echo "::group::04-persistence"
+          bash scenarios/04-persistence.sh
+          echo "::endgroup::"
+
+          echo "::group::05-memfd-exec"
+          bash scenarios/05-memfd-exec.sh
+          echo "::endgroup::"
+
+          echo "::group::06-anti-forensics"
+          bash scenarios/06-anti-forensics.sh
+          echo "::endgroup::"
+
+      - name: Stop Falco (live mode) and build job summary
+        if: always()
+        uses: falcosecurity/falco-actions/stop@PIN_ME_SEE_README # UNPINNED: falco-actions has no git tags, see README
+        with:
+          mode: live
+          verbose: true
+
+      - name: Record engine-version matrix outcome in job summary
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "## falco-live matrix note"
+            echo "- \`falco-version\`: \`${{ matrix.falco-version }}\`"
+            echo "- required_engine_version of the bundled CI/CD rules: \`0.43.0\`"
+            echo "- \`Start Falco\` step outcome: \`${{ steps.start_falco.outcome }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect telemetry (T2)
+        if: always()
+        run: |
+          mkdir -p telemetry
+          if [ -f "$GITHUB_STEP_SUMMARY" ]; then
+            cp "$GITHUB_STEP_SUMMARY" telemetry/job-summary.md
+          fi
+          # falco-actions の stop action (live mode) はこのファイルを
+          # アーティファクトとしてアップロードしない。手元に残っていれば
+          # 自分たちで回収する ("可能なら" 収集する、docs/SPEC.md §6)。
+          if [ -f /tmp/falco_events.json ]; then
+            cp /tmp/falco_events.json telemetry/falco_events.json
+          fi
+          # scenarios/lib/common.sh が書く実行ログ。仕様必須ではないが、
+          # 検知結果の突き合わせに有用なため追加で回収する。
+          if [ -n "${RUNNER_TEMP:-}" ] && [ -f "${RUNNER_TEMP}/cicd-runtime-testbed-log.jsonl" ]; then
+            cp "${RUNNER_TEMP}/cicd-runtime-testbed-log.jsonl" telemetry/testbed-log.jsonl
+          fi
+
+      - name: Upload telemetry-falco-live-${{ matrix.falco-version }}
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-falco-live-${{ matrix.falco-version }}
+          path: telemetry/
+          if-no-files-found: warn
+          retention-days: 1

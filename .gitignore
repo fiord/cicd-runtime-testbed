@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# スキャナの出力（実行のたびに生成される。コミットしない）
+leak-report.json
+leak-matrix.md
+
+# シナリオ実行時のローカル生成物
+scenarios/**/node_modules/
+package-lock.json
+
+# エディタ / OS
+.DS_Store
+*.swp

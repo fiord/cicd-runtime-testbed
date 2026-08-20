@@ -1,0 +1,21 @@
+# .cicd-sensor/config.yaml
+#
+# 用途:
+#   cicd-runtime-testbed の project-local cicd-sensor 設定 (standalone
+#   モード)。docs/user-guide/github-hosted.md の config.yaml スキーマに
+#   従う。
+#
+# 安全性:
+#   コミットされる既定値は安全側に倒し、`monitor_mode: true`
+#   (terminate ルールを detect として扱う) にしている。
+#
+# 重要 (docs/SPEC.md 5節):
+#   config.yaml は1つしか置けないため、monitor_mode の切り替えは
+#   ワークフロー側 (sensor-monitor.yml / sensor-enforce.yml。担当外) が
+#   実行時にこのファイルを書き換える方式を取る。
+#     - sensor-monitor.yml: monitor_mode: true のまま (検知のみ)
+#     - sensor-enforce.yml: monitor_mode: false に書き換えて実行 (kill テスト)
+#   このリポジトリにコミットされている値は sensor-monitor.yml 相当の
+#   安全な既定値である。
+monitor_mode: true
+default_max_alerts_per_rule: 50

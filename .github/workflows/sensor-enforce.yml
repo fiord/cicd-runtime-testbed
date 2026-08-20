@@ -1,0 +1,225 @@
+# .github/workflows/sensor-enforce.yml
+#
+# 検証目的 (docs/SPEC.md T1 / §5 / §8):
+#   cicd-sensor を `monitor_mode: false` で動かし、
+#   .cicd-sensor/rules/testbed.yaml の `testbed_kill_marker` ルール
+#   (action: terminate) が実際にプロセスを kill するかどうかを確認する。
+#   scenarios/90-killme.sh は kill 発火専用で、このワークフローからのみ
+#   呼び出す (docs/SPEC.md §4)。
+#
+# ============================================================================
+# 重要 (README にも明記): このワークフローだけは「成功が正常」である。
+# 他の 4 本 (falco-live / falco-analyze / sensor-monitor / leak-scan) は
+# 検知結果を集めること自体が目的で、赤くなっても異常ではない。
+# しかし sensor-enforce.yml は「kill が実際に起きること」を検証するための
+# ワークフローなので、assert ジョブが成功 = kill が確認できた = 正常、
+# assert ジョブが失敗 = kill されなかった = 異常、という意味になる。
+# ============================================================================
+#
+# ジョブ構成 (docs/SPEC.md §5 のとおり2ジョブ):
+#   enforce: 90-killme.sh を実行する。continue-on-error を付け、
+#            (期待どおり kill された場合の) 失敗でワークフロー全体を
+#            赤くしない。
+#   assert:  enforce の結果を判定する。
+#
+# 実装上の重要な注意 (SPEC からの意図的な逸脱、README にも記載):
+#   docs/SPEC.md §5 は判定に `needs.enforce.result` を使うと書いているが、
+#   GitHub Actions にはジョブレベルの `continue-on-error: true` を使うと
+#   `needs.<job>.result` が実際の失敗結果に関わらず常に "success" を返す
+#   という既知の制限がある
+#   (https://github.com/actions/toolkit/issues/1739)。
+#   これをそのまま実装すると、90-killme.sh が実際に kill されても
+#   assert 側では判定不能になり、このワークフローの目的そのものが
+#   壊れる。そのため本実装では:
+#     - 90-killme.sh を実行するステップ自体に "ステップレベルの"
+#       continue-on-error を付け、`steps.killme.outcome` (continue-on-error
+#       の影響を受けない、本来の成否) を enforce ジョブの output として
+#       公開する。
+#     - REACHED_AFTER_KILLME の有無も同じステップの出力を grep して
+#       output 化する。
+#     - assert ジョブはこの2つの output を判定に使う。
+#   これは SPEC §5 が意図する判定ロジック (enforce の失敗 + ログに
+#   REACHED_AFTER_KILLME が出ていないこと) と等価であり、GitHub Actions の
+#   上記の制限を回避するための実装上の置き換えである。
+
+name: "sensor-enforce: cicd-sensor kill test (monitor_mode: false) — success is expected"
+
+on:
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  enforce:
+    name: "enforce (expected to be killed)"
+    runs-on: ubuntu-24.04
+    # docs/SPEC.md §5: enforce ジョブに continue-on-error: true を付け、
+    # 90-killme.sh が kill されてジョブが失敗しても、ワークフロー全体の
+    # 成否には影響させない (最終判定は assert ジョブが行なう)。
+    continue-on-error: true
+    permissions:
+      contents: read
+    outputs:
+      killme_outcome: ${{ steps.killme.outcome }}
+      reached_after_killme: ${{ steps.check_reached.outputs.reached }}
+    steps:
+      - name: Checkout cicd-runtime-testbed
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set monitor_mode false in .cicd-sensor/config.yaml
+        run: |
+          cat > .cicd-sensor/config.yaml <<'EOF'
+          monitor_mode: false
+          default_max_alerts_per_rule: 50
+          EOF
+          echo "-- .cicd-sensor/config.yaml --"
+          cat .cicd-sensor/config.yaml
+
+      - name: Install cicd-sensorctl
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # NOTE (未検証・要確認): falco-live.yml / sensor-monitor.yml と同じ
+          # 命名規則の推定に基づく。README 参照。
+          mkdir -p "${RUNNER_TEMP}/cicd-sensorctl"
+          if gh release download v0.0.38 \
+              --repo cicd-sensor/cicd-sensor \
+              --pattern "cicd-sensor_*_linux_amd64.tar.gz" \
+              --dir "${RUNNER_TEMP}/cicd-sensorctl"; then
+            tar -xzf "${RUNNER_TEMP}"/cicd-sensorctl/cicd-sensor_*_linux_amd64.tar.gz -C "${RUNNER_TEMP}/cicd-sensorctl"
+            sudo install -m 0755 "${RUNNER_TEMP}/cicd-sensorctl/cicd-sensorctl-linux-amd64" /usr/local/bin/cicd-sensorctl
+            cicd-sensorctl version || true
+          else
+            echo "::warning::failed to download cicd-sensorctl (see README: install method is unverified). Skipping rule validation."
+          fi
+
+      - name: Validate .cicd-sensor/rules
+        run: |
+          if command -v cicd-sensorctl >/dev/null 2>&1; then
+            cicd-sensorctl rule validate .cicd-sensor/rules
+          else
+            echo "::warning::cicd-sensorctl not available; rule validation skipped"
+          fi
+
+      - name: Start cicd-sensor (standalone mode)
+        uses: cicd-sensor/cicd-sensor-action@6511eb44c91d71b2b93d71193b1bf2cb18352f66 # v0.0.38
+
+      - name: Run kill-trigger scenario (90-killme.sh)
+        id: killme
+        # ステップレベルの continue-on-error: killed されて非ゼロ終了しても
+        # このジョブの後続ステップ (check_reached, テレメトリ収集) を
+        # 実行し続けるため。ジョブレベルの continue-on-error だけに頼ると
+        # steps.killme.outcome を使えなくなる (このステップが実行されない)
+        # ので、両方が必要。
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          bash scenarios/90-killme.sh 2>&1 | tee "${RUNNER_TEMP}/killme-output.log"
+
+      - name: Check for REACHED_AFTER_KILLME
+        id: check_reached
+        if: always()
+        run: |
+          if [ -f "${RUNNER_TEMP}/killme-output.log" ] && grep -q "REACHED_AFTER_KILLME" "${RUNNER_TEMP}/killme-output.log"; then
+            echo "REACHED_AFTER_KILLME was observed: the process was NOT killed"
+            echo "reached=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "REACHED_AFTER_KILLME was not observed"
+            echo "reached=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Record outcome in job summary
+        if: always()
+        run: |
+          {
+            echo "## sensor-enforce: kill-trigger step result"
+            echo "- \`killme\` step outcome: \`${{ steps.killme.outcome }}\`"
+            echo "- REACHED_AFTER_KILLME observed: \`${{ steps.check_reached.outputs.reached }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  assert:
+    name: "assert (this job succeeding is the expected result)"
+    needs: enforce
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Verify the kill-trigger process was terminated
+        run: |
+          set -uo pipefail
+          outcome="${{ needs.enforce.outputs.killme_outcome }}"
+          reached="${{ needs.enforce.outputs.reached_after_killme }}"
+
+          echo "killme step outcome: ${outcome}"
+          echo "REACHED_AFTER_KILLME observed: ${reached}"
+
+          fail=0
+
+          # docs/SPEC.md §5: needs.enforce.result が failure/cancelled で
+          # あることが kill された証拠。上記コメントのとおり
+          # needs.<job>.result の代わりに steps.killme.outcome を使う。
+          if [ "${outcome}" != "failure" ] && [ "${outcome}" != "cancelled" ]; then
+            echo "::error::killme step outcome is '${outcome}', expected 'failure' or 'cancelled' — the process does not appear to have been terminated"
+            fail=1
+          fi
+
+          if [ "${reached}" != "false" ]; then
+            echo "::error::REACHED_AFTER_KILLME was observed (or could not be determined) — the process continued running after the point it should have been killed"
+            fail=1
+          fi
+
+          if [ "${fail}" -ne 0 ]; then
+            echo "::error::sensor-enforce assertion FAILED: cicd-sensor did not terminate the kill-trigger process as expected. This is the ONE workflow in this repo where success is the normal outcome and failure indicates a problem."
+            exit 1
+          fi
+
+          echo "OK: the kill-trigger process was terminated before reaching REACHED_AFTER_KILLME."
+
+  collect-telemetry:
+    name: "collect telemetry (T2)"
+    needs: [enforce, assert]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Download cicd-sensor-report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: cicd-sensor-report
+          path: telemetry/cicd-sensor-report
+
+      - name: Download cicd-sensor-attestation
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: cicd-sensor-attestation
+          path: telemetry/cicd-sensor-attestation
+
+      - name: Upload telemetry-cicd-sensor-enforce
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-cicd-sensor-enforce
+          path: telemetry/
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Enforce artifact retention (delete original cicd-sensor-report / cicd-sensor-attestation)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          for name in cicd-sensor-report cicd-sensor-attestation; do
+            id=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?name=${name}" \
+              --jq '.artifacts[0].id // empty' || true)
+            if [ -n "${id}" ]; then
+              echo "Deleting artifact '${name}' (id=${id})"
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/${id}" || \
+                echo "::warning::failed to delete artifact '${name}' (id=${id}); delete it manually"
+            else
+              echo "Artifact '${name}' not found; nothing to delete"
+            fi
+          done

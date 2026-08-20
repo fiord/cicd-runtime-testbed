@@ -1,0 +1,304 @@
+# .github/workflows/falco-analyze.yml
+#
+# 検証目的 (docs/SPEC.md T1 / T2 / §8):
+#   falco-actions の analyze モードで、検知シナリオ実行中の syscall を
+#   sysdig capture (capture.scap) に記録し、falco の replay エンジンで
+#   後から解析した際に何が検知・抽出されるかを確認する。
+#
+#   analyze action の `custom-rule-file` は明示的に渡さない限り
+#   falco-actions 同梱の CI/CD ルールセットを一切ロードしない
+#   (start action の live モードだけが `cicd-rules: true` で自動ロードする
+#   ため、analyze action には対応する自動ロード機構が存在しない)。
+#   このワークフローは falcosecurity/falco-actions リポジトリ本体
+#   (rules/falco_cicd_rules.yaml) を pin 済み ref でチェックアウトし、
+#   その場所を custom-rule-file に明示的に渡す。live モードと同じ
+#   ルールセットで比較できるようにするため。
+#
+# 安全性 (docs/SPEC.md §1-6):
+#   falco-actions の stop action (analyze モード) は capture.scap を
+#   無条件に "capture" という名前のアーティファクトとしてアップロードする
+#   (falco-actions のコードにハードコードされており、抑止する入力は無い。
+#   元リポジトリは変更しないため、この動作自体は変えられない)。
+#   このワークフローは、それを埋め合わせるため:
+#     1. workflow_dispatch 入力 `upload_raw_capture` が true のときだけ、
+#        capture.scap を自分たち自身のアーティファクト
+#        (telemetry-falco-analyze, retention-days: 1) に含める。
+#     2. capture.scap を含む "capture" アーティファクト (falco-actions が
+#        アップロードしたもの) と "hashes" アーティファクトは、telemetry
+#        アーティファクトの作成後に GitHub API で必ず削除する。
+#   この「アップロード後にすぐ削除する」方式には、削除が完了するまでの
+#   数秒〜数十秒程度、GitHub 上でアーティファクトが一覧に載る短い時間差が
+#   存在する。元アクションを改変できない制約下での緩和策であり、完全な
+#   「既定でアップロードしない」と同一ではないことを README / SAFETY.md に
+#   明記している。
+#
+# ============================================================================
+# public リポジトリでの実行について
+# ============================================================================
+#   結論: public リポジトリで実行してよい。upload_raw_capture の値に
+#   かかわらずジョブを停止するガードは存在しない (以前のバージョンには
+#   あったが、過剰と判断して撤去した)。
+#
+#   根拠 (このリポジトリの現状に依存する。下の「再評価が必要な条件」も
+#   参照すること):
+#     1. capture.scap に入りうるカナリア値はすべて偽物で、リポジトリに
+#        コミット済み。公開されても失うものがない (docs/SAFETY.md 1節)。
+#     2. このワークフローが実際に持つ本物の認証情報は次の2つだけ:
+#        - GITHUB_TOKEN: 宣言している権限は `contents: read` のみ。
+#          public リポジトリではこれは「誰でも読み取れる情報」に対する
+#          権限に過ぎず、しかもジョブ完了時に失効する。
+#        - ACTIONS_RUNTIME_TOKEN: run 中のみ有効な内部トークン。悪用の
+#          本命経路は actions/cache への汚染だが、このリポジトリは
+#          actions/cache を使っていないため、その経路自体が存在しない。
+#     3. `id-token: write` を宣言していないため、
+#        ACTIONS_ID_TOKEN_REQUEST_TOKEN は存在しない。
+#     4. 残るリスクは「このテストリポジトリ自身のアーティファクトを
+#        他人が上書きできるかもしれない」程度であり、T3 (capture.scap
+#        から実際に何が漏れるかを自分の目で確かめる) の検証価値の
+#        ほうが上回る。
+#
+#   このワークフローは T3 (secret が漏れないか) の検証で「実際に
+#   capture.scap から漏れること」を観測するために存在する。つまり
+#   漏洩を再現するのが目的であり、漏洩して当然の作りである。上記の
+#   根拠により、その観測を public リポジトリで行なってよい。
+#
+#   再評価が必要な条件 (次のいずれかが起きたら、この判断を見直すこと):
+#     - リポジトリに本物の secret を追加した場合
+#     - `contents: write` や `id-token: write` を宣言した場合
+#     - `actions/cache` を使い始めた場合
+#
+#   下の "Notice: raw capture exposure on a public repository" ステップは
+#   ジョブを停止せず、public リポジトリで実行されたときに capture.scap へ
+#   具体的に何が入りうるかを警告注釈と job summary に書くだけの情報提供
+#   ステップである。
+# ============================================================================
+
+name: "falco-analyze: detection scenarios (analyze mode, capture.scap)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_raw_capture:
+        description: >-
+          true にすると capture.scap (生の syscall キャプチャ) を
+          telemetry-falco-analyze アーティファクトに含める。
+          T3 の「capture.scap から実際に漏れること」を観測するには true が必要。
+          public repo では retention-days: 1 の間、誰でもダウンロードできる
+          状態になる (このリポジトリのカナリアはすべて偽物で、実在する
+          トークンは失効済み GITHUB_TOKEN と run 中限定の
+          ACTIONS_RUNTIME_TOKEN のみ。詳細はこのファイル冒頭のコメントを
+          参照)。既定は false。public repo でも true にできるが、
+          常時 true にする運用は避けること。
+        type: boolean
+        required: false
+        default: false
+
+permissions: {}
+
+jobs:
+  record:
+    name: "record (sysdig capture)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # public リポジトリで capture.scap に何が入りうるかを知らせるだけの
+      # 情報提供ステップ。ジョブは停止しない (冒頭のコメントブロックを参照)。
+      - name: "Notice: raw capture exposure on a public repository"
+        shell: bash
+        env:
+          IS_PRIVATE: ${{ github.event.repository.private }}
+          UPLOAD_RAW: ${{ inputs.upload_raw_capture }}
+        run: |
+          set -uo pipefail
+
+          if [ "$IS_PRIVATE" = "true" ]; then
+            echo "private リポジトリで実行中。"
+            exit 0
+          fi
+
+          echo "::warning title=public リポジトリで analyze モードを実行中::falco-actions の stop action は capture.scap を無条件にアップロードする (削除するまでの数秒〜数十秒は誰でもダウンロード可能)。upload_raw_capture=${UPLOAD_RAW} の場合、telemetry-falco-analyze にも retention-days: 1 の間含まれる。詳細は job summary を参照。"
+
+          {
+            echo "## ℹ️ public リポジトリで analyze モードを実行しています"
+            echo
+            echo "\`upload_raw_capture: ${UPLOAD_RAW}\` で実行されました。ジョブは停止しません"
+            echo "(このワークフローの目的は、public リポジトリで capture.scap に何が入るかを"
+            echo "実際に観測することそのものです)。"
+            echo
+            echo "### この run の capture.scap に入りうるもの"
+            echo
+            echo "- \`falco-actions\` の stop action (analyze モード) は capture.scap を"
+            echo "  無条件に \`capture\` という名前のアーティファクトとしてアップロードする。"
+            echo "  このワークフローはアップロード後すぐに GitHub API で削除するが、削除完了"
+            echo "  までの数秒〜数十秒は public リポジトリで誰でもダウンロードできる。"
+            echo "- \`upload_raw_capture: true\` の場合、capture.scap は"
+            echo "  \`telemetry-falco-analyze\` として \`retention-days: 1\` の間、継続的に"
+            echo "  ダウンロード可能になる。"
+            echo "- capture.scap は snaplen 256 の生 syscall キャプチャで、カナリア値"
+            echo "  (\`CANARY_SCAP\` など。すべて \`CNRY-\` プレフィックスの偽物でリポジトリに"
+            echo "  コミット済み) がそのまま混入する想定。"
+            echo
+            echo "### この run に実在する認証情報 (2つのみ) と、その実効的な価値"
+            echo
+            echo "| トークン | 宣言権限 / 有効範囲 | 失効タイミング | 悪用の本命経路 |"
+            echo "| --- | --- | --- | --- |"
+            echo "| \`GITHUB_TOKEN\` | \`contents: read\` のみ (このリポジトリの permissions 宣言)。public repo では誰でも同じ読み取りができる情報への権限に過ぎない | ジョブ完了時に失効 | (該当なし。write 系権限を宣言していない) |"
+            echo "| \`ACTIONS_RUNTIME_TOKEN\` | run 中のみ有効な内部トークン | run 終了時 | \`actions/cache\` への汚染が本命だが、このリポジトリは \`actions/cache\` を使っていないためその経路は存在しない |"
+            echo
+            echo "\`id-token: write\` を宣言していないため \`ACTIONS_ID_TOKEN_REQUEST_TOKEN\`"
+            echo "は存在しない。"
+            echo
+            echo "**この評価はこのリポジトリの現状に依存する。** リポジトリに本物の secret を"
+            echo "追加した場合、\`contents: write\` / \`id-token: write\` を宣言した場合、"
+            echo "\`actions/cache\` を使い始めた場合は、この判断を再評価すること"
+            echo "(詳細は docs/SAFETY.md 6節 / このファイル冒頭のコメント)。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Checkout cicd-runtime-testbed
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start Falco (analyze mode / sysdig capture)
+        uses: falcosecurity/falco-actions/start@PIN_ME_SEE_README # UNPINNED: falco-actions has no git tags, see README
+        with:
+          mode: analyze
+          verbose: true
+
+      - name: Run detection scenarios
+        shell: bash
+        env:
+          CANARY_ENV: ${{ secrets.CANARY_ENV }}
+        run: |
+          set -uo pipefail
+          echo "::group::00-seed"
+          bash scenarios/00-seed.sh
+          echo "::endgroup::"
+
+          echo "::group::01-credential-access"
+          bash scenarios/01-credential-access.sh
+          echo "::endgroup::"
+
+          echo "::group::02-exfil"
+          bash scenarios/02-exfil.sh
+          echo "::endgroup::"
+
+          echo "::group::03-npm-postinstall"
+          npm install --no-audit --no-fund ./scenarios/03-npm-postinstall || true
+          echo "::endgroup::"
+
+          echo "::group::04-persistence"
+          bash scenarios/04-persistence.sh
+          echo "::endgroup::"
+
+          echo "::group::05-memfd-exec"
+          bash scenarios/05-memfd-exec.sh
+          echo "::endgroup::"
+
+          echo "::group::06-anti-forensics"
+          bash scenarios/06-anti-forensics.sh
+          echo "::endgroup::"
+
+      - name: Stop Falco (analyze mode) — uploads capture.scap + hashes
+        if: always()
+        uses: falcosecurity/falco-actions/stop@PIN_ME_SEE_README # UNPINNED: falco-actions has no git tags, see README
+        with:
+          mode: analyze
+          verbose: true
+
+  analyze:
+    name: "analyze (falco replay)"
+    needs: record
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # analyze action の "Retrieve Job Info using GitHub API" ステップが
+      # jobs API を呼ぶため read が必要。write にしているのは、このジョブの
+      # 最終ステップ (Enforce artifact retention) が "capture" / "hashes"
+      # アーティファクトを削除するため (write は read を包含する)。
+      actions: write
+    steps:
+      - name: Checkout falco-actions (for its bundled CI/CD rule file)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: falcosecurity/falco-actions
+          ref: PIN_ME_SEE_README # UNPINNED: must match the same commit used for the uses: pins above, see README
+          path: _falco-actions-src
+
+      - name: Analyze capture
+        id: analyze
+        uses: falcosecurity/falco-actions/analyze@PIN_ME_SEE_README # UNPINNED: falco-actions has no git tags, see README
+        with:
+          falco-version: "0.43.0" # matches required_engine_version of the CI/CD rule file below
+          # 明示的に渡さないと CI/CD 特化ルールが一切ロードされないため必須。
+          # 絶対パスにしているのは、analyze action がこの値を
+          # `docker run -v $CUSTOM_RULE_FILE:/etc/falco/rules.d/custom_rules.yaml`
+          # にそのまま使うため。相対パスを渡すと Docker が名前付きボリューム
+          # として解釈してしまう既知の落とし穴があるため避ける。
+          custom-rule-file: ${{ github.workspace }}/_falco-actions-src/rules/falco_cicd_rules.yaml
+          # T2 (何が取得・閲覧できるか) を確認するため、抽出できる情報は
+          # すべて有効化する。
+          extract-connections: true
+          extract-processes: true
+          extract-dns: true
+          extract-containers: true
+          extract-written-files: true
+          extract-chisels: true
+          extract-hashes: true
+          verbose: true
+
+      - name: Collect telemetry (T2)
+        if: always()
+        run: |
+          mkdir -p telemetry
+          if [ -f "$GITHUB_STEP_SUMMARY" ]; then
+            cp "$GITHUB_STEP_SUMMARY" telemetry/job-summary.md
+          fi
+          for f in hashes.txt outbound.txt proc.txt files_written.txt \
+                   dns_extract_json.txt containers.txt udp_extract.txt \
+                   top_connection.txt topprocs_net.txt; do
+            if [ -f "/tmp/${f}" ]; then
+              cp "/tmp/${f}" "telemetry/${f}"
+            fi
+          done
+          if [ "${{ inputs.upload_raw_capture }}" = "true" ] && [ -f /tmp/capture.scap ]; then
+            echo "upload_raw_capture=true: including raw capture.scap in telemetry-falco-analyze"
+            cp /tmp/capture.scap telemetry/capture.scap
+          else
+            echo "upload_raw_capture=false (default): raw capture.scap is not included (docs/SPEC.md §1-6)"
+          fi
+
+      - name: Upload telemetry-falco-analyze
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-falco-analyze
+          path: telemetry/
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Enforce artifact retention (delete raw "capture" / "hashes" uploaded by falco-actions)
+        # falco-actions/stop (analyze mode) uploads "capture" (capture.scap)
+        # and "hashes" unconditionally, with no retention-days override and
+        # no way to suppress the upload from our side (see the workflow
+        # header comment). We already folded the information we want to
+        # keep into telemetry-falco-analyze (retention-days: 1, and only
+        # containing capture.scap when upload_raw_capture=true), so the
+        # originals are deleted here to minimize retention/exposure
+        # (docs/SPEC.md §1-5, §1-6).
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          for name in capture hashes; do
+            id=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?name=${name}" \
+              --jq '.artifacts[0].id // empty' || true)
+            if [ -n "${id}" ]; then
+              echo "Deleting artifact '${name}' (id=${id}) uploaded by falco-actions/stop"
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/${id}" || \
+                echo "::warning::failed to delete artifact '${name}' (id=${id}); delete it manually"
+            else
+              echo "Artifact '${name}' not found (already absent or upload failed); nothing to delete"
+            fi
+          done

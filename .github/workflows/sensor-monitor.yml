@@ -1,0 +1,179 @@
+# .github/workflows/sensor-monitor.yml
+#
+# 検証目的 (docs/SPEC.md T1 / T2 / §8):
+#   cicd-sensor を GitHub-hosted standalone モード (Manager なし) で動かし、
+#   `monitor_mode: true` (docs/SPEC.md §5) の状態で検知シナリオ
+#   (scenarios/00〜07) を実行した際に、何が検知され、どんな成果物
+#   (HTML レポート / attestation predicate) が得られるかを確認する。
+#   `monitor_mode: true` なので .cicd-sensor/rules/testbed.yaml の
+#   `action: terminate` ルールも `detect` として扱われ、プロセスは
+#   kill されない (kill の検証は sensor-enforce.yml が担当する)。
+#
+#   scenarios/07-rule-markers.sh は、レビューで見つかった仕様の穴
+#   (testbed_detect_marker / testbed_collect_marker ルールを発火させる
+#   シナリオが存在せず、死んだルールになっていた) を塞ぐために追加した。
+#   これにより detect / collect (このワークフロー) と terminate
+#   (sensor-enforce.yml の 90-killme.sh) の3アクションすべてが
+#   実地検証できる。
+#
+#   .cicd-sensor/config.yaml はリポジトリに 1 つしか置けないため、
+#   monitor_mode の切り替えはワークフロー側で実行時に上書きする
+#   (docs/SPEC.md §5)。config.yaml を書き換えるにはリポジトリの
+#   チェックアウトが必要なため、cicd-sensor-action は
+#   「actions/checkout より前に置ける」という一般的な推奨位置ではなく、
+#   checkout と config.yaml 書き換えの後に配置している。そのため
+#   checkout ステップ自体は cicd-sensor の監視対象に含まれない
+#   (README に明記)。
+
+name: "sensor-monitor: cicd-sensor detection scenarios (monitor_mode: true)"
+
+on:
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  monitor:
+    name: "monitor (no kill)"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout cicd-runtime-testbed
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set monitor_mode true in .cicd-sensor/config.yaml
+        run: |
+          cat > .cicd-sensor/config.yaml <<'EOF'
+          monitor_mode: true
+          default_max_alerts_per_rule: 50
+          EOF
+          echo "-- .cicd-sensor/config.yaml --"
+          cat .cicd-sensor/config.yaml
+
+      - name: Install cicd-sensorctl
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # NOTE (未検証・要確認): cicd-sensor/docs/user-guide/self-hosted-install.md
+          # に記載の命名規則 (cicd-sensor_<version>_linux_<arch>.tar.gz、中に
+          # cicd-sensorctl-linux-<arch>) に基づく。バージョンは
+          # cicd-sensor-action の pin (v0.0.38, README 参照) に合わせた。
+          # cicd-sensor/cicd-sensor のリリース一覧を実際に確認できていないため、
+          # 実行前にこのステップが動くことを確認すること (README 参照)。
+          mkdir -p "${RUNNER_TEMP}/cicd-sensorctl"
+          if gh release download v0.0.38 \
+              --repo cicd-sensor/cicd-sensor \
+              --pattern "cicd-sensor_*_linux_amd64.tar.gz" \
+              --dir "${RUNNER_TEMP}/cicd-sensorctl"; then
+            tar -xzf "${RUNNER_TEMP}"/cicd-sensorctl/cicd-sensor_*_linux_amd64.tar.gz -C "${RUNNER_TEMP}/cicd-sensorctl"
+            sudo install -m 0755 "${RUNNER_TEMP}/cicd-sensorctl/cicd-sensorctl-linux-amd64" /usr/local/bin/cicd-sensorctl
+            cicd-sensorctl version || true
+          else
+            echo "::warning::failed to download cicd-sensorctl (see README: install method is unverified). Skipping rule validation."
+          fi
+
+      - name: Validate .cicd-sensor/rules
+        run: |
+          if command -v cicd-sensorctl >/dev/null 2>&1; then
+            cicd-sensorctl rule validate .cicd-sensor/rules
+          else
+            echo "::warning::cicd-sensorctl not available; rule validation skipped"
+          fi
+
+      - name: Start cicd-sensor (standalone mode)
+        uses: cicd-sensor/cicd-sensor-action@6511eb44c91d71b2b93d71193b1bf2cb18352f66 # v0.0.38
+
+      - name: Run detection scenarios
+        shell: bash
+        env:
+          CANARY_ENV: ${{ secrets.CANARY_ENV }}
+        run: |
+          set -uo pipefail
+          echo "::group::00-seed"
+          bash scenarios/00-seed.sh
+          echo "::endgroup::"
+
+          echo "::group::01-credential-access"
+          bash scenarios/01-credential-access.sh
+          echo "::endgroup::"
+
+          echo "::group::02-exfil"
+          bash scenarios/02-exfil.sh
+          echo "::endgroup::"
+
+          echo "::group::03-npm-postinstall"
+          npm install --no-audit --no-fund ./scenarios/03-npm-postinstall || true
+          echo "::endgroup::"
+
+          echo "::group::04-persistence"
+          bash scenarios/04-persistence.sh
+          echo "::endgroup::"
+
+          echo "::group::05-memfd-exec"
+          bash scenarios/05-memfd-exec.sh
+          echo "::endgroup::"
+
+          echo "::group::06-anti-forensics"
+          bash scenarios/06-anti-forensics.sh
+          echo "::endgroup::"
+
+          echo "::group::07-rule-markers"
+          bash scenarios/07-rule-markers.sh
+          echo "::endgroup::"
+
+  collect-telemetry:
+    name: "collect telemetry (T2)"
+    needs: monitor
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # cicd-sensor-report / cicd-sensor-attestation (monitor ジョブが
+      # アップロードした, retention 未指定のアーティファクト) を回収し、
+      # retention-days: 1 の telemetry-cicd-sensor-monitor に詰め直したうえで
+      # 元のアーティファクトを削除するため write が必要。
+      actions: write
+    steps:
+      - name: Download cicd-sensor-report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: cicd-sensor-report
+          path: telemetry/cicd-sensor-report
+
+      - name: Download cicd-sensor-attestation
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: cicd-sensor-attestation
+          path: telemetry/cicd-sensor-attestation
+
+      - name: Upload telemetry-cicd-sensor-monitor
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-cicd-sensor-monitor
+          path: telemetry/
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Enforce artifact retention (delete original cicd-sensor-report / cicd-sensor-attestation)
+        # cicd-sensor-action uploads these itself with no retention-days
+        # override we control (docs/SPEC.md §1-5 requires retention-days: 1
+        # everywhere). We keep our own copy above and delete the originals.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          for name in cicd-sensor-report cicd-sensor-attestation; do
+            id=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?name=${name}" \
+              --jq '.artifacts[0].id // empty' || true)
+            if [ -n "${id}" ]; then
+              echo "Deleting artifact '${name}' (id=${id})"
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/${id}" || \
+                echo "::warning::failed to delete artifact '${name}' (id=${id}); delete it manually"
+            else
+              echo "Artifact '${name}' not found; nothing to delete"
+            fi
+          done

@@ -1,0 +1,107 @@
+# .cicd-sensor/rules/testbed.yaml
+#
+# 用途:
+#   cicd-runtime-testbed 専用の kill / detect / collect 発火ルール
+#   (docs/SPEC.md 5節)。実在の IOC は一切使わない。テストベッドの
+#   シナリオが書き込む専用マーカーファイルにのみ反応する、自己完結した
+#   テスト用ルールセット。
+#
+# 安全性:
+#   このルールセットは cicd-runtime-testbed リポジトリのシナリオが
+#   自ら作るマーカーファイルのパスにしか一致しない。実在の悪性
+#   ドメイン・IP・攻撃者インフラは参照しない。
+#
+# CEL の制約 (docs/user-guide/rule-cel-conditions.md を確認して実装。
+# フィールド名は docs/user-guide/rule-event-types.md にあるもののみ使用):
+#   - 正規表現・添字アクセス・算術は使えない。ここでは `endsWith` と
+#     `&&` のみを使用。
+#   - `rule_sets:` と `rule_modifiers:` は同一 YAML ドキュメントに
+#     同居できないため、このファイルには rule_sets のみを書く。
+#
+# `description` フィールドについて:
+#   docs/user-guide/rule-set.md の "Event rule fields" 表には
+#   `description` が載っていないが、これはドキュメント側の記載漏れであり、
+#   `description` は正式なフィールドである。根拠:
+#     - cicd-sensor 本体のベースラインルールが全て使用している
+#       (rules/testevent.yaml, rules/generic-tracking-escape.yaml,
+#        rules/generic-execution.yaml ほか)
+#     - .claude/rules/30-cel-rules.md が「Write the description as
+#       multi-line What: / Why: / Notes: blocks using the YAML `|` block
+#       scalar. The agent UI preserves the newlines.」と、description を
+#       書くことと、その書式を明示的に要求している
+#     - description を含む状態で `cicd-sensorctl rule validate` が
+#       `OK: 1 file(s) bundled and validated` を返すことを実機で確認済み
+#   description はエージェント UI とレポートに表示されるため、
+#   コメントではなくフィールドとして書く。
+#
+# 期待される検知内容:
+#   - testbed_kill_marker: scenarios/90-killme.sh が書く
+#     cicd-sensor-killme.marker への書き込みで発火し、action: terminate。
+#     sensor-enforce.yml (monitor_mode: false) ではプロセスが実際に
+#     kill される想定。sensor-monitor.yml (monitor_mode: true) では
+#     terminate は detect として扱われる。
+#   - testbed_detect_marker / testbed_collect_marker: detect / collect
+#     アクションを個別に確認するための自己完結ルール。
+#     scenarios/07-rule-markers.sh (sensor-monitor.yml から実行) が
+#     cicd-sensor-detect.marker / cicd-sensor-collect.marker への
+#     書き込みを行ない、この2つのルールを発火させる
+#     (レビューで見つかった仕様の穴: 当初はこれらのマーカーファイルを
+#     書き込むシナリオが存在せず、死んだルールになっていた)。
+
+rule_sets:
+  - ruleset_id: cicd_runtime_testbed/kill_test
+
+    rules:
+      - rule_id: testbed_kill_marker
+        rule_name: "Testbed: kill marker written"
+        description: |
+          What:
+            Detects a write to cicd-sensor-killme.marker, a marker file
+            created only by scenarios/90-killme.sh in this testbed.
+          Why:
+            Verifies that cicd-sensor actually terminates a job process
+            when monitor_mode is disabled. This is a self-contained
+            trigger that does not rely on any real IOC.
+          Notes:
+            This is a testbed rule, not a security detection. Under
+            sensor-enforce.yml (monitor_mode: false) a match is expected
+            to terminate the job. Under sensor-monitor.yml
+            (monitor_mode: true) terminate is downgraded to detect, so
+            the rule matches but nothing is killed.
+        event_type: file_open
+        condition: is_write && path.endsWith("/cicd-sensor-killme.marker")
+        action: terminate
+
+      - rule_id: testbed_detect_marker
+        rule_name: "Testbed: detect marker written"
+        description: |
+          What:
+            Detects a write to cicd-sensor-detect.marker, a marker file
+            created only by scenarios/07-rule-markers.sh in this testbed.
+          Why:
+            Exercises the detect action path independently of terminate
+            and collect, so all three actions can be observed in one run.
+          Notes:
+            This is a testbed rule, not a security detection. Written by
+            scenarios/07-rule-markers.sh, which sensor-monitor.yml runs.
+        event_type: file_open
+        condition: is_write && path.endsWith("/cicd-sensor-detect.marker")
+        action: detect
+
+      - rule_id: testbed_collect_marker
+        rule_name: "Testbed: collect marker written"
+        description: |
+          What:
+            Detects a write to cicd-sensor-collect.marker, a marker file
+            created only by scenarios/07-rule-markers.sh in this testbed.
+          Why:
+            Exercises the collect action path independently of terminate
+            and detect. collect hits are emitted to the Detection Log but
+            are excluded from the attestation predicate, so this rule also
+            lets us confirm that documented exclusion in practice.
+          Notes:
+            This is a testbed rule, not a security detection. Written by
+            scenarios/07-rule-markers.sh, which sensor-monitor.yml runs.
+        event_type: file_open
+        condition: is_write && path.endsWith("/cicd-sensor-collect.marker")
+        action: collect

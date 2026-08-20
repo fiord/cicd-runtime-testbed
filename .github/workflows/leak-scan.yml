@@ -1,0 +1,87 @@
+# .github/workflows/leak-scan.yml
+#
+# 検証目的 (docs/SPEC.md T3 / §7 / §8):
+#   指定した run_id の実行がアップロードした telemetry-* アーティファクトを
+#   横断的にダウンロードし、tools/scan-leaks.sh でカナリア値の漏洩有無を
+#   走査、tools/render-matrix.py で 期待 vs 実測のマトリクスを job summary
+#   に出す。
+#
+#   falco-live.yml / falco-analyze.yml / sensor-monitor.yml /
+#   sensor-enforce.yml のいずれかを先に実行し、その run_id を入力として
+#   与える。leak-scan.yml 自身はカナリアを注入するシナリオを実行しない。
+#
+#   ⚠️ が1つでもあれば tools/render-matrix.py が非ゼロで終了し
+#   (docs/SPEC.md §7)、このワークフロー自体も失敗する。これは意図的な
+#   挙動 (仮説と実測が食い違ったことを目立たせるため) であり、
+#   sensor-enforce.yml とは違いこのワークフローが失敗すること自体は
+#   「バグ」ではなく「シグナル」である。
+
+name: "leak-scan: canary leak matrix for a given run_id (T3)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: >-
+          走査対象にする workflow run の run_id
+          (falco-live / falco-analyze / sensor-monitor / sensor-enforce の
+          いずれかの Actions run ID)。
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  scan:
+    name: "scan telemetry-* artifacts from run ${{ inputs.run_id }}"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # 別の run のアーティファクトを run-id 指定でダウンロードするため必要
+      # (同一 run 内のダウンロードであれば actions: read で足りるが、
+      # ここでは他の run を対象にするため明示的に github-token を渡す)。
+      actions: read
+    steps:
+      - name: Checkout cicd-runtime-testbed
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download telemetry-* artifacts from target run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: "telemetry-*"
+          path: downloaded-artifacts
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          merge-multiple: false
+
+      - name: List downloaded artifacts
+        run: |
+          echo "Downloaded telemetry artifacts from run ${{ inputs.run_id }}:"
+          find downloaded-artifacts -maxdepth 2 -mindepth 1 | sort || true
+
+      # docs/SPEC.md §7: scan-leaks.sh <スキャン対象ディレクトリ> という
+      # 単一引数のインタフェース。run_id の埋め込み方 (どの run の
+      # leak-report.json を作っているかの記録) は scan-leaks.sh 側の実装に
+      # 委ねられており、ここでは念のため GITHUB_RUN_ID / SCANNED_RUN_ID の
+      # 両方を環境変数として渡しておく (scan-leaks.sh がどちらを見るかは
+      # 実装依存。tools/ はこのワークフローの担当範囲外のため、実際の
+      # 引数取り扱いは実装側の docs/SPEC.md §7 準拠を前提にしている)。
+      - name: Run scan-leaks.sh
+        env:
+          SCANNED_RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -uo pipefail
+          bash tools/scan-leaks.sh downloaded-artifacts
+
+      - name: Render leak matrix to job summary
+        run: |
+          python3 tools/render-matrix.py leak-report.json
+
+      - name: Upload leak-report.json
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: leak-report-${{ inputs.run_id }}
+          path: leak-report.json
+          if-no-files-found: warn
+          retention-days: 1

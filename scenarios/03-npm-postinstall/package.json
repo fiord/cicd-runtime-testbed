@@ -1,0 +1,9 @@
+{
+  "name": "cicd-runtime-testbed-postinstall-scenario",
+  "version": "0.0.0",
+  "private": true,
+  "description": "cicd-runtime-testbed scenario package: exercises detection of credential access and outbound network activity triggered from an npm postinstall lifecycle script. Installed locally only; not published to any registry.",
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  }
+}
