@@ -143,14 +143,15 @@ gh release view v0.0.38 --repo cicd-sensor/cicd-sensor
 | `falco-live.yml` | falco live モードでの検知 (`falco-version` 0.39.0 / 0.39.2 の matrix) | Actions タブから workflow_dispatch で実行 (入力なし) | falco-actions を呼ぶ前に、指定した `falco-version` タグが Docker Hub に実在するかを preflight ステップが確認する (存在しなければジョブをここで明確に落とす)。各バージョンの `telemetry-falco-live-<version>` アーティファクトに job summary と (取得できれば) `falco_events.json` / `falco_start_logs.txt` が入る。`required_engine_version: 0.43.0` のルールを実際の上限バージョン (0.39.x) が読み込めたか/拒否したか/警告のみで通ったかを job summary の "matrix note" / "required_engine_version" セクションで確認する。**なぜ 0.39.x が上限か**: falco-actions がハードコードして使う `falcosecurity/falco-no-driver` イメージは、Docker Hub 上の数値タグが `0.39.2` で公開停止しているため (`0.43.0` は実在しない) |
 | `falco-analyze.yml` | falco analyze モードでの検知と生キャプチャ | workflow_dispatch。`upload_raw_capture` (既定 false) で生キャプチャの取り扱いを制御 | `analyze` ジョブは falco-actions/analyze を呼ぶ前に、`falco-version: 0.39.2` (falcosecurity/falco-no-driver の実際の上限) が Docker Hub に実在するかを preflight ステップが確認する。`telemetry-falco-analyze` アーティファクトに job summary・抽出情報 (processes/connections/dns/containers/written-files/hashes) が入る。`upload_raw_capture: true` のときのみ `capture.scap` も含む。同梱ルール (`required_engine_version: 0.43.0`) を 0.39.2 エンジンが実際にロードできたかは job summary の "required_engine_version" セクションを参照 (要手動確認) |
 | `sensor-monitor.yml` | cicd-sensor の検知 (kill なし、`monitor_mode: true`) | workflow_dispatch (入力なし) | 全シナリオ (00〜07。07 は detect / collect ルール専用) が実行され、`telemetry-cicd-sensor-monitor` に HTML レポートと attestation predicate が入る |
-| `sensor-enforce.yml` | cicd-sensor の kill 動作の検証。**成功が正常** | workflow_dispatch (入力なし) | `assert` ジョブが **成功** すれば kill が確認できたことを意味する。失敗した場合は kill が起きなかったことを意味し、要調査 |
-| `leak-scan.yml` | 漏洩マトリクスの生成 (T3) | workflow_dispatch。`run_id` に上記いずれかのワークフロー実行の run ID を入力 | 対象 run の `telemetry-*` アーティファクトを横断的に走査し、job summary にカナリアごとの 期待 vs 実測 のマトリクスを出す。⚠️ が1つでもあれば非ゼロ終了する (仮説と現実が食い違ったことを目立たせるため。この場合の赤は「異常」ではなく「注目すべき結果」) |
+| `sensor-enforce.yml` | cicd-sensor の kill 動作の検証。**成功が正常** | workflow_dispatch (入力なし) | `assert` ジョブが **成功** すれば kill が確認できたことを意味する。失敗した場合は kill が起きなかったことを意味し、要調査。**このワークフローが実行する `scenarios/90-killme.sh` はカナリアを注入しない** (`load_canaries` を呼ばない) ため、この run の run_id は `leak-scan.yml` の入力にはできない (対象外として弾かれる) |
+| `leak-scan.yml` | 漏洩マトリクスの生成 (T3) | workflow_dispatch。`run_id` に `falco-live.yml` / `falco-analyze.yml` / `sensor-monitor.yml` いずれかの run ID を入力 (`sensor-enforce.yml` の run ID は不可。上記参照) | 対象 run の `telemetry-*` アーティファクトを横断的に走査し、job summary と (常に) ステップログの両方にカナリアごとの 期待 vs 実測 のマトリクスを出す。走査対象に含まれないツール向けのカナリア (`CANARY_SCAP` は falco 固有) は ⚠️ ではなく N/A (対象外) と表示され、判定にも exit code にも影響しない。**終了コードが 2 種類あり、意味が異なる**: exit 1 = 期待と実測の乖離あり (「発見」。仮説と現実が食い違ったことを目立たせるための意図的な失敗で、job summary の ⚠️ 行と `::error::` 注釈にどのカナリアが食い違ったかが出る)、exit 2 = 走査不成立 (「テスト自体が成立していない」。対象 run に `telemetry-*` アーティファクトが無かった、または `sensor-enforce.yml` の run を誤って指定した等で走査対象 0 件/対象外になったケース。カナリアの判定は行なわれない)。どちらもワークフローとしては失敗 (赤) になるが、job summary の内容でどちらかを区別できる |
 
 ### 推奨実行順序
 
 1. `sensor-monitor.yml` と `falco-live.yml` / `falco-analyze.yml` を先に実行し、検知結果とテレメトリを集める (T1 前半 / T2)。
 2. `sensor-enforce.yml` を実行し、kill が実際に起きることを確認する (T1 後半)。
-3. 1 で得た run_id を使って `leak-scan.yml` を実行し、T3 を確認する。
+3. 1 で得た run_id (`sensor-monitor.yml` / `falco-live.yml` / `falco-analyze.yml` のいずれか。
+   `sensor-enforce.yml` の run_id は使えない) を使って `leak-scan.yml` を実行し、T3 を確認する。
 
 ---
 

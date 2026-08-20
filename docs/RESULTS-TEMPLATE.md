@@ -142,7 +142,23 @@ falco-actions と cicd-sensor で、閲覧できる情報の粒度・種類に�
 
 ## T3: public repo で動かした際に secret 情報が漏れないか
 
-`leak-scan.yml` の実行結果 (job summary のマトリクスをそのまま転記、または要約):
+### 走査は成立したか (`render-matrix.py` の exit code)
+
+まずこれを確認する。`render-matrix.py` の exit code が **2 (走査不成立)** だった場合、
+以下のマトリクスは埋めず、このセクションのみ記入して T3 は再実行すること
+(走査対象アーティファクトが無かった状態でのマトリクスは意味を持たない)。
+
+- exit code (0 / 1 / 2 のいずれか):
+- exit code が 2 (走査不成立) だった場合:
+  - job summary / ログに出た `scanned_file_count` / `scan_root`:
+  - `Verify downloaded artifacts are not empty` ステップは通過したか (通過している場合、
+    ダウンロードされたファイルはあるが `scan-leaks.sh` の除外ロジックで全て除外された可能性がある):
+  - 対象にした run_id (`${{ inputs.run_id }}`) は正しかったか、その run は
+    telemetry-* アーティファクトを実際にアップロードしていたか:
+  - 再実行の要否・再実行結果:
+
+`leak-scan.yml` の実行結果 (job summary のマトリクスをそのまま転記、または要約。
+exit code が 2 だった場合はこの表は「N/A (走査不成立)」と記入してよい):
 
 | カナリア ID | 注入経路 | 期待 | 実測 | 判定 |
 | --- | --- | --- | --- | --- |
@@ -157,8 +173,13 @@ falco-actions と cicd-sensor で、閲覧できる情報の粒度・種類に�
 | `CANARY_DNS` | DNS ラベル | 漏れる | | |
 | `CANARY_SCAP` | 生 syscall バッファ | `capture.scap` でのみ漏れる | | |
 
-`leak-scan.yml` は⚠️ が1つでもあれば非ゼロ終了する。今回の実行は 成功 (すべて仮説どおり) /
-失敗 (乖離あり) のどちらだったか:
+`CANARY_SCAP` は falco 固有 (§3「適用範囲」)。`sensor-monitor.yml` の run のみを
+対象に走査した場合、実測欄は N/A (対象外) になる。これは正常であり、⚠️ や乖離
+としては扱わない (docs/SPEC.md §7)。
+
+`leak-scan.yml` は⚠️ が1つでもあれば非ゼロ終了する (exit 1)。今回の実行は
+成功 (exit 0、すべて仮説どおり) / 失敗 (exit 1、乖離あり) / 走査不成立 (exit 2、上のセクション参照)
+のどれだったか:
 
 ### ランナー由来トークンの検出 (`runner_token_findings`、参考情報・exit code に影響しない)
 

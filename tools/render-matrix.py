@@ -26,7 +26,25 @@
 
 Usage:
   tools/render-matrix.py [leak-report.json] [--out FILE]
-  (--out を省略した場合は $GITHUB_STEP_SUMMARY。それも未設定なら標準出力)
+  (--out を省略しても、$GITHUB_STEP_SUMMARY が設定されている場合は
+  そちらにも書き込むが、標準出力への出力は常に行なう。
+  $GITHUB_STEP_SUMMARY 未設定の場合は標準出力のみに出す)
+
+終了コード:
+  0 = 全カナリアが期待どおり（乖離なし）
+  1 = 期待と実測の乖離あり（＝調査上の「発見」。CI 上で目立たせるための
+      意図的な非ゼロ終了。docs/SPEC.md §7 参照）
+  2 = 走査不成立（scanned_file_count が 0、または
+      leak-report.json に scanned_file_count キーが無く、かつ全カナリアが
+      found=false。走査対象アーティファクトが無かった/ダウンロードに
+      失敗した等でテスト自体が成立していない状態。カナリアの乖離判定は
+      行なわない）
+
+  走査対象テレメトリの種別 (scan_root 配下のディレクトリ名から判定) に、
+  あるカナリアが意味を持つツール (docs/SPEC.md §3「適用範囲」) が含まれて
+  いない場合、そのカナリアは ⚠️ ではなく N/A (対象外) と表示され、
+  mismatches のカウントにも exit code にも算入しない (例: falco 固有の
+  CANARY_SCAP を cicd-sensor 単独の run に対して走査した場合)。
 
 Python 3 標準ライブラリのみを使用する。外部依存を追加しないこと。
 """
@@ -51,6 +69,50 @@ CANARY_ROUTES = {
 # 表示順は docs/SPEC.md 3節の表の並びに合わせる。
 CANARY_ORDER = list(CANARY_ROUTES.keys())
 
+# canary_id -> どのツールのテレメトリで期待値が意味を持つか (docs/SPEC.md
+# §3「適用範囲」列 / §7 参照)。
+#
+# 各カナリアの expected は「どのツールを見ているか」に依存する。例えば
+# CANARY_SCAP の expected=leak は「falco の capture.scap でのみ」という
+# 条件付きの期待であり、cicd-sensor 単独の run (capture.scap を作らない)
+# を対象に走査すると、この条件を満たしようがないため必ず found=false に
+# なる。これは「期待と実測が食い違った (発見)」ではなく「そもそも判定
+# できない組み合わせ (対象外)」なので、他のカナリアと同じ ⚠️ 扱いに
+# してはいけない。
+#
+# 判断に迷うものは「両方に適用」を既定にする (N/A で見逃すより、⚠️ で
+# 気づける方が安全なため)。明確にツール固有と言えるのは CANARY_SCAP の
+# みで、それ以外は cicd-sensor 側の redaction 挙動の検証が主目的だが、
+# falco 側のテレメトリに現れることも観測対象として有意なため両方を対象に
+# する。
+TOOL_CICD_SENSOR = "cicd-sensor"
+TOOL_FALCO = "falco"
+BOTH_TOOLS = frozenset({TOOL_CICD_SENSOR, TOOL_FALCO})
+
+CANARY_APPLIES_TO = {
+    "CANARY_ENV": BOTH_TOOLS,
+    "CANARY_FILE": BOTH_TOOLS,
+    "CANARY_PATH": BOTH_TOOLS,
+    "CANARY_ARGV_SHORT": BOTH_TOOLS,
+    "CANARY_ARGV_LONG": BOTH_TOOLS,
+    "CANARY_ARGV_FLAG": BOTH_TOOLS,
+    "CANARY_URL_QUERY": BOTH_TOOLS,
+    "CANARY_URL_PATH": BOTH_TOOLS,
+    "CANARY_DNS": BOTH_TOOLS,
+    "CANARY_SCAP": frozenset({TOOL_FALCO}),
+}
+
+# leak-scan.yml がダウンロードする telemetry-* アーティファクトのディレクトリ名
+# (actions/download-artifact merge-multiple:false によりアーティファクト名
+# そのままのサブディレクトリ名になる) の接頭辞 -> ツール種別。
+# 実際のアーティファクト名は各ワークフローの "Upload telemetry-*" ステップ
+# 参照 (telemetry-cicd-sensor-monitor / telemetry-cicd-sensor-enforce /
+# telemetry-falco-live-<version> / telemetry-falco-analyze)。
+TOOL_DIR_PREFIXES = (
+    (TOOL_CICD_SENSOR, "telemetry-cicd-sensor-"),
+    (TOOL_FALCO, "telemetry-falco-"),
+)
+
 EXPECTED_LABEL = {"leak": "漏れる", "no_leak": "漏れない"}
 
 # pattern id (tools/scan-leaks.sh の runner_token_findings) -> 表示ラベル
@@ -65,12 +127,60 @@ def load_report(path):
         return json.load(f)
 
 
+def detect_present_tools(report):
+    """leak-report.json の `scan_root` 直下のディレクトリ名から、走査対象に
+    含まれるツールの種別 (cicd-sensor / falco) を判定する。
+
+    戻り値:
+      - set: 判定できた場合、含まれていたツール種別の集合
+              (空集合はありえない。呼び出し側は non-empty を前提にしてよい)
+      - None: 判定できなかった場合 (scan_root が無い/アクセスできない、
+              または直下のディレクトリ名が既知の telemetry-* パターンに
+              一つも一致しなかった)。この場合、呼び出し側は安全側に倒して
+              全カナリアを判定対象として扱うこと (N/A で見逃すより、⚠️ で
+              気づける方が良いため。leak-report.json だけを後から別環境で
+              見返すケース (scan_root がもう存在しない) も含む)。
+    """
+    scan_root = report.get("scan_root")
+    if not scan_root or not os.path.isdir(scan_root):
+        return None
+    try:
+        entries = os.listdir(scan_root)
+    except OSError:
+        return None
+
+    present = set()
+    for entry in entries:
+        entry_path = os.path.join(scan_root, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        for tool, prefix in TOOL_DIR_PREFIXES:
+            if entry.startswith(prefix):
+                present.add(tool)
+
+    return present or None
+
+
 def render(report):
+    present_tools = detect_present_tools(report)
+
     lines = []
     lines.append("## Leak scan matrix")
     lines.append("")
     lines.append("- scanned_at: `%s`" % report.get("scanned_at", "?"))
     lines.append("- run_id: `%s`" % report.get("run_id", "?"))
+    if present_tools is not None:
+        lines.append(
+            "- 走査対象テレメトリの種別: %s"
+            % ", ".join(sorted(present_tools))
+        )
+    else:
+        lines.append(
+            "- 走査対象テレメトリの種別: 判定不能 "
+            "(`scan_root` にアクセスできないか、既知のディレクトリ名と"
+            "一致するものが無かったため、安全側に倒して全カナリアを"
+            "判定対象として扱う)"
+        )
     lines.append("")
     lines.append("| カナリア ID | 注入経路 | 期待 | 実測 | 判定 |")
     lines.append("| --- | --- | --- | --- | --- |")
@@ -79,20 +189,37 @@ def render(report):
     findings_by_id = {f.get("canary_id"): f for f in findings}
 
     mismatches = 0
+    mismatch_details = []
+    na_count = 0
     rendered_ids = set()
 
     def render_row(canary_id, finding):
-        nonlocal mismatches
+        nonlocal mismatches, na_count
         route = CANARY_ROUTES.get(canary_id, "(unknown route)")
         expected = finding.get("expected", "?")
         found = bool(finding.get("found", False))
         actual = "leak" if found else "no_leak"
         expected_label = EXPECTED_LABEL.get(expected, expected)
         actual_label = EXPECTED_LABEL.get(actual, actual)
+
+        applies_to = CANARY_APPLIES_TO.get(canary_id, BOTH_TOOLS)
+        if present_tools is not None and not (applies_to & present_tools):
+            # 今回走査したテレメトリにこのカナリアが意味を持つツールが
+            # 含まれていない (例: falco 固有の CANARY_SCAP を
+            # cicd-sensor 単独の run に対して走査した場合)。⚠️ にはせず、
+            # 乖離件数にも exit code にも算入しない。
+            na_count += 1
+            lines.append(
+                "| `%s` | %s | %s | (対象外) | N/A (%s のテレメトリではないため) |"
+                % (canary_id, route, expected_label, "/".join(sorted(applies_to)))
+            )
+            return
+
         ok = expected == actual
         verdict = "✅" if ok else "⚠️"  # ✅ / ⚠️
         if not ok:
             mismatches += 1
+            mismatch_details.append((canary_id, expected_label, actual_label))
         lines.append(
             "| `%s` | %s | %s | %s | %s |"
             % (canary_id, route, expected_label, actual_label, verdict)
@@ -127,11 +254,17 @@ def render(report):
         )
     else:
         lines.append("✅ すべてのカナリアが期待どおりの結果でした。")
+    if na_count:
+        lines.append(
+            "ℹ️ %d 件は今回走査したテレメトリの種別が対象外のため N/A "
+            "としました（⚠️ や exit code には算入していません）。"
+            % na_count
+        )
 
     lines.append("")
     lines.append(render_runner_token_section(report))
 
-    return "\n".join(lines) + "\n", mismatches
+    return "\n".join(lines) + "\n", mismatches, mismatch_details, na_count
 
 
 def render_runner_token_section(report):
@@ -200,6 +333,34 @@ def render_runner_token_section(report):
     return "\n".join(lines)
 
 
+def is_scan_not_established(report):
+    """走査対象が実質空だったか (＝テストが成立していないか) を判定する。
+
+    - `scanned_file_count` が 0 なら、走査対象ディレクトリが存在しても
+      中身が空だったということなので、無条件に不成立とみなす。
+    - `scanned_file_count` キーが無い場合 (旧形式の leak-report.json との
+      後方互換) は、代わりに「全カナリアが found=false」であることを
+      不成立の手がかりにする。ただし旧形式で本当に全部 no_leak として
+      正しく判定されたケースと区別がつかないため、これは推測に過ぎない
+      ことに注意 (docs/SPEC.md §7)。
+    - `scanned_file_count` が 1 以上なら、たとえ全カナリアが
+      found=false であっても、それ自体は正当な実測結果として扱う
+      (不成立とはしない)。
+    """
+    scanned_file_count = report.get("scanned_file_count")
+    findings = report.get("findings", [])
+
+    if scanned_file_count == 0:
+        return True
+
+    if scanned_file_count is None:
+        any_found = any(bool(f.get("found", False)) for f in findings)
+        if not any_found:
+            return True
+
+    return False
+
+
 def parse_args(argv):
     report_path = "leak-report.json"
     out_path = None
@@ -216,8 +377,15 @@ def parse_args(argv):
     return report_path, out_path
 
 
+def write_summary(summary_path, text):
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as f:
+            f.write(text)
+
+
 def main(argv):
     report_path, out_path = parse_args(argv)
+    summary_path = out_path or os.environ.get("GITHUB_STEP_SUMMARY")
 
     if not os.path.isfile(report_path):
         print("error: leak report not found: %s" % report_path, file=sys.stderr)
@@ -229,14 +397,52 @@ def main(argv):
         print("error: failed to parse %s: %s" % (report_path, exc), file=sys.stderr)
         return 1
 
-    table_md, mismatches = render(report)
+    if is_scan_not_established(report):
+        scanned_file_count = report.get("scanned_file_count", "(キーなし)")
+        scan_root = report.get("scan_root", "(キーなし)")
+        msg = (
+            "走査対象のファイルが 0 件でした。対象 run に telemetry-* "
+            "アーティファクトが存在しないか、ダウンロードに失敗した可能性が"
+            "あります。カナリアの判定は行なっていません。"
+            " (scanned_file_count=%s, scan_root=%s)"
+            % (scanned_file_count, scan_root)
+        )
+        # 標準出力・stderr・job summary・::error:: の全経路に出す。
+        # GITHUB_STEP_SUMMARY が設定されていても標準出力を省略しない
+        # (これが今回の不具合の再発防止策そのもの)。
+        print(msg)
+        print(msg, file=sys.stderr)
+        print("::error::%s" % msg)
+        write_summary(
+            summary_path,
+            "## Leak scan matrix\n\n"
+            "### ❌ 走査不成立 (テストが成立していません)\n\n"
+            "%s\n" % msg,
+        )
+        print("RESULT: scan not established (scanned_file_count=%s) -> exit 2" % scanned_file_count)
+        return 2
 
-    summary_path = out_path or os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary_path:
-        with open(summary_path, "a", encoding="utf-8") as f:
-            f.write(table_md)
-    else:
-        print(table_md)
+    table_md, mismatches, mismatch_details, na_count = render(report)
+
+    # job summary に書く場合でも、同じ内容を必ず標準出力にも出す
+    # (GITHUB_STEP_SUMMARY が設定されていてもステップのログが空にならない
+    # ようにするため。これが今回の不具合の再発防止策そのもの)。
+    write_summary(summary_path, table_md)
+    print(table_md)
+
+    if mismatches:
+        for canary_id, expected_label, actual_label in mismatch_details:
+            print(
+                "::error::canary mismatch: %s expected=%s actual=%s"
+                % (canary_id, expected_label, actual_label)
+            )
+
+    findings = report.get("findings", [])
+    na_suffix = " (%d N/A)" % na_count if na_count else ""
+    print(
+        "RESULT: %d canaries checked%s, %d mismatch(es) -> exit %d"
+        % (len(findings), na_suffix, mismatches, 1 if mismatches else 0)
+    )
 
     return 1 if mismatches else 0
 

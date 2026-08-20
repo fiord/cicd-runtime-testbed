@@ -119,18 +119,24 @@ cicd-runtime-testbed/
 漏洩検証の中核。**各カナリアは「どの経路で漏れるか」を個別に切り分けるために存在する**。
 形式は `KEY=VALUE` の shell source 可能な形式とし、値はすべて一意で grep 可能なこと。
 
-| ID | 注入経路 | 値の制約 | 期待結果 | 検証する仮説 |
-| --- | --- | --- | --- | --- |
-| `CANARY_ENV` | 環境変数（GitHub Secrets 経由） | 任意 | **漏れない** | GH のログ自動マスキングが効く／センサーは env を収集しない |
-| `CANARY_FILE` | ファイル**内容**（`~/.aws/credentials`） | 任意 | **漏れない** | 両ツールともファイル内容は読まない（パスのみ記録） |
-| `CANARY_PATH` | ファイル**パス**（`/tmp/CNRY.../marker`） | 任意 | **漏れる** | cicd-sensor はパスを redact しない |
-| `CANARY_ARGV_SHORT` | プロセス argv（キーワードなし・**12 バイト以下**） | 12 バイト以下／`token`,`key`,`auth`,`pass`,`secret`,`cred`,`bearer`,`AKIA`,`ghp_`,`glpat-` を**含まない** | **漏れる** | redaction ヒューリスティックのキーワード依存の穴 |
-| `CANARY_ARGV_LONG` | プロセス argv（キーワードなし・13 バイト以上） | 上記キーワードを含まない | **漏れない**（`<truncated, N bytes>` になる） | 12 バイト超の切り詰めが効く |
-| `CANARY_ARGV_FLAG` | プロセス argv（`--header "Authorization: Bearer <値>"`） | 任意 | **漏れない** | フラグ名ベースの redaction が効く |
-| `CANARY_URL_QUERY` | 平文 HTTP の**クエリ文字列** | 任意 | **漏れない** | eBPF 内でクエリが除去される |
-| `CANARY_URL_PATH` | 平文 HTTP の**パス** | 任意 | **漏れる** | HTTP path は redact 対象外 |
-| `CANARY_DNS` | DNS クエリのラベル（`<値>.test.invalid`） | DNS ラベルとして妥当（英数字とハイフン、63 文字以下） | **漏れる** | ドメイン名は redact 対象外 |
-| `CANARY_SCAP` | 生の syscall バッファ（`echo` の引数＋ファイル書き込み） | 200 バイト以下 | **falco の capture.scap でのみ漏れる** | snaplen 256 の生キャプチャに素通りで入る |
+| ID | 注入経路 | 値の制約 | 期待結果 | 適用範囲 | 検証する仮説 |
+| --- | --- | --- | --- | --- | --- |
+| `CANARY_ENV` | 環境変数（GitHub Secrets 経由） | 任意 | **漏れない** | 両方 | GH のログ自動マスキングが効く／センサーは env を収集しない |
+| `CANARY_FILE` | ファイル**内容**（`~/.aws/credentials`） | 任意 | **漏れない** | 両方 | 両ツールともファイル内容は読まない（パスのみ記録） |
+| `CANARY_PATH` | ファイル**パス**（`/tmp/CNRY.../marker`） | 任意 | **漏れる** | 両方 | cicd-sensor はパスを redact しない |
+| `CANARY_ARGV_SHORT` | プロセス argv（キーワードなし・**12 バイト以下**） | 12 バイト以下／`token`,`key`,`auth`,`pass`,`secret`,`cred`,`bearer`,`AKIA`,`ghp_`,`glpat-` を**含まない** | **漏れる** | 両方 | redaction ヒューリスティックのキーワード依存の穴 |
+| `CANARY_ARGV_LONG` | プロセス argv（キーワードなし・13 バイト以上） | 上記キーワードを含まない | **漏れない**（`<truncated, N bytes>` になる） | 両方 | 12 バイト超の切り詰めが効く |
+| `CANARY_ARGV_FLAG` | プロセス argv（`--header "Authorization: Bearer <値>"`） | 任意 | **漏れない** | 両方 | フラグ名ベースの redaction が効く |
+| `CANARY_URL_QUERY` | 平文 HTTP の**クエリ文字列** | 任意 | **漏れない** | 両方 | eBPF 内でクエリが除去される |
+| `CANARY_URL_PATH` | 平文 HTTP の**パス** | 任意 | **漏れる** | 両方 | HTTP path は redact 対象外 |
+| `CANARY_DNS` | DNS クエリのラベル（`<値>.test.invalid`） | DNS ラベルとして妥当（英数字とハイフン、63 文字以下） | **漏れる** | 両方 | ドメイン名は redact 対象外 |
+| `CANARY_SCAP` | 生の syscall バッファ（`echo` の引数＋ファイル書き込み） | 200 バイト以下 | **falco の capture.scap でのみ漏れる** | **falco 固有** | snaplen 256 の生キャプチャに素通りで入る |
+
+「適用範囲」は、そのカナリアの期待結果が意味を持つツールを示す（`tools/render-matrix.py`
+の `CANARY_APPLIES_TO`、§7 参照）。`CANARY_SCAP` のみ falco 固有（cicd-sensor は
+`capture.scap` を作らないため、cicd-sensor 単独の run を走査しても判定しようがない）。
+それ以外は cicd-sensor の redaction 挙動の検証が主目的だが、falco 側のテレメトリに
+現れることも観測対象として有意なため両方に適用する。
 
 ### 値の命名規則
 
@@ -247,6 +253,14 @@ cicd-runtime-testbed/
 - このスクリプトは `sensor-enforce.yml` からのみ呼ばれる
 - 実行後に `echo "REACHED_AFTER_KILLME"` を出力する。
   **この文字列がログに出ていたら kill されなかった**ことを意味する（判定に使う）
+- **`load_canaries` を呼ばない。カナリアを一切注入しない。**
+  kill 発火だけに専念させるための意図的な設計であり、他のシナリオ
+  （`00-seed.sh` / `01-credential-access.sh` / `02-exfil.sh` / `04-persistence.sh` /
+  `05-memfd-exec.sh` / `06-anti-forensics.sh` / `07-rule-markers.sh`）とは異なる。
+  **帰結**: `sensor-enforce.yml` がアップロードする `telemetry-cicd-sensor-enforce`
+  にはカナリアが一切含まれないため、この run を `leak-scan.yml` の対象にすると
+  「漏れるはず」のカナリアが全て見つからず必ず ⚠️ になる（＝発見ではなく単なる
+  対象選択のミス）。`leak-scan.yml` はこの run_id を早期に弾くガードを持つ（§7、§8）。
 
 ---
 
@@ -349,6 +363,8 @@ CEL の制約に注意:
 {
   "scanned_at": "2026-08-19T12:00:00Z",
   "run_id": "1234567890",
+  "scan_root": "downloaded-artifacts",
+  "scanned_file_count": 0,
   "findings": [
     {
       "canary_id": "CANARY_PATH",
@@ -373,6 +389,11 @@ CEL の制約に注意:
 
 - `run_id` は**走査対象の run**（`SCANNED_RUN_ID`）を記録する。
   leak-scan 自身の run（`GITHUB_RUN_ID`）ではない。
+- `scan_root` は走査対象ディレクトリの呼び出し時の引数文字列（絶対パス解決前の値）を記録する。
+  値そのもの（カナリア値やトークン）は含まない、単なるパス表記であることに注意する。
+- `scanned_file_count` は実際に走査した候補ファイル数（`CANDIDATE_FILES` の件数）を記録する。
+  `render-matrix.py` はこの値を使って「走査対象 0 件」（＝テスト不成立）を
+  「期待と実測の乖離」と区別する（後述）。
 - **カナリアの実値を `leak-report.json` に書かないこと**（スキャナ出力自体が漏洩源になるため）。
   `canary_id` のみ記録する。
 
@@ -397,10 +418,13 @@ CEL の制約に注意:
 
 ### `render-matrix.py`
 
-- `leak-report.json` を読み、Markdown の表を `$GITHUB_STEP_SUMMARY` に出力する
+- `leak-report.json` を読み、Markdown の表を出力する
+- **`$GITHUB_STEP_SUMMARY`（または `--out`）に書く場合でも、必ず同じ内容を標準出力にも出す。**
+  `GITHUB_STEP_SUMMARY` が設定されているからといって標準出力への出力を省略しないこと
+  （省略すると、ステップのログが空のまま失敗するだけの分かりにくい見え方になる。実際に
+  この不具合が起きたことがある）
 - 各行: カナリア ID / 注入経路 / 期待 / 実測 / 判定
 - 判定は `期待 == 実測` なら ✅、乖離していれば ⚠️
-- **⚠️ が 1 つでもあれば非ゼロで終了する**（＝仮説と現実が食い違ったことを CI 上で目立たせる）
 - `runner_token_findings` を**独立したセクション**として出力する。
   - **この結果は exit code に影響させない。** 終了コードの判定はカナリアのみを対象とする。
     ランナー由来トークンの検出は「発見」であって「失敗」ではないため
@@ -408,6 +432,66 @@ CEL の制約に注意:
   - `runner_token_findings` キーが無い旧形式の JSON でも例外にせず処理を続けること
 - 引数は `python3 tools/render-matrix.py <leak-report.json> [--out <出力先>]`
 - Python 3 標準ライブラリのみ使用。外部依存を追加しない
+
+#### 終了コード
+
+| exit code | 意味 |
+| --- | --- |
+| `0` | 全カナリアが期待どおり（乖離なし） |
+| `1` | 期待と実測の乖離あり（＝調査上の「発見」。⚠️ が 1 つでもあれば非ゼロで終了し、CI 上で目立たせる） |
+| `2` | 走査不成立（テスト自体が成立していない。後述） |
+
+- `1` で終了する場合、**どのカナリアがどう食い違ったかを `::error::` 注釈として標準出力に出す**こと
+  （GitHub Actions の UI に拾わせるため）。
+- 終了直前に、判定の一行サマリを標準出力に出す。例:
+  `RESULT: 10 canaries checked, 3 mismatch(es) -> exit 1`
+
+#### 走査不成立（exit 2）の判定
+
+「走査対象が 0 件だった」ケース（telemetry アーティファクトが存在しない、ダウンロードに
+失敗した等）と、「本当に期待と実測が食い違った」ケースは意味が異なる。前者はテストベッド
+側・インフラ側の問題であって「発見」ではないため、独立したエラーとして区別する。
+
+- `leak-report.json` の `scanned_file_count` が `0`、または
+  `scanned_file_count` キーが存在せず（後方互換のための救済策）かつ全カナリアが
+  `found=false` の場合、**カナリアの乖離判定を一切行なわず**、専用のエラーメッセージを
+  標準出力・`$GITHUB_STEP_SUMMARY`・`::error::` 注釈のすべてに出して **exit 2** で終了する。
+  - メッセージ例:「走査対象のファイルが 0 件でした。対象 run に telemetry-* アーティファクトが
+    存在しないか、ダウンロードに失敗した可能性があります。カナリアの判定は行なっていません」
+- `scanned_file_count` が `1` 以上であれば、たとえ全カナリアが `found=false` でも
+  それは正当な実測結果として扱い、通常どおり判定する（exit 2 にはしない）。
+- `scanned_file_count` キーが無い古い形式の `leak-report.json` でも例外を起こさないこと。
+
+#### 対象外（N/A）判定：走査対象テレメトリの種別によるカナリアの絞り込み
+
+カナリアの期待値は「どのツールのテレメトリを見ているか」に依存する（§3「適用範囲」列）。
+`CANARY_SCAP`（falco 固有）を cicd-sensor 単独の run に対して走査すると、
+`capture.scap` 自体が存在しないため必ず `found=false` になる。これは「期待と実測が
+食い違った（発見）」ではなく「そもそも判定できない組み合わせ（対象外）」であり、
+他のカナリアと同じ ⚠️ にしてはいけない。
+
+- `render-matrix.py` は `leak-report.json` の `scan_root` 直下のディレクトリ名から、
+  走査対象に含まれるツールの種別を判定する
+  （`telemetry-cicd-sensor-*` → cicd-sensor、`telemetry-falco-*` → falco。
+  実際のアーティファクト名は §8 参照）。
+- 走査対象に、あるカナリアの「適用範囲」（§3）に含まれるツールのテレメトリが
+  1 つも含まれていない場合、そのカナリアは ⚠️ ではなく **N/A（対象外）** と表示し、
+  乖離件数にも exit code にも算入しない。
+- マトリクスの冒頭に、今回走査したテレメトリの種別（判定できた場合）または
+  「判定不能」（後述）を明記する。読み手が「なぜ N/A なのか」を理解できるようにするため。
+- `scan_root` にアクセスできない場合（ディレクトリが既に存在しない、
+  `leak-report.json` だけを後から別環境で読む場合等）や、直下のディレクトリ名が
+  既知の `telemetry-*` パターンに一つも一致しない場合は、**判定不能として扱い、
+  安全側に倒して全カナリアを判定対象にする**（N/A で見逃すより、⚠️ で気づける方が
+  良いため）。
+
+#### leak-scan.yml の対象にできるワークフロー
+
+`leak-scan.yml` は、カナリアを実際に注入するワークフロー（`falco-live.yml` /
+`falco-analyze.yml` / `sensor-monitor.yml`）の run_id のみを対象にできる。
+`sensor-enforce.yml` はカナリアを注入しない（`90-killme.sh` は `load_canaries` を
+呼ばない。§4）ため対象外であり、`leak-scan.yml` はダウンロード直後にこれを検出して
+早期にジョブを失敗させる（§8）。
 
 ---
 
@@ -427,8 +511,8 @@ CEL の制約に注意:
 | `falco-live.yml` | `ubuntu-latest` | falco live モードでの検知 | `falco-version` を `0.39.0` と `0.39.2` の matrix にする。**falcosecurity/falco-no-driver イメージ (falco-actions がハードコードして使う) は Docker Hub 上の数値タグが `0.39.2` で公開停止しているため、`required_engine_version: 0.43.0` を満たすバージョンはそもそも指定できない。** 各ジョブは falco-actions を呼ぶ前に Docker Hub のタグ API を叩く preflight ステップでタグの実在を確認し、`0.39.x` エンジンが `required_engine_version: 0.43.0` のルールを実際にロードできたか/拒否したか/警告のみで通ったかを観測する。`fail-fast: false`（ただし preflight 自体がタグ不在で失敗した場合はそのジョブを fail-fast させてよい。原因が明確なため） |
 | `falco-analyze.yml` | `ubuntu-latest` | falco analyze モードでの検知と生キャプチャ | `custom-rule-file` に CI/CD ルールを**明示的に渡す**（渡さないと効かないため）。`falco-version` は `0.39.2`（falcosecurity/falco-no-driver の実際の上限。理由は上記と同じ）。`analyze` ジョブは falco-actions/analyze を呼ぶ前に同様の preflight ステップでタグの実在を確認する。`upload_raw_capture` 入力で scap のアップロードを制御（既定 `false`）。**ジョブを停止するガードは置かない**（§1-6）。public リポジトリで実行された場合は、`capture.scap` に何が入りうるかを `::warning::` と job summary で告知する情報提供ステップのみを置く |
 | `sensor-monitor.yml` | `ubuntu-24.04` | cicd-sensor の検知（kill なし） | `monitor_mode: true`。全シナリオを実行 |
-| `sensor-enforce.yml` | `ubuntu-24.04` | cicd-sensor の kill 動作 | `monitor_mode: false`。§5 の 2 ジョブ構成 |
-| `leak-scan.yml` | `ubuntu-latest` | 漏洩マトリクスの生成 | 入力で対象 run_id を受け取り、その run のアーティファクトを DL して走査 |
+| `sensor-enforce.yml` | `ubuntu-24.04` | cicd-sensor の kill 動作 | `monitor_mode: false`。§5 の 2 ジョブ構成。`90-killme.sh` は `load_canaries` を呼ばずカナリアを注入しないため、**この run の run_id は `leak-scan.yml` の対象にできない**（§4、§7） |
+| `leak-scan.yml` | `ubuntu-latest` | 漏洩マトリクスの生成 | 入力で対象 run_id を受け取り、その run のアーティファクトを DL して走査。ダウンロード結果が空、または `telemetry-cicd-sensor-enforce` のみだった場合はジョブを早期に落とすガードを持つ（§7） |
 
 ### falco-actions / cicd-sensor-action のバージョン
 

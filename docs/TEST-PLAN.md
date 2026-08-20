@@ -10,28 +10,35 @@
    falco-live.yml       (live mode, matrix, 全シナリオ)   ─ 1 と並行実行可
    falco-analyze.yml    (analyze mode, 全シナリオ)         ─ 1 と並行実行可
 2. sensor-enforce.yml   (monitor_mode: false, 90-killme.sh のみ)
-3. leak-scan.yml        (1 で得た run_id を対象に T3 を確認)
+3. leak-scan.yml        (1 の run_id のいずれかを対象に T3 を確認。
+                          2 (sensor-enforce.yml) の run_id は使えない —
+                          90-killme.sh はカナリアを注入しないため)
 ```
 
 1 のワークフローは互いに独立しているため並行実行して構わない。2 は
 1 とは独立した検証 (kill 動作のみ) であり、どの順序でもよいが、
 「まず検知が起きることを確認してから kill を確認する」順序を推奨する。
-3 は 1 の run_id が出揃った後に実行する。
+3 は 1 の run_id が出揃った後に実行する。**2 の run_id を 3 の入力に使わない
+こと**（`leak-scan.yml` 側にガードがあり弾かれるが、そもそも意味がない）。
 
 ## カナリア表 (docs/SPEC.md §3 準拠)
 
-| ID | 注入経路 | 期待結果 | 検証する仮説 |
-| --- | --- | --- | --- |
-| `CANARY_ENV` | 環境変数 (GitHub Secrets 経由) | 漏れない | GH のログ自動マスキングが効く／センサーは env を収集しない |
-| `CANARY_FILE` | ファイル内容 (`~/.aws/credentials`) | 漏れない | 両ツールともファイル内容は読まない (パスのみ記録) |
-| `CANARY_PATH` | ファイルパス (`/tmp/CNRY.../marker`) | 漏れる | cicd-sensor はパスを redact しない |
-| `CANARY_ARGV_SHORT` | プロセス argv (12 バイト以下・キーワードなし) | 漏れる | redaction ヒューリスティックのキーワード依存の穴 |
-| `CANARY_ARGV_LONG` | プロセス argv (13 バイト以上・キーワードなし) | 漏れない (`<truncated, N bytes>`) | 12 バイト超の切り詰めが効く |
-| `CANARY_ARGV_FLAG` | プロセス argv (`Authorization: Bearer` ヘッダ) | 漏れない | フラグ名ベースの redaction が効く |
-| `CANARY_URL_QUERY` | 平文 HTTP のクエリ文字列 | 漏れない | eBPF 内でクエリが除去される |
-| `CANARY_URL_PATH` | 平文 HTTP のパス | 漏れる | HTTP path は redact 対象外 |
-| `CANARY_DNS` | DNS クエリのラベル (`*.test.invalid`) | 漏れる | ドメイン名は redact 対象外 |
-| `CANARY_SCAP` | 生の syscall バッファ | falco の `capture.scap` でのみ漏れる | snaplen 256 の生キャプチャに素通りで入る |
+| ID | 注入経路 | 期待結果 | 適用範囲 | 検証する仮説 |
+| --- | --- | --- | --- | --- |
+| `CANARY_ENV` | 環境変数 (GitHub Secrets 経由) | 漏れない | 両方 | GH のログ自動マスキングが効く／センサーは env を収集しない |
+| `CANARY_FILE` | ファイル内容 (`~/.aws/credentials`) | 漏れない | 両方 | 両ツールともファイル内容は読まない (パスのみ記録) |
+| `CANARY_PATH` | ファイルパス (`/tmp/CNRY.../marker`) | 漏れる | 両方 | cicd-sensor はパスを redact しない |
+| `CANARY_ARGV_SHORT` | プロセス argv (12 バイト以下・キーワードなし) | 漏れる | 両方 | redaction ヒューリスティックのキーワード依存の穴 |
+| `CANARY_ARGV_LONG` | プロセス argv (13 バイト以上・キーワードなし) | 漏れない (`<truncated, N bytes>`) | 両方 | 12 バイト超の切り詰めが効く |
+| `CANARY_ARGV_FLAG` | プロセス argv (`Authorization: Bearer` ヘッダ) | 漏れない | 両方 | フラグ名ベースの redaction が効く |
+| `CANARY_URL_QUERY` | 平文 HTTP のクエリ文字列 | 漏れない | 両方 | eBPF 内でクエリが除去される |
+| `CANARY_URL_PATH` | 平文 HTTP のパス | 漏れる | 両方 | HTTP path は redact 対象外 |
+| `CANARY_DNS` | DNS クエリのラベル (`*.test.invalid`) | 漏れる | 両方 | ドメイン名は redact 対象外 |
+| `CANARY_SCAP` | 生の syscall バッファ | falco の `capture.scap` でのみ漏れる | **falco 固有** | snaplen 256 の生キャプチャに素通りで入る |
+
+「適用範囲」が falco 固有のカナリアを cicd-sensor 単独の run (`sensor-monitor.yml`)
+に対して走査すると、`tools/render-matrix.py` は ⚠️ ではなく N/A (対象外) と表示する
+(docs/SPEC.md §7)。
 
 ## ランナー由来トークンの検出 (`tools/scan-leaks.sh` 二次走査)
 
@@ -62,7 +69,7 @@
 | `05-memfd-exec.sh` | `memfd_create` 経由の fileless 実行 | falco 側で memfd 相当の情報が取れるかを確認 (専用ルールがあるかは未確認) | `process_exec.is_memfd` |
 | `06-anti-forensics.sh` | 00/05 が作った証跡の削除 | `File does not exist anymore` (SHA256 計算失敗) の確認 | `file_remove` |
 | `07-rule-markers.sh` | detect / collect マーカーファイルへの書き込み (`sensor-monitor.yml` から実行。レビューで見つかった仕様の穴を塞ぐために追加) | (対象外、cicd-sensor 専用テスト) | `testbed_detect_marker` (action: detect) / `testbed_collect_marker` (action: collect) |
-| `90-killme.sh` | kill 発火専用 (`sensor-enforce.yml` からのみ実行) | (対象外、cicd-sensor 専用テスト) | `testbed_kill_marker` (action: terminate) |
+| `90-killme.sh` | kill 発火専用 (`sensor-enforce.yml` からのみ実行)。**`load_canaries` を呼ばずカナリアを注入しない** | (対象外、cicd-sensor 専用テスト) | `testbed_kill_marker` (action: terminate) |
 
 ## ワークフローとテレメトリの対応
 
@@ -71,8 +78,8 @@
 | `falco-live.yml` | `telemetry-falco-live-0.39.0`, `telemetry-falco-live-0.39.2` | T1 (live 検知)、engine-version 不整合の実害確認 (falcosecurity/falco-no-driver の公開停止により `0.39.2` が事実上の上限。`0.43.0` は指定できない) |
 | `falco-analyze.yml` | `telemetry-falco-analyze` | T1 (analyze 検知)、T2 (抽出情報の網羅確認) |
 | `sensor-monitor.yml` | `telemetry-cicd-sensor-monitor` | T1 (検知、kill なし)、T2 |
-| `sensor-enforce.yml` | `telemetry-cicd-sensor-enforce` (+ `assert` ジョブの成否が T1 の kill 判定そのもの) | T1 (kill) |
-| `leak-scan.yml` | `leak-report-<run_id>` | T3 (上記4本のいずれかの telemetry を横断走査) |
+| `sensor-enforce.yml` | `telemetry-cicd-sensor-enforce` (+ `assert` ジョブの成否が T1 の kill 判定そのもの) | T1 (kill)。**カナリアを注入しないため T3 (leak-scan.yml) の対象にはできない** |
+| `leak-scan.yml` | `leak-report-<run_id>` | T3 (`falco-live.yml` / `falco-analyze.yml` / `sensor-monitor.yml` いずれかの telemetry を横断走査。`sensor-enforce.yml` は対象外) |
 
 ## 前提条件
 

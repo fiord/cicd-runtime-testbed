@@ -6,9 +6,17 @@
 #   走査、tools/render-matrix.py で 期待 vs 実測のマトリクスを job summary
 #   に出す。
 #
-#   falco-live.yml / falco-analyze.yml / sensor-monitor.yml /
-#   sensor-enforce.yml のいずれかを先に実行し、その run_id を入力として
-#   与える。leak-scan.yml 自身はカナリアを注入するシナリオを実行しない。
+#   falco-live.yml / falco-analyze.yml / sensor-monitor.yml の
+#   いずれかを先に実行し、その run_id を入力として与える。
+#   leak-scan.yml 自身はカナリアを注入するシナリオを実行しない。
+#
+#   ⚠️ sensor-enforce.yml の run_id は対象にできない。
+#   sensor-enforce.yml が実行する scenarios/90-killme.sh は
+#   kill 発火専用で load_canaries を呼ばず、カナリアを一切注入しない
+#   (docs/SPEC.md §4) ため、telemetry-cicd-sensor-enforce だけを対象に
+#   走査すると「漏れるはず」のカナリアが全部見つからず必ず失敗する。
+#   これは「発見」ではなく単なる入力ミスなので、ダウンロード直後の
+#   ガードで早期に弾く。
 #
 #   ⚠️ が1つでもあれば tools/render-matrix.py が非ゼロで終了し
 #   (docs/SPEC.md §7)、このワークフロー自体も失敗する。これは意図的な
@@ -24,8 +32,10 @@ on:
       run_id:
         description: >-
           走査対象にする workflow run の run_id
-          (falco-live / falco-analyze / sensor-monitor / sensor-enforce の
-          いずれかの Actions run ID)。
+          (falco-live / falco-analyze / sensor-monitor の
+          いずれかの Actions run ID)。sensor-enforce.yml の run_id は
+          指定不可 (90-killme.sh はカナリアを注入しないため対象外。
+          指定した場合はダウンロード後のガードステップで失敗する)。
         type: string
         required: true
 
@@ -59,6 +69,34 @@ jobs:
           echo "Downloaded telemetry artifacts from run ${{ inputs.run_id }}:"
           find downloaded-artifacts -maxdepth 2 -mindepth 1 | sort || true
 
+      # ダウンロード結果が空だと、後段の scan-leaks.sh /
+      # render-matrix.py は「走査対象 0 件」を「期待どおり漏れなかった」と
+      # 誤解しかねない紛らわしい結果を返してしまう (render-matrix.py 側では
+      # scanned_file_count による専用エラーで区別しているが、そもそも
+      # ここで早期に落とした方が原因が明確になる)。
+      - name: Verify downloaded artifacts are not empty
+        run: |
+          set -uo pipefail
+          if [ -z "$(find downloaded-artifacts -mindepth 1 -type f 2>/dev/null)" ]; then
+            echo "::error::対象 run (${{ inputs.run_id }}) に telemetry-* アーティファクトが見つかりませんでした。run が失敗して成果物を残していないか、run_id が誤っている可能性があります。"
+            exit 1
+          fi
+
+      # sensor-enforce.yml (90-killme.sh のみ実行、カナリア注入なし) の
+      # run_id が誤って指定された場合を早期に弾く。ダウンロードされた
+      # telemetry-* アーティファクトが telemetry-cicd-sensor-enforce
+      # だけだった場合、走査してもカナリアが全く含まれないため
+      # 「漏れるはず」の項目が必ず ⚠️ になり、原因不明の失敗に見えてしまう
+      # (docs/SPEC.md §4 / §7)。
+      - name: Guard against sensor-enforce runs (no canaries injected)
+        run: |
+          set -uo pipefail
+          dirs="$(find downloaded-artifacts -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)"
+          if [ "${dirs}" = "telemetry-cicd-sensor-enforce" ]; then
+            echo "::error::対象 run (${{ inputs.run_id }}) は sensor-enforce.yml の run のようです。sensor-enforce.yml が実行する scenarios/90-killme.sh はカナリアを注入しない (load_canaries を呼ばない) ため、leak-scan の対象になりません。falco-live / falco-analyze / sensor-monitor のいずれかの run_id を指定してください。"
+            exit 1
+          fi
+
       # docs/SPEC.md §7: scan-leaks.sh <スキャン対象ディレクトリ> という
       # 単一引数のインタフェース。run_id の埋め込み方 (どの run の
       # leak-report.json を作っているかの記録) は scan-leaks.sh 側の実装に
@@ -73,9 +111,37 @@ jobs:
           set -uo pipefail
           bash tools/scan-leaks.sh downloaded-artifacts
 
-      - name: Render leak matrix to job summary
+      # render-matrix.py の終了コードは 0/1/2 に意味があり (docs/SPEC.md
+      # §7)、1 (期待と実測の乖離=発見) と 2 (走査不成立) を区別して扱う
+      # 必要がある。デフォルトの `shell: bash -e {0}` のままだと非ゼロ
+      # 終了で即座にステップが落ち、job summary への追記より前に処理が
+      # 打ち切られる恐れがあるため、終了コードを一度変数で受け取ってから
+      # 分岐する。job summary への内容自体は render-matrix.py が
+      # (exit 0/1/2 いずれの場合も) 自分で書き込む。
+      - name: Render leak matrix
         run: |
+          set -uo pipefail
+          set +e
           python3 tools/render-matrix.py leak-report.json
+          code=$?
+          set -e
+
+          case "${code}" in
+            0)
+              echo "render-matrix.py exit code: 0 (すべてのカナリアが期待どおり)"
+              ;;
+            1)
+              echo "render-matrix.py exit code: 1 (期待と実測の乖離あり = 発見。job summary と上記 ::error:: 注釈を参照)"
+              ;;
+            2)
+              echo "render-matrix.py exit code: 2 (走査不成立 = テスト自体が成立していない。job summary を参照)"
+              ;;
+            *)
+              echo "render-matrix.py exit code: ${code} (想定外)"
+              ;;
+          esac
+
+          exit "${code}"
 
       - name: Upload leak-report.json
         if: always()

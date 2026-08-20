@@ -51,6 +51,10 @@
 #
 # 出力:
 #   leak-report.json (省略時はカレントディレクトリに作成)
+#   トップレベルキー `scan_root` (走査対象ディレクトリの呼び出し時の引数
+#   文字列) と `scanned_file_count` (実際に走査したファイル数) を含む。
+#   これは tools/render-matrix.py が「走査対象 0 件 (＝テスト不成立)」を
+#   期待と実測の乖離と区別して扱うために使う (docs/SPEC.md §7)。
 #
 set -uo pipefail
 
@@ -75,6 +79,12 @@ if [ ! -f "${CANARIES_FILE}" ]; then
   echo "error: canaries file not found: ${CANARIES_FILE}" >&2
   exit 1
 fi
+
+# leak-report.json に記録する scan_root は、呼び出し元がそのまま渡した
+# 引数の文字列を使う (絶対パスに解決したあとの値ではない)。ディレクトリ名
+# そのものに秘密情報が混入することは通常ないが、念のため値そのもの
+# (カナリア値やトークン等) ではなく単なるパス表記であることを前提にする。
+SCAN_ROOT_LABEL="${TARGET_DIR}"
 
 TARGET_DIR="$(cd "${TARGET_DIR}" && pwd)"
 
@@ -279,10 +289,20 @@ scanned_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # leak-report.json に記録したいため、SCANNED_RUN_ID を優先する)。
 run_id="${SCANNED_RUN_ID:-${GITHUB_RUN_ID:-unknown}}"
 
+# render-matrix.py が「走査対象 0 件」(＝テスト不成立) を独立したエラーと
+# して扱えるように、実際に走査したファイル数と走査対象ディレクトリを
+# トップレベルに記録する。scan_root は上で保持した呼び出し時の引数文字列
+# (パス表記のみ。値そのものは含まない)。
+scanned_file_count="${#CANDIDATE_FILES[@]}"
+scan_root_escaped="${SCAN_ROOT_LABEL//\\/\\\\}"
+scan_root_escaped="${scan_root_escaped//\"/\\\"}"
+
 {
   echo "{"
   echo "  \"scanned_at\": \"${scanned_at}\","
   echo "  \"run_id\": \"${run_id}\","
+  echo "  \"scan_root\": \"${scan_root_escaped}\","
+  echo "  \"scanned_file_count\": ${scanned_file_count},"
   echo "  \"findings\": $(cat "${FINDINGS_TMP}"),"
   echo "  \"runner_token_findings\": $(cat "${TOKEN_FINDINGS_TMP}")"
   echo "}"
