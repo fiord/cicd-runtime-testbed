@@ -54,7 +54,7 @@ jobs:
         # 落とさない。後続ステップは falco が起動していなくても実行され、
         # 「検知されなかった」という結果自体が観測データになる。
         continue-on-error: true
-        uses: falcosecurity/falco-actions/start@PIN_ME_SEE_README # UNPINNED: falco-actions has no git tags, see README
+        uses: falcosecurity/falco-actions/start@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README
         with:
           mode: live
           falco-version: ${{ matrix.falco-version }}
@@ -99,7 +99,7 @@ jobs:
 
       - name: Stop Falco (live mode) and build job summary
         if: always()
-        uses: falcosecurity/falco-actions/stop@PIN_ME_SEE_README # UNPINNED: falco-actions has no git tags, see README
+        uses: falcosecurity/falco-actions/stop@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README
         with:
           mode: live
           verbose: true

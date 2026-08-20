@@ -160,7 +160,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Start Falco (analyze mode / sysdig capture)
-        uses: falcosecurity/falco-actions/start@PIN_ME_SEE_README # UNPINNED: falco-actions has no git tags, see README
+        uses: falcosecurity/falco-actions/start@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README
         with:
           mode: analyze
           verbose: true
@@ -201,7 +201,7 @@ jobs:
 
       - name: Stop Falco (analyze mode) — uploads capture.scap + hashes
         if: always()
-        uses: falcosecurity/falco-actions/stop@PIN_ME_SEE_README # UNPINNED: falco-actions has no git tags, see README
+        uses: falcosecurity/falco-actions/stop@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README
         with:
           mode: analyze
           verbose: true
@@ -222,12 +222,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: falcosecurity/falco-actions
-          ref: PIN_ME_SEE_README # UNPINNED: must match the same commit used for the uses: pins above, see README
+          ref: 558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: must match the same commit used for the uses: pins above, see README
           path: _falco-actions-src
 
       - name: Analyze capture
         id: analyze
-        uses: falcosecurity/falco-actions/analyze@PIN_ME_SEE_README # UNPINNED: falco-actions has no git tags, see README
+        uses: falcosecurity/falco-actions/analyze@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README
         with:
           falco-version: "0.43.0" # matches required_engine_version of the CI/CD rule file below
           # 明示的に渡さないと CI/CD 特化ルールが一切ロードされないため必須。
