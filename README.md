@@ -105,6 +105,54 @@
 
 ---
 
+## 既知の制約
+
+実地実行 (run 32519409901, sensor-monitor.yml) で判明した、現時点のピン留め
+バージョンに起因する制約です。**ルールが静かに無効化されても
+`cicd-sensorctl rule validate` はローカルでは通ってしまうため、この不整合は
+ローカル検証だけでは検出できません。** 実際の run の job summary
+(`rules_summary` / `::warning::` 注釈) を必ず確認してください。
+
+- このリポジトリは `cicd-sensor-action@6511eb44c91d71b2b93d71193b1bf2cb18352f66`
+  (v0.0.38、2026-06-13 時点のコミット) をピン留めして使っています。
+- `http_request` イベント (平文 HTTP リクエストの捕捉) が実装されたのは
+  **2026-08-11** (cicd-sensor リポジトリの commit `bdec37f2`
+  "feat(agent): capture cleartext HTTP request metadata (#139)") です。
+  ピン留めしている v0.0.38 はこれより前のバージョンで、
+  `internal/agent/bpf/http_hooks.bpf.h` を含みません。さらに、
+  **最新のリリース済みタグ `releases/v0.0.45` (2026-08-09) 時点でもまだ
+  この実装は含まれていません**。`http_request` は現時点では cicd-sensor の
+  main ブランチにしか存在しません。
+- このため、`.cicd-sensor/rules/testbed.yaml` の `testbed_canary_http_host`
+  ルール (`event_type: http_request`) は、このリポジトリがピン留めしている
+  バージョンの cicd-sensor では**静かに読み込まれず、一度も発火しません**
+  (HTML レポートの `rules_summary.warnings_count` に計上されるだけで、
+  ハードエラーにはなりません)。
+- その結果、`CANARY_URL_PATH` / `CANARY_URL_QUERY` は現状 **N/A**
+  (`tools/render-matrix.py` の判定で「http_request 未対応のため観測不能」)
+  になります。これは「漏れなかった」ことの確認ではなく、「そもそも観測する
+  場所が無かった」ことを意味します。以前このプロジェクトでは
+  `CANARY_URL_QUERY` の実測を ✅ (漏れない) として記録していましたが、
+  これは無効な確認でした (クエリ文字列が実際に除去されたからではなく、
+  HTTP イベント自体が捕捉されていなかったため)。詳細は
+  `docs/RESULTS-TEMPLATE.md` の「実測結果 (run 32519409901)」を参照して
+  ください。
+- **`cicd-sensorctl rule validate` はローカル (このリポジトリの
+  `.cicd-sensor/rules/`) では通ってしまいます。** `rule validate` は
+  ルールの構文・フィールド名を検証するだけで、実行時にそのルールが使う
+  イベント型を、実際に使うことになる cicd-sensor バージョンがサポート
+  しているかまでは検証しません。つまりこの不整合は
+  **ローカル検証だけでは検出できず**、実際に GitHub Actions 上で走らせて
+  job summary の `rules_summary` / `::warning::` 注釈を確認して初めて
+  気づけます。
+- ピン留めしている `cicd-sensor-action` のバージョンを、`http_request` を
+  含むバージョン (main ブランチに含まれる時点以降、将来的なリリース) に
+  更新すれば、`testbed_canary_http_host` ルールは変更なしに発火するように
+  なり、`CANARY_URL_PATH` / `CANARY_URL_QUERY` も通常どおり ✅/⚠️ で
+  判定されるようになります。
+
+---
+
 ## セットアップ
 
 ### 1. `CANARY_ENV` シークレットの登録

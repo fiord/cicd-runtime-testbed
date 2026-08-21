@@ -70,6 +70,42 @@ Usage:
   証跡粒度による N/A は独立した仕組みであり、両方が同時に働く
   (一方が先に N/A と判定していれば、そちらの理由を優先して表示する)。
 
+  さらに (実地実行 run 32519409901 で判明した問題への対応) 3つ目の独立した
+  N/A 判定として「必要なイベント型サポートによる N/A」を追加する。
+  `CANARY_URL_PATH` / `CANARY_URL_QUERY` は `http_request` イベント型を
+  実装した cicd-sensor バージョンでなければ観測できない。ワークフローが
+  ピン留めしている cicd-sensor-action@6511eb44... (v0.0.38, 2026-06-13) は
+  `http_request` の実装 (2026-08-11, commit bdec37f2) より前のバージョンで、
+  最新リリース (releases/v0.0.45, 2026-08-09) 時点でもまだ未対応であり、
+  `http_request` は cicd-sensor の main ブランチにしか存在しない。この場合、
+  `testbed_canary_http_host` ルールは静かに読み込まれず (rules_summary の
+  warnings_count に計上されるだけで、`cicd-sensorctl rule validate` は
+  エラーにしない) 一度も発火しないため、この2つのカナリアについて
+  「漏れなかった」という判定は無効な確認である (証拠の不在を証拠として
+  扱う誤り)。このサポート有無の判定は `tools/scan-leaks.sh` が
+  cicd-sensor-report.html から抽出し、leak-report.json の
+  `sensor_capabilities.http_request` ("supported" / "unsupported" /
+  "unknown") として記録済みのものを読むだけで、ここでファイルシステムを
+  再解析はしない (`detect_evidence_granularity` とは異なる設計。理由は
+  `sensor_capabilities` の抽出に二重デコードの HTML パースが必要で、
+  scan-leaks.sh 側に Python 標準ライブラリでの実装を寄せた方が
+  render-matrix.py をシンプルに保てるため)。
+  `sensor_capabilities.http_request` が "supported" でない場合
+  (unsupported = hits[] に http_request が無く warnings_count>0、
+  unknown = 判断がつかない場合の安全側フォールバック)、この2つのカナリアは
+  ⚠️ ではなく N/A ("http_request 未対応のため観測不能" 等の、"漏れなかった"
+  と誤読されない文言) と表示し、mismatches のカウントにも exit code にも
+  算入しない。この N/A 判定は証跡粒度による N/A や ツール種別による N/A
+  とは独立しており、いずれか一つでも N/A と判定すればその理由を優先して
+  表示する。
+
+  最後に、`rules_summary` (`rule_count` / `warnings_count`) を常に
+  マトリクスの冒頭に表示する。ルールが静かに無効化されても気づけない、
+  という今回の教訓 (`testbed_canary_http_host` が発火しなかったことに
+  しばらく気づけなかった) への対応であり、`warnings_count > 0` の場合は
+  `::warning::` 注釈で「ルールの一部が読み込まれていない可能性がある」
+  ことを明示する。この注釈は exit code には影響しない。
+
 Python 3 標準ライブラリのみを使用する。外部依存を追加しないこと。
 """
 import json
@@ -181,6 +217,64 @@ REQUIRES_DETAIL_OR_BETTER = frozenset(
 )
 
 MIN_GRANULARITY_FOR_JUDGEMENT = 2  # "detail" 以上でないと判定しない
+
+
+# --- 必要なイベント型サポートによる N/A 判定 (実地実行 run 32519409901 で
+# 判明した問題への対応) -------------------------------------------------
+#
+# `CANARY_URL_PATH` / `CANARY_URL_QUERY` は `http_request` イベントの
+# ヒットが `testbed_canary_http_host` ルール経由で hits[] に載らない限り
+# 観測できない (docs/SPEC.md §5)。ワークフローがピン留めしている
+# cicd-sensor-action のバージョンに `http_request` の実装が無い場合、この
+# ルールは静かに読み込まれず一度も発火しない。これは「証跡粒度不足」
+# (REQUIRES_DETAIL_OR_BETTER) とは別の問題である: HTML レポート自体は
+# 存在し detail 相当の証跡があっても、そのバージョンの cicd-sensor が
+# そもそも http_request イベントを生成しないため、証跡粒度を上げても
+# 観測できるようにはならない。
+REQUIRES_HTTP_REQUEST_SUPPORT = frozenset({"CANARY_URL_PATH", "CANARY_URL_QUERY"})
+
+HTTP_REQUEST_NA_LABEL = {
+    "unsupported": (
+        "N/A（http_request 未対応のため観測不能。使用している cicd-sensor "
+        "バージョンではこのイベント型が実装されていないと推定される）"
+    ),
+    "unknown": (
+        "N/A（http_request のサポート有無が判定できなかったため、安全側に"
+        "倒して観測不能扱い。「漏れなかった」と誤読しないこと）"
+    ),
+}
+
+
+def detect_http_request_capability(report):
+    """leak-report.json の `sensor_capabilities` (tools/scan-leaks.sh が
+    cicd-sensor-report.html から抽出済み) から、`http_request` イベント型の
+    サポート有無を読み取る。
+
+    render-matrix.py 自身はファイルシステムを再解析しない (二重エンコードの
+    HTML パースは scan-leaks.sh 側に集約する設計。モジュール冒頭コメント
+    参照)。
+
+    戻り値: (status, basis)
+      - status: "supported" / "unsupported" / "unknown" のいずれか
+      - basis: 判定根拠を説明する文字列 (job summary に表示する)
+
+    `sensor_capabilities` キーが無い (旧形式の leak-report.json、または
+    scan-leaks.sh 側の解析が失敗した) 場合は "unknown" として扱う
+    (判定できないのに ✅ を出す方が、N/A で見逃すより有害なため、安全側に
+    倒す)。
+    """
+    caps = report.get("sensor_capabilities")
+    if not isinstance(caps, dict):
+        return "unknown", (
+            "leak-report.json に sensor_capabilities が記録されていません"
+            "(旧形式の leak-report.json の可能性)。判定できないため安全側に"
+            "倒します。"
+        )
+    status = caps.get("http_request")
+    if status not in ("supported", "unsupported", "unknown"):
+        status = "unknown"
+    basis = caps.get("http_request_basis") or "(理由不明)"
+    return status, basis
 
 
 def detect_evidence_granularity(report):
@@ -338,6 +432,16 @@ def render(report):
     granularity_rank, granularity_label, granularity_detail_lines = (
         detect_evidence_granularity(report)
     )
+    http_capability_status, http_capability_basis = detect_http_request_capability(
+        report
+    )
+
+    sensor_caps = report.get("sensor_capabilities")
+    rule_count = None
+    warnings_count = None
+    if isinstance(sensor_caps, dict):
+        rule_count = sensor_caps.get("rule_count")
+        warnings_count = sensor_caps.get("warnings_count")
 
     lines = []
     lines.append("## Leak scan matrix")
@@ -371,6 +475,38 @@ def render(report):
             "(`scan_root` にアクセスできないため。安全側に倒して"
             "証跡粒度による N/A 判定は行なわず、全カナリアを通常どおり判定する)"
         )
+    # rules_summary (rule_count / warnings_count) を必ず表示する。ルールが
+    # 静かに無効化されても (今回の testbed_canary_http_host のように)
+    # 気づけるようにするための、今回の教訓への直接の対応。
+    if isinstance(sensor_caps, dict):
+        lines.append(
+            "- ルール読み込み状況 (rules_summary): rule_count=`%s`, "
+            "warnings_count=`%s`"
+            % (
+                rule_count if rule_count is not None else "?",
+                warnings_count if warnings_count is not None else "?",
+            )
+        )
+        if isinstance(warnings_count, int) and warnings_count > 0:
+            lines.append(
+                "  - ⚠️ warnings_count が 0 より大きいです。ルールの一部が"
+                "読み込まれていない可能性があります。使用している "
+                "cicd-sensor のバージョンが、ルールで使っているイベント型に"
+                "対応しているか確認してください。"
+            )
+    else:
+        lines.append(
+            "- ルール読み込み状況 (rules_summary): 記録なし "
+            "(`sensor_capabilities` が leak-report.json に無いため。"
+            "旧形式の leak-report.json の可能性)"
+        )
+    # http_request イベント型のサポート有無 (実地実行 run 32519409901 で
+    # 判明した問題への対応)。CANARY_URL_PATH / CANARY_URL_QUERY が N/A に
+    # なる理由をここで明示する。
+    lines.append(
+        "- `http_request` イベント型のサポート状況: `%s` (%s)"
+        % (http_capability_status, http_capability_basis)
+    )
     lines.append("")
     lines.append("| カナリア ID | 注入経路 | 期待 | 実測 | 判定 |")
     lines.append("| --- | --- | --- | --- | --- |")
@@ -382,10 +518,11 @@ def render(report):
     mismatch_details = []
     na_count = 0
     granularity_na_count = 0
+    capability_na_count = 0
     rendered_ids = set()
 
     def render_row(canary_id, finding):
-        nonlocal mismatches, na_count, granularity_na_count
+        nonlocal mismatches, na_count, granularity_na_count, capability_na_count
         route = CANARY_ROUTES.get(canary_id, "(unknown route)")
         expected = finding.get("expected", "?")
         found = bool(finding.get("found", False))
@@ -428,6 +565,24 @@ def render(report):
                     expected_label,
                     "/".join(sorted(applies_to)),
                 )
+            )
+            return
+
+        # 必要なイベント型サポートによる N/A 判定 (ツール種別による N/A・
+        # 証跡粒度による N/A とは独立、複数が同時に働きうる。判明した理由が
+        # 一つあれば十分なので、ここで先に判定して return する。モジュール
+        # 冒頭コメントおよび REQUIRES_HTTP_REQUEST_SUPPORT の定義を参照)。
+        if (
+            canary_id in REQUIRES_HTTP_REQUEST_SUPPORT
+            and http_capability_status != "supported"
+        ):
+            capability_na_count += 1
+            label = HTTP_REQUEST_NA_LABEL.get(
+                http_capability_status, HTTP_REQUEST_NA_LABEL["unknown"]
+            )
+            lines.append(
+                "| `%s` | %s | %s | (観測不能) | %s |"
+                % (canary_id, route, expected_label, label)
             )
             return
 
@@ -501,6 +656,14 @@ def render(report):
                 granularity_label if granularity_label else "不明",
             )
         )
+    if capability_na_count:
+        lines.append(
+            "ℹ️ %d 件は `http_request` イベント型のサポートが確認できな"
+            "かった (`%s`) ため N/A としました（⚠️ や exit code には算入して"
+            "いません。「漏れなかった」のではなく「この cicd-sensor "
+            "バージョンでは観測不能」なことに注意）。"
+            % (capability_na_count, http_capability_status)
+        )
 
     lines.append("")
     lines.append(render_runner_token_section(report))
@@ -511,6 +674,8 @@ def render(report):
         mismatch_details,
         na_count,
         granularity_na_count,
+        capability_na_count,
+        warnings_count,
     )
 
 
@@ -669,9 +834,15 @@ def main(argv):
         print("RESULT: scan not established (scanned_file_count=%s) -> exit 2" % scanned_file_count)
         return 2
 
-    table_md, mismatches, mismatch_details, na_count, granularity_na_count = render(
-        report
-    )
+    (
+        table_md,
+        mismatches,
+        mismatch_details,
+        na_count,
+        granularity_na_count,
+        capability_na_count,
+        warnings_count,
+    ) = render(report)
 
     # job summary に書く場合でも、同じ内容を必ず標準出力にも出す
     # (GITHUB_STEP_SUMMARY が設定されていてもステップのログが空にならない
@@ -686,12 +857,28 @@ def main(argv):
                 % (canary_id, expected_label, actual_label)
             )
 
+    # rules_summary.warnings_count > 0 は「ルールの一部が静かに無効化されて
+    # いるかもしれない」というシグナル。今回のように testbed_canary_http_host
+    # がしばらく気づかれないまま発火していなかった (docs/SPEC.md / README
+    # 「既知の制約」参照) 再発を防ぐため、::warning:: 注釈として必ず出す。
+    # exit code には一切影響させない (mismatches のみで判定する)。
+    if isinstance(warnings_count, int) and warnings_count > 0:
+        print(
+            "::warning::rules_summary.warnings_count=%d - "
+            "一部のルールが読み込まれていない可能性がある。使用している "
+            "cicd-sensor のバージョンがルールで使っているイベント型に "
+            "対応しているか確認すること。"
+            % warnings_count
+        )
+
     findings = report.get("findings", [])
     na_parts = []
     if na_count:
         na_parts.append("%d N/A tool" % na_count)
     if granularity_na_count:
         na_parts.append("%d N/A granularity" % granularity_na_count)
+    if capability_na_count:
+        na_parts.append("%d N/A capability" % capability_na_count)
     na_suffix = " (%s)" % ", ".join(na_parts) if na_parts else ""
     print(
         "RESULT: %d canaries checked%s, %d mismatch(es) -> exit %d"

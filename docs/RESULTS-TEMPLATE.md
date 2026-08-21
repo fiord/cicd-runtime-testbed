@@ -257,6 +257,63 @@ job summary の「ランナー由来トークンのパターン検出」セク�
 
 ---
 
+## 実測結果（run 32519409901, sensor-monitor.yml）
+
+このセクションも記入用テンプレートではなく、実際に得られた実測結果の記録。
+**本テストベッドの主要な成果**。9 カナリア中 8 件が仮説どおりの結果になった。
+
+| カナリア | 仮説 | 実測 | 判定 |
+| --- | --- | --- | --- |
+| `CANARY_ARGV_SHORT`（12バイト） | 漏れる | **漏れた** | 仮説どおり。redaction のキーワード依存の穴を実証 |
+| `CANARY_ARGV_LONG`（13バイト以上） | 漏れない | 漏れなかった | 仮説どおり。12バイト超の切り詰めが機能 |
+| `CANARY_ARGV_FLAG` | 漏れない | 漏れなかった | 仮説どおり。フラグ名ベースの redaction が機能 |
+| `CANARY_PATH` | 漏れる | **漏れた** | 仮説どおり。ファイルパスは redact されない |
+| `CANARY_DNS` | 漏れる | **漏れた** | 仮説どおり。ドメイン名は redact されない |
+| `CANARY_FILE` | 漏れない | 漏れなかった | 仮説どおり。ファイル内容は読まれない |
+| `CANARY_ENV` | 漏れない | 漏れなかった | 仮説どおり |
+| `CANARY_URL_PATH` / `CANARY_URL_QUERY` | — | 観測不能 | `http_request` 未対応バージョンのため判定保留 |
+| ランナー由来トークン（`ghs_` / JWT） | — | **検出 0 件** | cicd-sensor の出力に GitHub 発行トークンの混入は見られなかった |
+
+### `CANARY_URL_PATH` / `CANARY_URL_QUERY` が観測不能だった原因
+
+`http_request`（平文 HTTP 捕捉）の実装が入ったのは **2026-08-11**
+（cicd-sensor リポジトリの commit `bdec37f2`
+"feat(agent): capture cleartext HTTP request metadata (#139)"）で、
+このテストベッドがピン留めしている **`cicd-sensor-action@6511eb44...`
+(v0.0.38) は 2026-06-13** の時点のもので、
+`internal/agent/bpf/http_hooks.bpf.h` を**含まない**。
+**リリース済みタグの最新 `releases/v0.0.45` (2026-08-09) でもまだ未対応**で、
+`http_request` は現時点では main ブランチにしか存在しない。
+
+実際のこの run の `rules_summary` は `{"rule_count": 65, "warnings_count": 1}`
+で、警告 1 件がこの未対応ルール (`testbed_canary_http_host`) に対応すると
+考えられる。`cicd-sensorctl rule validate`（HEAD からビルドしたもの）は
+通ってしまうため、この不整合は**ローカル検証では気づけない**。
+
+**重要: `CANARY_URL_QUERY` の以前の ✅ は無効な確認だった。** 以前は
+`CANARY_URL_QUERY` が「期待=漏れない / 実測=漏れない → ✅」と記録されて
+いたが、これはクエリ文字列が実際に除去されたからではなく、**HTTP イベント
+がそもそも捕捉されていなかったから** だった。典型的な「証拠の不在を証拠
+として扱う」誤りであり、この ✅ には根拠が無い。今回のツール改修
+（`tools/render-matrix.py` への「必要なイベント型サポート」による N/A 判定
+の追加、`tools/scan-leaks.sh` への `sensor_capabilities` 抽出の追加）は、
+この誤判定を二度と出さないようにするためのもの。
+
+### `hits[]` から確認できたその他の事実
+
+- 17 件のヒット。`testbed_canary_argv_carrier`（`process_exec`）5件、各種
+  `credential_read`、`anchored_multi_family_credential_access`
+  （相関ルール）、`shell_rc_write`（永続化）など。
+- argv は **12 バイト超の要素がすべて `<truncated, N bytes>` に切り詰められる**
+  （秘密らしさに関係なく一律。例:
+  `"scenarios/07<truncated, 28 bytes>"`）。
+- **ファイルパスと `exec_path` は切り詰めも redact もされない**
+  （フルパスで記録される）。
+- `collect` アクションのヒットは **HTML レポートには載るが attestation
+  predicate には載らない**（run 32381640678 に続き、今回も確認）。
+
+---
+
 ## 総合所見
 
 - T1 / T2 / T3 を通じて得られた、falco-actions と cicd-sensor それぞれの強み・弱み:

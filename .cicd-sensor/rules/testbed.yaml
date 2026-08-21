@@ -214,6 +214,28 @@ rule_sets:
             This is a testbed rule, not a security detection.
             example.com is an IANA reserved domain; matching on it here
             does not reference any real IOC.
+
+            KNOWN GAP (confirmed via run 32519409901, sensor-monitor.yml):
+            the http_request event type does not exist yet in the
+            cicd-sensor version this testbed pins
+            (cicd-sensor-action@6511eb44c91d71b2b93d71193b1bf2cb18352f66,
+            v0.0.38, 2026-06-13). Support for capturing cleartext HTTP
+            request metadata was only added on 2026-08-11 in commit
+            bdec37f2 ("feat(agent): capture cleartext HTTP request
+            metadata (#139)"), and is still absent from the latest
+            tagged release as of this writing (releases/v0.0.45,
+            2026-08-09) - it currently exists only on cicd-sensor's main
+            branch. Against the pinned v0.0.38 binary, this rule is
+            silently dropped at load time (rules_summary.warnings_count
+            increments; there is no hard error and cicd-sensorctl rule
+            validate, built from a HEAD checkout, still passes), so it
+            never fires and CANARY_URL_PATH / CANARY_URL_QUERY cannot be
+            observed for that reason (not because they were redacted).
+            This rule is left in place unchanged so it starts firing
+            automatically once the pinned cicd-sensor version is
+            upgraded past the point where http_request lands in a
+            release. See README.md "既知の制約" and
+            tools/render-matrix.py's http_request capability handling.
         event_type: http_request
         condition: host == "example.com"
         action: collect

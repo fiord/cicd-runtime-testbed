@@ -32,6 +32,21 @@
 #     「後から何が収集できていた/いなかったか」を leak-report.json の
 #     locations 経由で追跡できる (この観点であえて除外リストに入れていない)。
 #
+# センサー能力プローブ (実地実行 run 32519409901 で判明した問題への対応):
+#   ワークフローがピン留めしている cicd-sensor-action のバージョンによっては、
+#   ルールが使うイベント型 (例: http_request) がそもそも実装されておらず、
+#   該当ルールが静かに読み込まれない (発火しないだけで cicd-sensorctl rule
+#   validate はエラーにならない) ことがある。この場合、そのルールが観測対象に
+#   していたカナリアは「漏れなかった」のではなく「見る場所が無かった」だけ
+#   であり、これを ✅ として扱うのは誤り (証拠の不在を証拠として扱う誤り)。
+#   このスクリプトは cicd-sensor-report.html に埋め込まれた
+#   window.REPORT_DATA (二重エンコードの JSON) を Python 標準ライブラリのみで
+#   解析し、rules_summary (rule_count / warnings_count) と、hits[] に
+#   event_type == "http_request" のヒットが1件以上あるかどうかを、
+#   トップレベルキー `sensor_capabilities` として leak-report.json に記録する
+#   (詳細はスクリプト内の該当セクションのコメント参照)。
+#   render-matrix.py はこのキーを読むだけで、ファイルシステムを再解析しない。
+#
 # 期待される検知内容:
 #   検知シナリオではない。docs/SPEC.md 3節の「期待結果」列と、実際に
 #   telemetry アーティファクト中にカナリア値が現れたかどうかを突き合わせる
@@ -331,6 +346,139 @@ EOF
 done
 echo "]" >> "${TOKEN_FINDINGS_TMP}"
 
+# --- sensor capability probe: is the http_request event type supported? --
+# 実地実行 run 32519409901 (sensor-monitor.yml) で判明した問題への対応:
+# ワークフローがピン留めしている cicd-sensor-action のバージョン
+# (v0.0.38, 2026-06-13) には http_request イベント (平文 HTTP 捕捉) の
+# 実装が存在しない (2026-08-11 の commit bdec37f2 で main にのみ追加され、
+# 最新リリース releases/v0.0.45 (2026-08-09) 時点でもまだ含まれない)。
+# この場合、testbed_canary_http_host ルールは静かに読み込まれず (rules
+# バンドルの warnings_count に計上される)、一度も発火しない。つまり
+# CANARY_URL_PATH / CANARY_URL_QUERY が「漏れなかった」ように見えても、
+# 実際には「そもそも観測する場所が無かった」だけであり、これを
+# render-matrix.py が ✅ と誤判定しないようにする必要がある。
+#
+# ここで cicd-sensor-report.html (走査対象ディレクトリ配下に複数あり得るが
+# 通常は leak-scan.yml が対象にする1 run につき高々1つ) に埋め込まれた
+# window.REPORT_DATA (二重エンコードの JSON: JS の文字列リテラルとして
+# エスケープされた JSON テキストを JSON.parse() に渡している) を Python
+# 標準ライブラリのみで解析し、次の2点を抽出する:
+#   - rules_summary (rule_count / warnings_count)
+#   - hits[] に event_type == "http_request" のヒットが1件以上あるか
+# 結果は leak-report.json のトップレベルキー sensor_capabilities に
+# 記録する。render-matrix.py 側でファイルシステムを再解析しなくて
+# 済むようにするため (leak-report.json 単体で再現可能な判定にする、
+# 既存の telemetry_dirs / 証跡粒度判定と同じ設計方針)。
+#
+# 判定方法 (このファイルの担当範囲。render-matrix.py はこの結果を
+# そのまま読むだけで、判定ロジックは持たない):
+#   - http_request のヒットが1件以上ある                        -> supported
+#   - ヒットが0件、かつ rules_summary.warnings_count > 0          -> unsupported (推定)
+#   - ヒットが0件、かつ warnings_count が 0 または不明            -> unknown
+#     (判断がつかないため、render-matrix.py 側で安全側に倒して N/A 扱いにする)
+#   - cicd-sensor-report.html が1つも見つからない                -> unknown
+#     (HTML レポートが走査対象に含まれていない。predicate.json のみの
+#     走査等)
+SENSOR_CAPABILITIES_JSON="$(python3 - "${TARGET_DIR}" <<'PYEOF'
+import json
+import os
+import re
+import sys
+
+target_dir = sys.argv[1]
+
+rules_summary = None
+http_request_hit_found = False
+reports_parsed = 0
+parse_errors = []
+
+# window.REPORT_DATA = JSON.parse("...");
+# "..." は JS の文字列リテラルで、中身は JSON テキストがバックスラッシュ
+# エスケープされたもの (二重エンコード)。(?:[^"\\]|\\.)* で、閉じ引用符
+# でもバックスラッシュでもない文字、またはバックスラッシュ+任意の1文字の
+# 繰り返しにマッチさせることで、エスケープされた引用符を誤って文字列の
+# 終端と解釈しないようにする。
+PATTERN = re.compile(r'window\.REPORT_DATA\s*=\s*JSON\.parse\("((?:[^"\\]|\\.)*)"\)')
+
+for walk_root, _dirs, files in os.walk(target_dir):
+    for fname in files:
+        if fname != "cicd-sensor-report.html":
+            continue
+        path = os.path.join(walk_root, fname)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                html = f.read()
+        except OSError as exc:
+            parse_errors.append("%s: read error: %s" % (path, exc))
+            continue
+        m = PATTERN.search(html)
+        if not m:
+            parse_errors.append("%s: window.REPORT_DATA marker not found" % path)
+            continue
+        try:
+            # 1段目: JS 文字列リテラルのエスケープを解く (中身は JSON テキスト)
+            raw_json_text = json.loads('"' + m.group(1) + '"')
+            # 2段目: JSON テキストをパースして実際のレポートデータを得る
+            data = json.loads(raw_json_text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            parse_errors.append("%s: JSON decode error: %s" % (path, exc))
+            continue
+        reports_parsed += 1
+        rs = data.get("rules_summary")
+        if isinstance(rs, dict) and rules_summary is None:
+            rules_summary = rs
+        for hit in (data.get("hits") or []):
+            if isinstance(hit, dict) and hit.get("event_type") == "http_request":
+                http_request_hit_found = True
+                break
+
+rule_count = rules_summary.get("rule_count") if isinstance(rules_summary, dict) else None
+warnings_count = rules_summary.get("warnings_count") if isinstance(rules_summary, dict) else None
+
+if http_request_hit_found:
+    http_request_status = "supported"
+    basis = "hits[] に event_type=http_request のヒットが1件以上あった"
+elif reports_parsed == 0:
+    http_request_status = "unknown"
+    basis = (
+        "cicd-sensor-report.html が走査対象から1件も見つからず、"
+        "http_request のサポート有無を判定できなかった"
+    )
+elif isinstance(warnings_count, int) and warnings_count > 0:
+    http_request_status = "unsupported"
+    basis = (
+        "hits[] に http_request のヒットが無く、"
+        "rules_summary.warnings_count=%d (> 0) だったため、"
+        "使用している cicd-sensor バージョンでは http_request イベント型が"
+        "未対応と推定した" % warnings_count
+    )
+else:
+    http_request_status = "unknown"
+    basis = (
+        "hits[] に http_request のヒットが無く、"
+        "rules_summary.warnings_count も 0 または不明だったため、"
+        "サポート有無を判定できなかった (安全側に倒して N/A 扱いとすること)"
+    )
+
+result = {
+    "http_request": http_request_status,
+    "http_request_basis": basis,
+    "rule_count": rule_count,
+    "warnings_count": warnings_count,
+    "reports_parsed": reports_parsed,
+    "parse_errors": parse_errors,
+}
+print(json.dumps(result))
+PYEOF
+)"
+
+if [ -z "${SENSOR_CAPABILITIES_JSON}" ]; then
+  # python3 が使えない、あるいは予期しない例外で何も出力されなかった場合の
+  # フォールバック。render-matrix.py 側は unknown を安全側 (N/A) に倒して
+  # 扱う。
+  SENSOR_CAPABILITIES_JSON='{"http_request": "unknown", "http_request_basis": "python3 execution failed or produced no output; sensor capability probe skipped", "rule_count": null, "warnings_count": null, "reports_parsed": 0, "parse_errors": []}'
+fi
+
 scanned_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # leak-scan.yml は「走査対象にした run」の ID を SCANNED_RUN_ID として渡す
 # (自分自身の run である GITHUB_RUN_ID とは別物: leak-scan.yml 自身の
@@ -375,6 +523,10 @@ fi
   # 偽陰性の再発防止)。runner_token_findings (二次走査) は対象外で、
   # 引き続き大文字小文字を区別する。
   echo "  \"canary_match_mode\": \"case_insensitive\","
+  # sensor_capabilities: cicd-sensor-report.html から抽出した rules_summary
+  # と http_request ヒットの有無 (上記のセンサー能力プローブ参照)。
+  # render-matrix.py はこれを読むだけで、ファイルシステムを再解析しない。
+  echo "  \"sensor_capabilities\": ${SENSOR_CAPABILITIES_JSON},"
   echo "  \"findings\": $(cat "${FINDINGS_TMP}"),"
   echo "  \"runner_token_findings\": $(cat "${TOKEN_FINDINGS_TMP}")"
   echo "}"
