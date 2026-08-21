@@ -127,8 +127,8 @@ cicd-runtime-testbed/
 | `CANARY_ARGV_SHORT` | プロセス argv（キーワードなし・**12 バイト以下**） | 12 バイト以下／`token`,`key`,`auth`,`pass`,`secret`,`cred`,`bearer`,`AKIA`,`ghp_`,`glpat-` を**含まない** | **漏れる** | 両方 | **詳細以上**（predicate に argv は無い） | redaction ヒューリスティックのキーワード依存の穴 |
 | `CANARY_ARGV_LONG` | プロセス argv（キーワードなし・13 バイト以上） | 上記キーワードを含まない | **漏れない**（`<truncated, N bytes>` になる） | 両方 | **詳細以上**（predicate に argv は無い） | 12 バイト超の切り詰めが効く |
 | `CANARY_ARGV_FLAG` | プロセス argv（`--header "Authorization: Bearer <値>"`） | 任意 | **漏れない** | 両方 | **詳細以上**（predicate に argv は無い） | フラグ名ベースの redaction が効く |
-| `CANARY_URL_QUERY` | 平文 HTTP の**クエリ文字列** | 任意 | **漏れない** | 両方 | **詳細以上**（predicate の domains には host しか無く、path/query は無い） | eBPF 内でクエリが除去される |
-| `CANARY_URL_PATH` | 平文 HTTP の**パス** | 任意 | **漏れる** | 両方 | **詳細以上**（predicate の domains には host しか無く、path/query は無い） | HTTP path は redact 対象外 |
+| `CANARY_URL_QUERY` | 平文 HTTP の**クエリ文字列** | 任意 | **漏れない** | 両方 | **詳細以上** ＋ **`http_request` サポート必須**（§7） | eBPF 内でクエリが除去される。※未対応バージョンでの「漏れない」は無効な確認 |
+| `CANARY_URL_PATH` | 平文 HTTP の**パス** | 任意 | **漏れる** | 両方 | **詳細以上** ＋ **`http_request` サポート必須**（§7） | HTTP path は redact 対象外 |
 | `CANARY_DNS` | DNS クエリのラベル（`<値>.test.invalid`） | DNS ラベルとして妥当（英数字とハイフン、63 文字以下） | **漏れる** | 両方 | 集計（predicate）でも判定対象（`domains` 配列に host 単位で載る） | ドメイン名は redact 対象外 |
 | `CANARY_SCAP` | 生の syscall バッファ（`echo` の引数＋ファイル書き込み） | 200 バイト以下 | **falco の capture.scap でのみ漏れる** | **falco 固有** | 生（capture.scap そのもの） | snaplen 256 の生キャプチャに素通りで入る |
 
@@ -679,6 +679,51 @@ predicate（集計レベル）しか無い状況では原理的に観測でき�
   安全側に倒して全カナリアを通常どおり判定する。
 - **ツール種別による N/A とこの証跡粒度による N/A は独立した仕組みであり、両方が同時に
   機能する。** 一方がすでに N/A と判定していれば、そちらの理由が優先される。
+
+#### 対象外（N/A）判定：センサーの機能サポートによるカナリアの絞り込み
+
+上記 2 つとは独立した、**3 つ目の N/A 判定**。実地実行（run 32519409901）で判明した
+次の事実に対応する。
+
+- **平文 HTTP を捕捉する `http_request` イベントは、cicd-sensor の
+  リリース済みバージョンにまだ存在しない。** 実装は 2026-08-11
+  （cicd-sensor の commit `bdec37f2`, PR #139）で、`releases/v0.0.45`（2026-08-09）にも
+  含まれず、main にしかない。テストベッドがピン留めしている
+  `cicd-sensor-action` v0.0.38（2026-06-13）はもちろん未対応。
+- 未対応のイベント型を使ったルールは、**エラーにならず、ただ発火しない**。
+  唯一の手がかりはレポートの `rules_summary.warnings_count` が増えることだけである。
+- **`cicd-sensorctl rule validate`（main からビルドしたもの）はこのルールを通してしまう**ため、
+  ローカル検証ではこの不整合を検出できない。
+
+したがって `CANARY_URL_PATH` / `CANARY_URL_QUERY` は、`http_request` のサポートが
+確認できない限り観測不能である。
+
+**特に重要**: この状況で `CANARY_URL_QUERY`（期待 = 漏れない）を ✅ にしてはいけない。
+クエリ文字列が eBPF 内で除去されたからではなく、**HTTP イベントがそもそも捕捉されていない**
+からである。これを ✅ とするのは「証拠の不在を証拠として扱う」誤りにあたる。
+
+- `scan-leaks.sh` は HTML レポート（`window.REPORT_DATA` に埋め込まれた二重エンコードの
+  JSON）から `rules_summary` と `hits[]` の `event_type` を抽出し、
+  `sensor_capabilities` としてトップレベルに記録する。
+  判定は次の 3 値:
+  - `supported`: `hits[]` に `http_request` のヒットが 1 件以上ある
+  - `unsupported`: `http_request` のヒットが 0 件、かつ `warnings_count > 0`（**推定**）
+  - `unknown`: 上記以外。判断がつかないため安全側に倒す
+- `render-matrix.py` は `supported` 以外の場合、`CANARY_URL_PATH` / `CANARY_URL_QUERY` を
+  **N/A（この cicd-sensor バージョンでは `http_request` 未対応のため観測不能）** と表示し、
+  乖離件数にも exit code にも算入しない。表示文言は「漏れなかった」と誤読されないものにする。
+- `unsupported` はあくまで**推定**である（他のルールが原因で `warnings_count` が
+  増える可能性は理論上残る）。出力にもその旨を明記する。
+
+#### `rules_summary` の可視化（必須）
+
+**今回の教訓は「ルールが静かに無効化されても気づけない」ことである。**
+
+- `render-matrix.py` は `rule_count` と `warnings_count` を**必ずマトリクス冒頭に表示**する。
+- `warnings_count > 0` の場合は `::warning::` 注釈を出し、「ルールの一部が読み込まれて
+  いない可能性がある。使用している cicd-sensor のバージョンが、ルールで使っている
+  イベント型に対応しているか確認すること」と示す。
+- これは exit code には影響させない（発見であって失敗ではないため）。
 
 #### leak-scan.yml の対象にできるワークフロー
 
