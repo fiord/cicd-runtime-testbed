@@ -63,6 +63,14 @@
 #   これは tools/render-matrix.py が「走査対象 0 件 (＝テスト不成立)」を
 #   期待と実測の乖離と区別して扱うために使う (docs/SPEC.md §7)。
 #
+#   `telemetry_dirs`: 走査対象ディレクトリの直下にあるディレクトリ名の
+#   一覧 (例: ["telemetry-cicd-sensor-monitor"])。tools/render-matrix.py の
+#   ツール種別判定 (`telemetry-cicd-sensor-*` → cicd-sensor、
+#   `telemetry-falco-*` → falco) がこの走査時点のスナップショットを
+#   優先的に使うことで、render-matrix.py を実行する時点で scan_root に
+#   ファイルシステムアクセスできるかどうかに判定結果が左右されなくなる
+#   (leak-report.json 単体で再現可能な判定にするため)。
+#
 # カナリア走査の大文字小文字非依存化 (実地実行 run 32381640678 で判明した
 # 偽陰性の修正):
 #   DNS 名は解決前にリゾルバによって小文字に正規化されるため、
@@ -338,11 +346,29 @@ scanned_file_count="${#CANDIDATE_FILES[@]}"
 scan_root_escaped="${SCAN_ROOT_LABEL//\\/\\\\}"
 scan_root_escaped="${scan_root_escaped//\"/\\\"}"
 
+# telemetry_dirs: 走査対象ディレクトリ (TARGET_DIR) の直下にあるディレクトリ
+# 名の一覧。render-matrix.py のツール種別判定 (present_tools) がこれを
+# 優先して使う (スクリプト冒頭コメント参照)。
+mapfile -d '' TELEMETRY_DIR_NAMES < <(
+  find "${TARGET_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%f\0' 2>/dev/null | sort -z
+)
+telemetry_dirs_entries=()
+for d in "${TELEMETRY_DIR_NAMES[@]}"; do
+  esc_d="${d//\\/\\\\}"
+  esc_d="${esc_d//\"/\\\"}"
+  telemetry_dirs_entries+=("\"${esc_d}\"")
+done
+telemetry_dirs_json="[]"
+if [ "${#telemetry_dirs_entries[@]}" -gt 0 ]; then
+  telemetry_dirs_json="[$(IFS=,; echo "${telemetry_dirs_entries[*]}")]"
+fi
+
 {
   echo "{"
   echo "  \"scanned_at\": \"${scanned_at}\","
   echo "  \"run_id\": \"${run_id}\","
   echo "  \"scan_root\": \"${scan_root_escaped}\","
+  echo "  \"telemetry_dirs\": ${telemetry_dirs_json},"
   echo "  \"scanned_file_count\": ${scanned_file_count},"
   # findings (カナリア本走査) は大文字小文字非依存 (grep -aFio) で行なわれた
   # ことを明記する (スクリプト冒頭のコメント参照。run 32381640678 で判明した

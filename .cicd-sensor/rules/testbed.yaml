@@ -47,6 +47,40 @@
 #     書き込みを行ない、この2つのルールを発火させる
 #     (レビューで見つかった仕様の穴: 当初はこれらのマーカーファイルを
 #     書き込むシナリオが存在せず、死んだルールになっていた)。
+#
+# 実地実行 (run 32510077347) で判明した最重要の事実と、それへの対応
+# (2つ目の ruleset, cicd_runtime_testbed/canary_observability):
+#   cicd-sensor は「ルールに一致したイベント」の詳細 (process.argv /
+#   process.ancestors / payload の全フィールド) しか記録しない。
+#   ルールが1つも発火しないイベントは standalone モードのレポートに
+#   一切現れない (生のイベントストリームは存在しない)。
+#   このため、02-exfil.sh が argv に載せる CANARY_ARGV_SHORT /
+#   CANARY_ARGV_LONG や、00-seed.sh が作る CANARY_PATH 配下のマーカー、
+#   02-exfil.sh の平文 HTTP の path/query は、そのプロセス / イベントが
+#   何らかのルールに一致しない限り「漏れたかどうか」を観測すること自体が
+#   できない (漏れなかったのではなく、見る場所が無い)。
+#
+#   以下の3ルールは、この観測用ギャップを埋めるためだけに存在する
+#   自己完結ルールで、すべて action: collect (ジョブを止めず、
+#   Detection Log に載せるだけ)。実在の IOC には一切依存しない。
+#   - testbed_canary_argv_carrier: curl の実行そのものを collect する。
+#     02-exfil.sh が実行する curl 呼び出し全般 (CANARY_ARGV_SHORT /
+#     CANARY_ARGV_LONG / CANARY_ARGV_FLAG を argv に含むものを含む) を
+#     ヒットさせ、そのヒットの process.argv を通じてカナリアが
+#     実際に記録されるかどうかを観測できるようにする。
+#   - testbed_canary_path_probe: 00-seed.sh が /tmp/${CANARY_PATH}/ 配下に
+#     作る専用マーカー (canary-path-probe.marker) への書き込みを collect
+#     する。ヒットの payload.path に /tmp/<CANARY_PATH の値>/... が
+#     そのまま現れるため、CANARY_PATH (ディレクトリ名) が観測できるように
+#     なる。
+#   - testbed_canary_http_host: host が example.com の http_request を
+#     collect する。ヒットの payload.path / payload.method を通じて
+#     CANARY_URL_PATH / CANARY_URL_QUERY (query は payload.path には
+#     含まれない仕様のため、query 側は「除去された」ことの確認になる)
+#     が観測できるようになる。
+#   `domain` イベント (CANARY_DNS) は既に attestation predicate の
+#   `domains` 配列に現れる (集計レベルでも観測できる) ため、専用の
+#   観測用ルールは追加しない。
 
 rule_sets:
   - ruleset_id: cicd_runtime_testbed/kill_test
@@ -104,4 +138,82 @@ rule_sets:
             scenarios/07-rule-markers.sh, which sensor-monitor.yml runs.
         event_type: file_open
         condition: is_write && path.endsWith("/cicd-sensor-collect.marker")
+        action: collect
+
+  - ruleset_id: cicd_runtime_testbed/canary_observability
+    rules:
+      - rule_id: testbed_canary_argv_carrier
+        rule_name: "Testbed: curl execution (argv canary carrier)"
+        description: |
+          What:
+            Matches every curl execution. In this testbed, curl is the
+            process that carries CANARY_ARGV_SHORT / CANARY_ARGV_LONG
+            (scenarios/02-exfil.sh, --referer / -A options) and
+            CANARY_ARGV_FLAG (Authorization header) in its argv.
+          Why:
+            cicd-sensor only records the full detail (process.argv,
+            process.ancestors, payload) of events that match some rule;
+            events with no match do not appear in the standalone report
+            at all. Without this rule, the curl processes carrying the
+            argv canaries never produce a hit, so there is no way to
+            observe whether the argv canaries survive into the report
+            (this was the root cause behind "the argv canary is never
+            found" in run 32510077347). This rule exists purely to make
+            those curl invocations observable; it does not depend on any
+            real IOC.
+          Notes:
+            This intentionally matches curl broadly (including the DNS /
+            HTTPS control-group steps of 02-exfil.sh), which is fine:
+            action is collect, so it only adds Detection Log entries and
+            never stops the job.
+        event_type: process_exec
+        condition: process.exec_path.endsWith("/curl")
+        action: collect
+
+      - rule_id: testbed_canary_path_probe
+        rule_name: "Testbed: canary-path observation probe written"
+        description: |
+          What:
+            Detects a write to canary-path-probe.marker, a dedicated
+            marker file created only by scenarios/00-seed.sh under
+            /tmp/${CANARY_PATH}/ (i.e. its directory name is the
+            CANARY_PATH value itself).
+          Why:
+            Same root cause as testbed_canary_argv_carrier: without a
+            rule matching this write, the CANARY_PATH directory is never
+            part of any recorded event, so payload.path (which would
+            contain the CANARY_PATH value as part of the path) never
+            appears in the report. This rule is a self-contained
+            observation probe, independent of the pre-existing
+            /tmp/${CANARY_PATH}/marker file used by other scenarios.
+          Notes:
+            This is a testbed rule, not a security detection. Written by
+            scenarios/00-seed.sh, which runs in every detection workflow
+            (sensor-monitor.yml, and any workflow that calls 00-seed.sh).
+        event_type: file_open
+        condition: is_write && path.endsWith("/canary-path-probe.marker")
+        action: collect
+
+      - rule_id: testbed_canary_http_host
+        rule_name: "Testbed: plaintext HTTP request to example.com"
+        description: |
+          What:
+            Matches outgoing plaintext HTTP requests whose Host is
+            example.com, the only HTTP endpoint this testbed is allowed
+            to contact (docs/SPEC.md 1節).
+          Why:
+            scenarios/02-exfil.sh sends CANARY_URL_PATH in the request
+            path and CANARY_URL_QUERY in the query string. Per the same
+            root cause as the other two rules in this ruleset, without a
+            matching rule the http_request event carrying
+            payload.path / payload.method is never recorded, so neither
+            the "path survives" nor the "query string is stripped"
+            hypothesis (docs/SPEC.md 3節) can actually be observed from
+            the report.
+          Notes:
+            This is a testbed rule, not a security detection.
+            example.com is an IANA reserved domain; matching on it here
+            does not reference any real IOC.
+        event_type: http_request
+        condition: host == "example.com"
         action: collect

@@ -78,8 +78,30 @@
   `telemetry-manifest.txt` (各 telemetry アーティファクトに同梱) に記録し、1 つも
   取得できなければジョブを失敗させます (一部だけの場合は `::warning::` で続行)。
   以前は `actions/download-artifact` の `continue-on-error: true` により、
-  `cicd-sensor-report` の取得に失敗しても黙って進み、predicate.json 1 ファイルだけの
+  `cicd-sensor-report.html` の取得に失敗しても黙って進み、predicate.json 1 ファイルだけの
   テレメトリが「成功」として上がってしまう不具合がありました (run 32381640678 で実際に発生)。
+- **cicd-sensor はルールに一致したイベントの詳細しか記録しません。**
+  実物の HTML レポート (run 32510077347) を解析して判明した最重要の事実です。
+  standalone モードのレポートには「生のイベントストリーム」に相当するものが
+  存在せず、`hits[]` (ルールに一致したイベント) だけが `process.argv` /
+  `process.ancestors` / `payload` の詳細を持ちます。`domain_observations[]` /
+  `network_connections[]` はルール一致に関係なく載りますが `argv` を持ちません。
+  このため、以前は `CANARY_ARGV_SHORT` / `CANARY_ARGV_LONG` がそもそも
+  どのシナリオの argv にも注入されておらず (仕様の穴)、さらに argv・
+  `CANARY_PATH` のパス・HTTP の path/query を運ぶプロセスやイベントが
+  何のルールにも一致しないため記録されない、という二重の問題がありました。
+  `02-exfil.sh` に argv カナリアの注入を追加し、`.cicd-sensor/rules/testbed.yaml`
+  に `action: collect` の観測用ルール 3 本 (`testbed_canary_argv_carrier` /
+  `testbed_canary_path_probe` / `testbed_canary_http_host`) を追加して
+  対応しています (docs/SPEC.md §4, §5 参照)。
+- **アーティファクト名の不一致を修正しました。** `cicd-sensor-action` が
+  アップロードする HTML レポートの実際のアーティファクト名は
+  `cicd-sensor-report.html` です (`gh api` で実際の run から確認済み)。
+  以前のワークフローは `cicd-sensor-report` (拡張子なし) でダウンロードを
+  試みており、常に失敗していました (`continue-on-error: true` で黙って
+  `MISSING` として処理は続行していましたが、HTML レポートが一度も
+  取得できていませんでした)。`cicd-sensor-attestation` の名前は元々正しく、
+  変更していません。
 
 ---
 
@@ -193,7 +215,7 @@ gh release view v0.0.38 --repo cicd-sensor/cicd-sensor
 明示しています (docs/SPEC.md §1-5)。
 
 一方で `falco-actions` (`stop` action の analyze モード) と `cicd-sensor-action` は、
-それぞれ `capture` / `hashes` / `cicd-sensor-report` / `cicd-sensor-attestation` という
+それぞれ `capture` / `hashes` / `cicd-sensor-report.html` / `cicd-sensor-attestation` という
 アーティファクトを**それ自身の内部処理として**アップロードします。これらは
 このリポジトリのコードではなく元アクション側の実装であり、`retention-days` を
 私たちの側から指定できません (元リポジトリは変更しない方針のため)。

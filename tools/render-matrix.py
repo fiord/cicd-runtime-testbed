@@ -40,11 +40,16 @@ Usage:
       失敗した等でテスト自体が成立していない状態。カナリアの乖離判定は
       行なわない）
 
-  走査対象テレメトリの種別 (scan_root 配下のディレクトリ名から判定) に、
-  あるカナリアが意味を持つツール (docs/SPEC.md §3「適用範囲」) が含まれて
-  いない場合、そのカナリアは ⚠️ ではなく N/A (対象外) と表示され、
-  mismatches のカウントにも exit code にも算入しない (例: falco 固有の
-  CANARY_SCAP を cicd-sensor 単独の run に対して走査した場合)。
+  走査対象テレメトリの種別 (leak-report.json の `telemetry_dirs`、無ければ
+  scan_root 配下のディレクトリ名から判定) に、あるカナリアが意味を持つ
+  ツール (docs/SPEC.md §3「適用範囲」) が含まれていない場合、そのカナリアは
+  ⚠️ ではなく N/A (対象外) と表示され、mismatches のカウントにも exit code
+  にも算入しない (例: falco 固有の CANARY_SCAP を cicd-sensor 単独の run に
+  対して走査した場合)。ツール種別そのものが判定不能な場合、両ツール共通の
+  カナリアは通常どおり判定するが、ツール固有のカナリア (現状 CANARY_SCAP
+  のみ) は「判定できないので N/A」として扱う (以前は安全側に倒して常に
+  判定していたが、ツール固有カナリアに対しては判定不能=cicd-sensor 単独の
+  run というケースで必ず ⚠️ になる誤検知だった)。
 
   さらに (実地実行 run 32381640678 で判明した問題への対応)、上記の
   「ツール種別による N/A」とは独立に「証跡の粒度による N/A」も判定する。
@@ -277,32 +282,50 @@ def load_report(path):
 
 
 def detect_present_tools(report):
-    """leak-report.json の `scan_root` 直下のディレクトリ名から、走査対象に
-    含まれるツールの種別 (cicd-sensor / falco) を判定する。
+    """走査対象直下のディレクトリ名から、走査対象に含まれるツールの種別
+    (cicd-sensor / falco) を判定する。
+
+    `leak-report.json` の `telemetry_dirs` (tools/scan-leaks.sh が走査時点で
+    記録した、走査対象ディレクトリ直下のディレクトリ名一覧) を優先して使う。
+    これにより render-matrix.py を実行する時点でのファイルシステムアクセス
+    (`scan_root` が実在するか、カレントディレクトリがどこか) に判定結果が
+    左右されなくなり、leak-report.json 単体で再現可能な判定になる
+    (実地実行で、scan_root 配下を歩く detect_evidence_granularity は正しく
+    判定できていたのに、この関数だけ「判定不能」になるという不整合が
+    起きたことへの対応)。
+
+    `telemetry_dirs` が無い (旧形式の leak-report.json) 場合のみ、従来どおり
+    `scan_root` に対する `os.listdir` にフォールバックする。
 
     戻り値:
       - set: 判定できた場合、含まれていたツール種別の集合
               (空集合はありえない。呼び出し側は non-empty を前提にしてよい)
-      - None: 判定できなかった場合 (scan_root が無い/アクセスできない、
-              または直下のディレクトリ名が既知の telemetry-* パターンに
-              一つも一致しなかった)。この場合、呼び出し側は安全側に倒して
-              全カナリアを判定対象として扱うこと (N/A で見逃すより、⚠️ で
-              気づける方が良いため。leak-report.json だけを後から別環境で
-              見返すケース (scan_root がもう存在しない) も含む)。
+      - None: 判定できなかった場合 (`telemetry_dirs` が無く、かつ
+              `scan_root` が無い/アクセスできない、または直下のディレクトリ
+              名が既知の telemetry-* パターンに一つも一致しなかった)。
+              この場合の呼び出し側の扱いは render_row を参照
+              (ツール固有カナリアは N/A、両ツール共通のカナリアは通常どおり
+              判定する)。
     """
-    scan_root = report.get("scan_root")
-    if not scan_root or not os.path.isdir(scan_root):
-        return None
-    try:
-        entries = os.listdir(scan_root)
-    except OSError:
-        return None
+    telemetry_dirs = report.get("telemetry_dirs")
+    if telemetry_dirs is not None:
+        entries = telemetry_dirs
+    else:
+        scan_root = report.get("scan_root")
+        if not scan_root or not os.path.isdir(scan_root):
+            return None
+        try:
+            all_entries = os.listdir(scan_root)
+        except OSError:
+            return None
+        entries = [
+            entry
+            for entry in all_entries
+            if os.path.isdir(os.path.join(scan_root, entry))
+        ]
 
     present = set()
     for entry in entries:
-        entry_path = os.path.join(scan_root, entry)
-        if not os.path.isdir(entry_path):
-            continue
         for tool, prefix in TOOL_DIR_PREFIXES:
             if entry.startswith(prefix):
                 present.add(tool)
@@ -329,9 +352,10 @@ def render(report):
     else:
         lines.append(
             "- 走査対象テレメトリの種別: 判定不能 "
-            "(`scan_root` にアクセスできないか、既知のディレクトリ名と"
-            "一致するものが無かったため、安全側に倒して全カナリアを"
-            "判定対象として扱う)"
+            "(`telemetry_dirs` が記録されておらず、かつ `scan_root` に"
+            "アクセスできないか既知のディレクトリ名と一致するものが"
+            "無かったため。ツール固有のカナリア (`CANARY_SCAP` 等) は "
+            "N/A、両ツール共通のカナリアは通常どおり判定する)"
         )
     # 今回の走査で利用できた証跡の粒度 (docs/SPEC.md §7 後半、実地実行
     # run 32381640678 で判明した問題への対応)。predicate 相当の集計レベル
@@ -370,15 +394,40 @@ def render(report):
         actual_label = EXPECTED_LABEL.get(actual, actual)
 
         applies_to = CANARY_APPLIES_TO.get(canary_id, BOTH_TOOLS)
-        if present_tools is not None and not (applies_to & present_tools):
-            # 今回走査したテレメトリにこのカナリアが意味を持つツールが
-            # 含まれていない (例: falco 固有の CANARY_SCAP を
-            # cicd-sensor 単独の run に対して走査した場合)。⚠️ にはせず、
-            # 乖離件数にも exit code にも算入しない。
+        if present_tools is not None:
+            if not (applies_to & present_tools):
+                # 今回走査したテレメトリにこのカナリアが意味を持つツールが
+                # 含まれていない (例: falco 固有の CANARY_SCAP を
+                # cicd-sensor 単独の run に対して走査した場合)。⚠️ にはせず、
+                # 乖離件数にも exit code にも算入しない。
+                na_count += 1
+                lines.append(
+                    "| `%s` | %s | %s | (対象外) | N/A (%s のテレメトリではないため) |"
+                    % (canary_id, route, expected_label, "/".join(sorted(applies_to)))
+                )
+                return
+        elif applies_to != BOTH_TOOLS:
+            # ツール種別が判定不能 (present_tools is None) な場合のフォール
+            # バック。以前は「安全側に倒して全カナリアを判定対象にする」
+            # としていたが、これはツール固有カナリア (現状 CANARY_SCAP のみ、
+            # falco 専用) に対しては必ず誤検知を生む: cicd-sensor 単独の run
+            # では capture.scap 自体が存在しないため found=false になり、
+            # expected=leak と食い違って必ず ⚠️ (exit 1) になってしまう。
+            # ツール種別を確認できないのだから「漏れなかった (発見)」とは
+            # 判定しようがないので、ツール固有カナリアは N/A とする。
+            # 両ツール共通のカナリア (BOTH_TOOLS) は、ツール種別が
+            # 判定できなくても意味を持つ判定なので、このフォールバックの
+            # 対象にはせず、以下の通常判定に進める。
             na_count += 1
             lines.append(
-                "| `%s` | %s | %s | (対象外) | N/A (%s のテレメトリではないため) |"
-                % (canary_id, route, expected_label, "/".join(sorted(applies_to)))
+                "| `%s` | %s | %s | (対象外) | N/A (ツール種別が判定不能なため、"
+                "%s 固有のこのカナリアは判定しない) |"
+                % (
+                    canary_id,
+                    route,
+                    expected_label,
+                    "/".join(sorted(applies_to)),
+                )
             )
             return
 

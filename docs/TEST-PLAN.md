@@ -28,8 +28,8 @@
 | `CANARY_ENV` | 環境変数 (GitHub Secrets 経由) | 漏れない | 両方 | 集計でも判定対象 | GH のログ自動マスキングが効く／センサーは env を収集しない |
 | `CANARY_FILE` | ファイル内容 (`~/.aws/credentials`) | 漏れない | 両方 | 詳細以上 | 両ツールともファイル内容は読まない (パスのみ記録) |
 | `CANARY_PATH` | ファイルパス (`/tmp/CNRY.../marker`) | 漏れる | 両方 | 詳細以上 | cicd-sensor はパスを redact しない |
-| `CANARY_ARGV_SHORT` | プロセス argv (12 バイト以下・キーワードなし) | 漏れる | 両方 | 詳細以上 | redaction ヒューリスティックのキーワード依存の穴 |
-| `CANARY_ARGV_LONG` | プロセス argv (13 バイト以上・キーワードなし) | 漏れない (`<truncated, N bytes>`) | 両方 | 詳細以上 | 12 バイト超の切り詰めが効く |
+| `CANARY_ARGV_SHORT` | プロセス argv (`02-exfil.sh` の `curl --referer "${CANARY_ARGV_SHORT}"`。独立した argv 要素、12 バイト以下・キーワードなし) | 漏れる | 両方 | 詳細以上 | redaction ヒューリスティックのキーワード依存の穴 |
+| `CANARY_ARGV_LONG` | プロセス argv (`02-exfil.sh` の `curl -A "${CANARY_ARGV_LONG}"`。独立した argv 要素、13 バイト以上・キーワードなし) | 漏れない (`<truncated, N bytes>`) | 両方 | 詳細以上 | 12 バイト超の切り詰めが効く |
 | `CANARY_ARGV_FLAG` | プロセス argv (`Authorization: Bearer` ヘッダ) | 漏れない | 両方 | 詳細以上 | フラグ名ベースの redaction が効く |
 | `CANARY_URL_QUERY` | 平文 HTTP のクエリ文字列 | 漏れない | 両方 | 詳細以上 | eBPF 内でクエリが除去される |
 | `CANARY_URL_PATH` | 平文 HTTP のパス | 漏れる | 両方 | 詳細以上 | HTTP path は redact 対象外 |
@@ -48,6 +48,21 @@ path/host を含まない) しか走査対象に無い場合、⚠️ ではな�
 アーティファクトが `cicd-sensor-attestation/predicate.json` 1 ファイルのみだったため、
 `CANARY_DNS` (集計でも判定対象) 以外の「漏れる」はずのカナリアはすべてこの N/A に
 分類され、「乖離なし」と正しく判定された (docs/SPEC.md §3, §6, §7)。
+
+## 前提: cicd-sensor はルールに一致したイベントの詳細しか記録しない (run 32510077347)
+
+HTML レポート (詳細レベルの証跡) であっても、cicd-sensor は「ルールに一致した
+イベント」の `hits[]` にしか `process.argv` / `payload` の詳細を記録しない。
+ルールに一致しないイベントは standalone モードのレポートに一切現れない
+(`domain_observations[]` / `network_connections[]` はルール一致に関係なく
+載る例外だが、`argv` を持たない)。このため `CANARY_ARGV_SHORT` /
+`CANARY_ARGV_LONG` / `CANARY_PATH` / `CANARY_URL_PATH` は、それらを運ぶ
+プロセス・イベントが `.cicd-sensor/rules/testbed.yaml` の何らかのルールに
+一致しない限り、原理的に観測できない。この対応として
+`cicd_runtime_testbed/canary_observability` ruleset
+(`testbed_canary_argv_carrier` / `testbed_canary_path_probe` /
+`testbed_canary_http_host`、すべて `action: collect`) を追加した
+(docs/SPEC.md §5)。
 
 ## ランナー由来トークンの検出 (`tools/scan-leaks.sh` 二次走査)
 
@@ -70,9 +85,9 @@ path/host を含まない) しか走査対象に無い場合、⚠️ ではな�
 
 | シナリオ | 主な操作 | falco-actions 側の想定対応 | cicd-sensor 側の想定対応 |
 | --- | --- | --- | --- |
-| `00-seed.sh` | 偽クレデンシャルの配置 (準備ステップ、検知対象ではない) | (該当なし、書き込みの副次的検知はありうる) | (該当なし) |
+| `00-seed.sh` | 偽クレデンシャルの配置 (準備ステップ、検知対象ではない)。`/tmp/${CANARY_PATH}/canary-path-probe.marker` も作る | (該当なし、書き込みの副次的検知はありうる) | `testbed_canary_path_probe` (action: collect) |
 | `01-credential-access.sh` | `~/.aws/credentials` 等の cat、`/proc/self/environ` の読み取り、Runner トークンファイルの存在確認 | `Suspicious Process Reading GitHub Token`、`Process Reading Environment Variables of Others` (falco_cicd_rules.yaml) | baseline rules の generic-credential-access 系 |
-| `02-exfil.sh` | DNS 解決失敗、平文 HTTP (クエリ/パス/Authorization ヘッダ)、HTTPS 対照群 | outbound connection 抽出 (analyze mode)、CI/CD ルールには専用の平文 HTTP ルールはない想定 | `domain` / `http_request` イベント種別のベースライン・カスタムルール |
+| `02-exfil.sh` | DNS 解決失敗、平文 HTTP (クエリ/パス/Authorization ヘッダ/argv カナリア)、HTTPS 対照群 | outbound connection 抽出 (analyze mode)、CI/CD ルールには専用の平文 HTTP ルールはない想定 | `domain` / `http_request` イベント種別のベースライン・カスタムルール、`testbed_canary_argv_carrier` (curl 実行全般、action: collect)、`testbed_canary_http_host` (host==example.com、action: collect) |
 | `03-npm-postinstall/` | npm postinstall からクレデンシュル読み取り + 外部通信 (最重要: プロセス系譜の検知能力比較) | 系譜4世代までを output に含めるが、ルール条件としては使っていない想定 → 汎用ルールでしか引っかからない | `process.ancestors` を使い npm の子孫であることを条件に含められる専用ルールで検知できる想定 |
 | `04-persistence.sh` | `~/.bashrc` への追記、無効化された `.disabled` ワークフローファイルの作成 | `Possible Workflow File Overwrite` (`.github/workflows/` への書き込み) | file_open / file_move 系のベースライン・カスタムルール |
 | `05-memfd-exec.sh` | `memfd_create` 経由の fileless 実行 | falco 側で memfd 相当の情報が取れるかを確認 (専用ルールがあるかは未確認) | `process_exec.is_memfd` |
@@ -88,6 +103,24 @@ path/host を含まない) しか走査対象に無い場合、⚠️ ではな�
 同梱) と job summary に記録する。1 つも取得できなければジョブは失敗し、一部だけの場合は
 `::warning::` を出して続行する (docs/SPEC.md §6)。`tools/scan-leaks.sh` は
 `telemetry-manifest.txt` をカナリア走査から除外しない。
+
+## `telemetry_dirs` とツール種別判定の不整合の修正
+
+`leak-report.json` に `telemetry_dirs` (`scan_root` 直下のディレクトリ名一覧、
+`tools/scan-leaks.sh` が走査時点で記録する) を追加した。`tools/render-matrix.py`
+のツール種別判定 (present_tools) はこれを優先して使う。以前はこの判定に
+実行時の `os.listdir(scan_root)` を直接使っており、`render-matrix.py` を
+走査時と異なる環境・カレントディレクトリで実行すると (例: `leak-report.json`
+だけを後から読む場合)、証跡粒度判定 (`detect_evidence_granularity`、
+scan_root 配下を再帰的に歩くため名前の一致に依存しない) は正しく機能するのに
+ツール種別判定だけが「判定不能」になる、という不整合が起きていた。
+
+さらに、ツール種別が判定不能な場合のフォールバックも見直した。以前は
+「安全側に倒して全カナリアを判定対象にする」だったが、これは falco 固有の
+`CANARY_SCAP` に対しては cicd-sensor 単独の run を走査するたびに必ず
+⚠️ (exit 1) を生む誤検知だった。修正後は、ツール固有のカナリア
+(`CANARY_SCAP`) のみ判定不能時に N/A とし、両ツール共通のカナリアは
+従来どおり判定する (docs/SPEC.md §7)。
 
 ## カナリア走査の大文字小文字非依存化
 

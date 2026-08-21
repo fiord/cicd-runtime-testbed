@@ -5,7 +5,11 @@
 # 用途:
 #   後続シナリオ (01, 05, 06 など) が読み書きする「偽クレデンシャル」を
 #   配置する。CANARY_FILE / CANARY_PATH を実ファイルに埋め込み、
-#   01-credential-access.sh がそれを読む対象を作る。
+#   01-credential-access.sh がそれを読む対象を作る。また、
+#   .cicd-sensor/rules/testbed.yaml の観測用ルール
+#   (testbed_canary_path_probe) を発火させる専用マーカーファイルも
+#   ここで作成する (cicd-sensor はルールに一致したイベントの詳細しか
+#   記録しないため。docs/SPEC.md 5節参照)。
 #
 # 安全性:
 #   ここで書き込む値はすべて canaries/canaries.env 由来の偽値 (CNRY-...)。
@@ -57,6 +61,20 @@ marker_dir="/tmp/${CANARY_PATH}"
 mkdir -p "${marker_dir}"
 printf 'cicd-runtime-testbed marker file\n' > "${marker_dir}/marker"
 note "created marker directory whose name is CANARY_PATH itself"
+end_step
+
+step "seed: canary path observation marker (/tmp/\${CANARY_PATH}/canary-path-probe.marker)"
+# .cicd-sensor/rules/testbed.yaml の testbed_canary_path_probe ルール
+# (event_type: file_open, action: collect) がこのファイル名一致で発火する。
+# cicd-sensor はルールに一致したイベントの詳細しか記録しない (「実地実行で
+# 判明した最重要の事実」。README / docs/SPEC.md 5節参照) ため、CANARY_PATH
+# を含むディレクトリへの書き込みが発火対象にならない限り payload.path は
+# 一切レポートに現れない。上の "marker" とは別に、この専用ファイル名
+# (canary-path-probe.marker) にだけ一致する観測用ルールを用意することで、
+# ディレクトリ名 (=CANARY_PATH の値) を含む path がヒットの payload に
+# 確実に記録されるようにする。
+printf 'cicd-runtime-testbed canary-path observation probe\n' > "${marker_dir}/canary-path-probe.marker"
+note "created canary-path-probe.marker to trigger testbed_canary_path_probe (collect)"
 end_step
 
 step "seed: fake npm registry token (~/.npmrc)"

