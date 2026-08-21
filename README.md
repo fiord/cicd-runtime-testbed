@@ -56,6 +56,30 @@
   `assert` が失敗した場合は、kill が実際には起きなかったことを意味し、それが異常事態です。
 - 全てのトリガーは `workflow_dispatch` のみです。`push` / `pull_request` では起動しません
   (public repo で不用意に走らないようにするため)。
+- **カナリア走査 (`tools/scan-leaks.sh`) は大文字小文字を区別しません。** DNS 名は
+  リゾルバによって小文字に正規化されるため、以前の大文字小文字を区別する実装では
+  `CANARY_DNS` の漏洩を見逃す偽陰性が実地実行 (run 32381640678) で発生していました。
+  ランナー由来トークンの二次走査 (`runner_token_findings`) は対象外で、引き続き
+  大文字小文字を区別します (`ghs_`/`ghp_` 等のプレフィックスや JWT の `eyJ` は大小に
+  意味があるため)。
+- **cicd-sensor の standalone モードで得られる証跡には限界があります。** attestation
+  predicate は集計のみで、個別イベントの timestamp / argv / プロセスツリー、
+  ファイルアクセスのパス (`fileAccess` 未実装)、`collect` アクションのヒット、HTTP の
+  path/host を一切含みません。個別イベントの詳細ログを得るには Manager が必要で、
+  このテストベッドは Manager を構築しない方針のため得られません。このため
+  `tools/render-matrix.py` は、集計レベルの証跡 (predicate.json) しか無い場合、
+  そのレベルでは原理的に観測できないカナリアを ⚠️ ではなく **N/A (この証跡粒度では
+  観測不能)** と表示します (`CANARY_DNS` は predicate の `domains` 配列に載るため
+  集計レベルでも判定対象です)。実地実行 (run 32381640678) では、実際にアーティファクトが
+  `cicd-sensor-attestation/predicate.json` 1 ファイルだけだったことをこの仕組みで
+  正しく扱えることを確認しています (docs/SPEC.md §3, §6, §7)。
+- **collect-telemetry 系ジョブはテレメトリ収集の完全性を明示します。** 期待する
+  アーティファクト／抽出ファイルのうちどれが取得できたかを job summary と
+  `telemetry-manifest.txt` (各 telemetry アーティファクトに同梱) に記録し、1 つも
+  取得できなければジョブを失敗させます (一部だけの場合は `::warning::` で続行)。
+  以前は `actions/download-artifact` の `continue-on-error: true` により、
+  `cicd-sensor-report` の取得に失敗しても黙って進み、predicate.json 1 ファイルだけの
+  テレメトリが「成功」として上がってしまう不具合がありました (run 32381640678 で実際に発生)。
 
 ---
 
@@ -142,9 +166,9 @@ gh release view v0.0.38 --repo cicd-sensor/cicd-sensor
 | --- | --- | --- | --- |
 | `falco-live.yml` | falco live モードでの検知 (`falco-version` 0.39.0 / 0.39.2 の matrix) | Actions タブから workflow_dispatch で実行 (入力なし) | falco-actions を呼ぶ前に、指定した `falco-version` タグが Docker Hub に実在するかを preflight ステップが確認する (存在しなければジョブをここで明確に落とす)。各バージョンの `telemetry-falco-live-<version>` アーティファクトに job summary と (取得できれば) `falco_events.json` / `falco_start_logs.txt` が入る。`required_engine_version: 0.43.0` のルールを実際の上限バージョン (0.39.x) が読み込めたか/拒否したか/警告のみで通ったかを job summary の "matrix note" / "required_engine_version" セクションで確認する。**なぜ 0.39.x が上限か**: falco-actions がハードコードして使う `falcosecurity/falco-no-driver` イメージは、Docker Hub 上の数値タグが `0.39.2` で公開停止しているため (`0.43.0` は実在しない) |
 | `falco-analyze.yml` | falco analyze モードでの検知と生キャプチャ | workflow_dispatch。`upload_raw_capture` (既定 false) で生キャプチャの取り扱いを制御 | `analyze` ジョブは falco-actions/analyze を呼ぶ前に、`falco-version: 0.39.2` (falcosecurity/falco-no-driver の実際の上限) が Docker Hub に実在するかを preflight ステップが確認する。`telemetry-falco-analyze` アーティファクトに job summary・抽出情報 (processes/connections/dns/containers/written-files/hashes) が入る。`upload_raw_capture: true` のときのみ `capture.scap` も含む。同梱ルール (`required_engine_version: 0.43.0`) を 0.39.2 エンジンが実際にロードできたかは job summary の "required_engine_version" セクションを参照 (要手動確認) |
-| `sensor-monitor.yml` | cicd-sensor の検知 (kill なし、`monitor_mode: true`) | workflow_dispatch (入力なし) | 全シナリオ (00〜07。07 は detect / collect ルール専用) が実行され、`telemetry-cicd-sensor-monitor` に HTML レポートと attestation predicate が入る |
-| `sensor-enforce.yml` | cicd-sensor の kill 動作の検証。**成功が正常** | workflow_dispatch (入力なし) | `assert` ジョブが **成功** すれば kill が確認できたことを意味する。失敗した場合は kill が起きなかったことを意味し、要調査。**このワークフローが実行する `scenarios/90-killme.sh` はカナリアを注入しない** (`load_canaries` を呼ばない) ため、この run の run_id は `leak-scan.yml` の入力にはできない (対象外として弾かれる) |
-| `leak-scan.yml` | 漏洩マトリクスの生成 (T3) | workflow_dispatch。`run_id` に `falco-live.yml` / `falco-analyze.yml` / `sensor-monitor.yml` いずれかの run ID を入力 (`sensor-enforce.yml` の run ID は不可。上記参照) | 対象 run の `telemetry-*` アーティファクトを横断的に走査し、job summary と (常に) ステップログの両方にカナリアごとの 期待 vs 実測 のマトリクスを出す。走査対象に含まれないツール向けのカナリア (`CANARY_SCAP` は falco 固有) は ⚠️ ではなく N/A (対象外) と表示され、判定にも exit code にも影響しない。**終了コードが 2 種類あり、意味が異なる**: exit 1 = 期待と実測の乖離あり (「発見」。仮説と現実が食い違ったことを目立たせるための意図的な失敗で、job summary の ⚠️ 行と `::error::` 注釈にどのカナリアが食い違ったかが出る)、exit 2 = 走査不成立 (「テスト自体が成立していない」。対象 run に `telemetry-*` アーティファクトが無かった、または `sensor-enforce.yml` の run を誤って指定した等で走査対象 0 件/対象外になったケース。カナリアの判定は行なわれない)。どちらもワークフローとしては失敗 (赤) になるが、job summary の内容でどちらかを区別できる |
+| `sensor-monitor.yml` | cicd-sensor の検知 (kill なし、`monitor_mode: true`) | workflow_dispatch (入力なし) | 全シナリオ (00〜07。07 は detect / collect ルール専用) が実行され、`telemetry-cicd-sensor-monitor` に HTML レポートと attestation predicate が入る。collect-telemetry ジョブは取得できたアーティファクトを `telemetry-manifest.txt` と job summary に明記し、1 つも取得できなければジョブを失敗させる |
+| `sensor-enforce.yml` | cicd-sensor の kill 動作の検証。**成功が正常** | workflow_dispatch (入力なし) | `assert` ジョブが **成功** すれば kill が確認できたことを意味する。失敗した場合は kill が起きなかったことを意味し、要調査。**このワークフローが実行する `scenarios/90-killme.sh` はカナリアを注入しない** (`load_canaries` を呼ばない) ため、この run の run_id は `leak-scan.yml` の入力にはできない (対象外として弾かれる)。collect-telemetry ジョブのテレメトリ収集完全性チェックは `sensor-monitor.yml` と同様 |
+| `leak-scan.yml` | 漏洩マトリクスの生成 (T3) | workflow_dispatch。`run_id` に `falco-live.yml` / `falco-analyze.yml` / `sensor-monitor.yml` いずれかの run ID を入力 (`sensor-enforce.yml` の run ID は不可。上記参照) | 対象 run の `telemetry-*` アーティファクトを横断的に走査し、job summary と (常に) ステップログの両方にカナリアごとの 期待 vs 実測 のマトリクスを出す。走査対象に含まれないツール向けのカナリア (`CANARY_SCAP` は falco 固有) は ⚠️ ではなく N/A (対象外) と表示され、判定にも exit code にも影響しない。**証跡の粒度が足りない場合も同様に N/A になる** (例: cicd-sensor の attestation predicate 集計のみで、HTML レポートや falco の詳細テレメトリが無い場合、`CANARY_PATH` 等の「詳細以上」を要求するカナリアは N/A (この証跡粒度では観測不能) と表示される。`CANARY_DNS` は predicate だけでも判定対象)。**終了コードが 2 種類あり、意味が異なる**: exit 1 = 期待と実測の乖離あり (「発見」。仮説と現実が食い違ったことを目立たせるための意図的な失敗で、job summary の ⚠️ 行と `::error::` 注釈にどのカナリアが食い違ったかが出る)、exit 2 = 走査不成立 (「テスト自体が成立していない」。対象 run に `telemetry-*` アーティファクトが無かった、または `sensor-enforce.yml` の run を誤って指定した等で走査対象 0 件/対象外になったケース。カナリアの判定は行なわれない)。どちらもワークフローとしては失敗 (赤) になるが、job summary の内容でどちらかを区別できる |
 
 ### 推奨実行順序
 

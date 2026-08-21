@@ -177,6 +177,14 @@ exit code が 2 だった場合はこの表は「N/A (走査不成立)」と記�
 対象に走査した場合、実測欄は N/A (対象外) になる。これは正常であり、⚠️ や乖離
 としては扱わない (docs/SPEC.md §7)。
 
+さらに、`sensor-monitor.yml` の run で attestation predicate (`cicd-sensor-attestation`)
+しか取得できていない場合 (HTML レポート `cicd-sensor-report` や falco の詳細テレメトリが
+無い場合)、`CANARY_PATH` / `CANARY_FILE` / `CANARY_ARGV_SHORT` / `CANARY_ARGV_LONG` /
+`CANARY_ARGV_FLAG` / `CANARY_URL_QUERY` / `CANARY_URL_PATH` の実測欄も
+N/A (この証跡粒度では観測不能) になる (`CANARY_DNS` は predicate だけでも判定対象なので
+対象外)。これも正常であり、⚠️ や乖離としては扱わない
+(docs/SPEC.md §3「観測に必要な証跡粒度」、§7)。上記「参考: 初回実行で得られた結果」を参照。
+
 `leak-scan.yml` は⚠️ が1つでもあれば非ゼロ終了する (exit 1)。今回の実行は
 成功 (exit 0、すべて仮説どおり) / 失敗 (exit 1、乖離あり) / 走査不成立 (exit 2、上のセクション参照)
 のどれだったか:
@@ -209,6 +217,43 @@ job summary の「ランナー由来トークンのパターン検出」セク�
 - Secret は登録されていたか:
 - 登録されていた場合、`CANARY_ENV` の判定結果 (漏れなかったか):
 - 未登録だった場合、その旨が `scenarios/lib/common.sh` の記録どおりログに残っていたか:
+
+---
+
+## 参考: 初回実行で得られた結果 (run 32381640678, sensor-monitor.yml)
+
+このセクションは記入用テンプレートではなく、実際に得られた実測結果の記録。
+以降の実行結果とこの記録を突き合わせることで、再現性や差分を確認できる。
+
+- 対象 run: `sensor-monitor.yml` の run
+  [32381640678](https://github.com/fiord/cicd-runtime-testbed/actions/runs/32381640678)
+- アーティファクトの中身: `cicd-sensor-attestation/predicate.json` の **1 ファイルのみ**
+  (2112 バイト)。`cicd-sensor-report` (HTML レポート) も `testbed-log.jsonl` も
+  含まれていなかった。
+- cicd-sensor は正常に動作し、predicate の
+  `https://cicd-sensor.github.io/runtime_trace/result/v1alpha1` は `"detected"`。
+- 発火した検知:
+  - カスタムルール `cicd_runtime_testbed/kill_test` / `testbed_detect_marker`
+    (`.cicd-sensor/rules/` のロードが機能していることを確認)
+  - ベースラインルール `cicd_sensor_baseline/generic_credential_access` /
+    `anchored_multi_family_credential_access`
+    (`01-credential-access.sh` の検知を確認)
+- `CANARY_DNS` の漏洩を確認: predicate の `domains` 配列に
+  `cnry-dns-donotuse-18ebf5.test.invalid.zuup3ixw3die3n0bckkvpevybe.bx.internal.cloudapp.net`
+  として現れていた。DNS 名がリゾルバによって**小文字化**され、resolver の
+  **search domain が付加**されていることを実地で確認 (`tools/scan-leaks.sh` の
+  大文字小文字非依存化の直接の根拠。部分一致で拾えているため search domain の
+  付加自体は問題にならない)。
+- `testbed_collect_marker` は predicate に一切現れなかった。**`collect` アクションの
+  ヒットが attestation predicate から除外される仕様であることを実地で確認**
+  (docs/SPEC.md §4, §6)。
+- `testbed_detect_marker` は `file_open` ルールだが、predicate には**どのファイルへの
+  アクセスだったかの情報が無かった**。**`fileAccess` フィールドが未実装であることを
+  実地で確認** (docs/SPEC.md §6)。
+- 接続先 IP に `127.0.0.53` (systemd-resolved のループバックアドレス) が記録されており、
+  ローカル DNS リゾルバ経由の名前解決が捕捉されていることを確認。
+- この実測結果が、今回のツール改修 (カナリア走査の大文字小文字非依存化、
+  collect-telemetry の完全性チェック、証跡粒度による N/A 判定) の直接のきっかけとなった。
 
 ---
 

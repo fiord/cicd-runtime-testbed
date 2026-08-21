@@ -46,6 +46,25 @@ Usage:
   mismatches のカウントにも exit code にも算入しない (例: falco 固有の
   CANARY_SCAP を cicd-sensor 単独の run に対して走査した場合)。
 
+  さらに (実地実行 run 32381640678 で判明した問題への対応)、上記の
+  「ツール種別による N/A」とは独立に「証跡の粒度による N/A」も判定する。
+  cicd-sensor の standalone モードで得られる attestation predicate は
+  **集計のみ** (個別イベントの timestamp / argv / プロセスツリー、ファイル
+  アクセスのパス、collect アクションのヒット、HTTP の path/host 等を
+  一切含まない。cicd-sensor のドキュメントにも明記されている仕様) であり、
+  predicate.json しか無い状況では `CANARY_PATH` / `CANARY_FILE` /
+  `CANARY_ARGV_SHORT` / `CANARY_ARGV_LONG` / `CANARY_ARGV_FLAG` /
+  `CANARY_URL_QUERY` / `CANARY_URL_PATH` は原理的に観測できない
+  (「漏れなかった」のではなく「見る場所が無い」)。これらは、走査対象に
+  cicd-sensor-report (HTML レポート) や falco の詳細テレメトリ
+  (falco_events.json・抽出ファイル等) といった、集計より詳細な証跡が
+  一つも含まれていない場合に限り、⚠️ ではなく N/A (証跡粒度不足) と表示し、
+  mismatches のカウントにも exit code にも算入しない。`CANARY_DNS` は
+  predicate の domains 配列に載る (今回の実地実行で確認した唯一の有効な
+  観測) ため、この N/A 判定の対象には含めない。ツール種別による N/A と
+  証跡粒度による N/A は独立した仕組みであり、両方が同時に働く
+  (一方が先に N/A と判定していれば、そちらの理由を優先して表示する)。
+
 Python 3 標準ライブラリのみを使用する。外部依存を追加しないこと。
 """
 import json
@@ -101,6 +120,136 @@ CANARY_APPLIES_TO = {
     "CANARY_DNS": BOTH_TOOLS,
     "CANARY_SCAP": frozenset({TOOL_FALCO}),
 }
+
+# --- 証跡粒度による N/A 判定 (docs/SPEC.md §7「対象外（N/A）判定」後半) -------
+#
+# cicd-sensor の standalone モード (Manager なし) で得られる証跡は、
+# attestation predicate (集計のみ) と HTML レポート (詳細) の 2 種類しかない
+# (docs/SPEC.md §6)。predicate は個別イベントの timestamp / argv /
+# プロセスツリー、ファイルアクセスのパス、`collect` アクションのヒット、
+# HTTP の path/host を一切含まない仕様であることが cicd-sensor の
+# ドキュメントに明記されている。実地実行 (run 32381640678) でこれを実際に
+# 確認した: predicate.json だけがアーティファクトに含まれており、
+# `testbed_detect_marker` (file_open ルール) が発火したことは分かっても
+# どのファイルだったかは分からなかった (fileAccess 未実装)。
+#
+# このため、predicate 相当の集計レベルの証跡しか走査対象に無い場合、
+# 集計レベルでは原理的に観測できないカナリアを ⚠️ (期待との乖離) として
+# 扱ってはいけない。「漏れなかった」のか「見る場所が無い」のかを
+# 区別できないため、そのようなカナリアは N/A (証跡粒度不足) として
+# mismatches にも exit code にも算入しない。
+#
+# 証跡粒度は 3 段階 (低い順): "aggregate" (集計。predicate のみ) <
+# "detail" (詳細。cicd-sensor-report の HTML、または falco の
+# falco_events.json・抽出ファイル等の個別イベント情報) < "raw" (生。
+# falco の capture.scap)。個々のカナリアは、観測に最低限必要な粒度を
+# GRANULARITY_RANK の値で表す。
+GRANULARITY_RANK = {"none": 0, "aggregate": 1, "detail": 2, "raw": 3}
+GRANULARITY_LABEL = {
+    "none": "証跡なし",
+    "aggregate": "集計レベル (attestation predicate のみ)",
+    "detail": "詳細レベル (HTML レポート / 個別イベント情報あり)",
+    "raw": "生キャプチャレベル (capture.scap あり)",
+}
+
+# 「詳細レベル (rank>=2) 以上の証跡が無いと原理的に観測できない」カナリア。
+# docs/SPEC.md §3 の「観測に必要な証跡粒度」列、および今回の実地実行で
+# 判明した predicate の仕様 (集計のみ・fileAccess 未実装・collect除外・
+# HTTP path/host 未収録) に基づく。`CANARY_DNS` は predicate の domains
+# 配列に載るため意図的にこの集合から除外している (集計レベルでも判定対象)。
+# `CANARY_ENV` / `CANARY_SCAP` も意図的に含めていない
+# (`CANARY_ENV` は「観測できるかどうか」よりは redaction/マスキングの
+# 検証が主目的であり expected=no_leak なので集計レベルでも矛盾しない。
+# `CANARY_SCAP` は既存の CANARY_APPLIES_TO による falco 固有 N/A 判定で
+# 別途カバーされている。挙動変更の影響範囲を最小化するため、この2つは
+# 対象に含めない判断とした)。
+REQUIRES_DETAIL_OR_BETTER = frozenset(
+    {
+        "CANARY_PATH",
+        "CANARY_FILE",
+        "CANARY_ARGV_SHORT",
+        "CANARY_ARGV_LONG",
+        "CANARY_ARGV_FLAG",
+        "CANARY_URL_QUERY",
+        "CANARY_URL_PATH",
+    }
+)
+
+MIN_GRANULARITY_FOR_JUDGEMENT = 2  # "detail" 以上でないと判定しない
+
+
+def detect_evidence_granularity(report):
+    """leak-report.json の `scan_root` 配下のディレクトリ構成から、実際に
+    得られている証跡の粒度を判定する。
+
+    戻り値: (rank, label, detail_lines)
+      - rank: GRANULARITY_RANK の値 (int)。判定できた場合のみ int。
+      - label: GRANULARITY_LABEL 相当の説明文字列。
+      - detail_lines: 判定根拠 (見つかった/見つからなかったものの一覧)。
+
+    判定できない場合 (scan_root にアクセスできない等) は (None, None, [])
+    を返す。呼び出し側は None の場合、detect_present_tools と同様に
+    安全側に倒して証跡粒度による N/A 判定を行なわないこと
+    (N/A で見逃すより ⚠️ で気づける方が良いため)。
+    """
+    scan_root = report.get("scan_root")
+    if not scan_root or not os.path.isdir(scan_root):
+        return None, None, []
+    try:
+        top_entries = os.listdir(scan_root)
+    except OSError:
+        return None, None, []
+
+    cicd_sensor_attestation_found = False
+    cicd_sensor_report_found = False
+    falco_any_found = False
+    falco_raw_found = False
+
+    for entry in top_entries:
+        entry_path = os.path.join(scan_root, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        is_falco_dir = entry.startswith("telemetry-falco-")
+        if is_falco_dir:
+            falco_any_found = True
+        for walk_root, _dirs, files in os.walk(entry_path):
+            base = os.path.basename(walk_root)
+            if base == "cicd-sensor-attestation":
+                cicd_sensor_attestation_found = True
+            if base == "cicd-sensor-report":
+                cicd_sensor_report_found = True
+            if is_falco_dir and "capture.scap" in files:
+                falco_raw_found = True
+
+    rank = 0
+    if cicd_sensor_attestation_found:
+        rank = max(rank, GRANULARITY_RANK["aggregate"])
+    if cicd_sensor_report_found:
+        rank = max(rank, GRANULARITY_RANK["detail"])
+    if falco_any_found:
+        # falco のテレメトリ (falco_events.json / 抽出ファイル等) は
+        # capture.scap が無くても個別イベント相当の情報を含むため、
+        # 集計のみの predicate よりは詳細な証跡として扱う。
+        rank = max(rank, GRANULARITY_RANK["detail"])
+    if falco_raw_found:
+        rank = max(rank, GRANULARITY_RANK["raw"])
+
+    label_by_rank = {v: k for k, v in GRANULARITY_RANK.items()}
+    label = GRANULARITY_LABEL[label_by_rank[rank]]
+
+    detail_lines = [
+        "cicd-sensor-attestation (predicate.json): %s"
+        % ("あり" if cicd_sensor_attestation_found else "なし"),
+        "cicd-sensor-report (HTML): %s"
+        % ("あり" if cicd_sensor_report_found else "なし"),
+        "falco テレメトリ (telemetry-falco-*): %s"
+        % ("あり" if falco_any_found else "なし"),
+        "falco capture.scap (生キャプチャ): %s"
+        % ("あり" if falco_raw_found else "なし"),
+    ]
+
+    return rank, label, detail_lines
+
 
 # leak-scan.yml がダウンロードする telemetry-* アーティファクトのディレクトリ名
 # (actions/download-artifact merge-multiple:false によりアーティファクト名
@@ -163,6 +312,9 @@ def detect_present_tools(report):
 
 def render(report):
     present_tools = detect_present_tools(report)
+    granularity_rank, granularity_label, granularity_detail_lines = (
+        detect_evidence_granularity(report)
+    )
 
     lines = []
     lines.append("## Leak scan matrix")
@@ -181,6 +333,20 @@ def render(report):
             "一致するものが無かったため、安全側に倒して全カナリアを"
             "判定対象として扱う)"
         )
+    # 今回の走査で利用できた証跡の粒度 (docs/SPEC.md §7 後半、実地実行
+    # run 32381640678 で判明した問題への対応)。predicate 相当の集計レベル
+    # しか無い場合、そのレベルでは原理的に観測できないカナリアが後続の表で
+    # N/A (証跡粒度不足) になる理由をここで明示する。
+    if granularity_rank is not None:
+        lines.append("- 今回の走査で利用できた証跡の粒度: %s" % granularity_label)
+        for detail_line in granularity_detail_lines:
+            lines.append("  - %s" % detail_line)
+    else:
+        lines.append(
+            "- 今回の走査で利用できた証跡の粒度: 判定不能 "
+            "(`scan_root` にアクセスできないため。安全側に倒して"
+            "証跡粒度による N/A 判定は行なわず、全カナリアを通常どおり判定する)"
+        )
     lines.append("")
     lines.append("| カナリア ID | 注入経路 | 期待 | 実測 | 判定 |")
     lines.append("| --- | --- | --- | --- | --- |")
@@ -191,10 +357,11 @@ def render(report):
     mismatches = 0
     mismatch_details = []
     na_count = 0
+    granularity_na_count = 0
     rendered_ids = set()
 
     def render_row(canary_id, finding):
-        nonlocal mismatches, na_count
+        nonlocal mismatches, na_count, granularity_na_count
         route = CANARY_ROUTES.get(canary_id, "(unknown route)")
         expected = finding.get("expected", "?")
         found = bool(finding.get("found", False))
@@ -212,6 +379,21 @@ def render(report):
             lines.append(
                 "| `%s` | %s | %s | (対象外) | N/A (%s のテレメトリではないため) |"
                 % (canary_id, route, expected_label, "/".join(sorted(applies_to)))
+            )
+            return
+
+        # 証跡粒度による N/A 判定 (ツール種別による N/A とは独立、両方が働く。
+        # モジュール冒頭コメントおよび REQUIRES_DETAIL_OR_BETTER の定義を参照)。
+        if (
+            canary_id in REQUIRES_DETAIL_OR_BETTER
+            and granularity_rank is not None
+            and granularity_rank < MIN_GRANULARITY_FOR_JUDGEMENT
+        ):
+            granularity_na_count += 1
+            lines.append(
+                "| `%s` | %s | %s | (観測不能) | "
+                "N/A（この証跡粒度では観測不能。集計レベルの証跡しか無い） |"
+                % (canary_id, route, expected_label)
             )
             return
 
@@ -260,11 +442,27 @@ def render(report):
             "としました（⚠️ や exit code には算入していません）。"
             % na_count
         )
+    if granularity_na_count:
+        lines.append(
+            "ℹ️ %d 件は今回の証跡粒度 (%s) では原理的に観測できないため "
+            "N/A としました（⚠️ や exit code には算入していません。"
+            "「漏れなかった」のではなく「見る場所が無い」ことに注意）。"
+            % (
+                granularity_na_count,
+                granularity_label if granularity_label else "不明",
+            )
+        )
 
     lines.append("")
     lines.append(render_runner_token_section(report))
 
-    return "\n".join(lines) + "\n", mismatches, mismatch_details, na_count
+    return (
+        "\n".join(lines) + "\n",
+        mismatches,
+        mismatch_details,
+        na_count,
+        granularity_na_count,
+    )
 
 
 def render_runner_token_section(report):
@@ -422,7 +620,9 @@ def main(argv):
         print("RESULT: scan not established (scanned_file_count=%s) -> exit 2" % scanned_file_count)
         return 2
 
-    table_md, mismatches, mismatch_details, na_count = render(report)
+    table_md, mismatches, mismatch_details, na_count, granularity_na_count = render(
+        report
+    )
 
     # job summary に書く場合でも、同じ内容を必ず標準出力にも出す
     # (GITHUB_STEP_SUMMARY が設定されていてもステップのログが空にならない
@@ -438,7 +638,12 @@ def main(argv):
             )
 
     findings = report.get("findings", [])
-    na_suffix = " (%d N/A)" % na_count if na_count else ""
+    na_parts = []
+    if na_count:
+        na_parts.append("%d N/A tool" % na_count)
+    if granularity_na_count:
+        na_parts.append("%d N/A granularity" % granularity_na_count)
+    na_suffix = " (%s)" % ", ".join(na_parts) if na_parts else ""
     print(
         "RESULT: %d canaries checked%s, %d mismatch(es) -> exit %d"
         % (len(findings), na_suffix, mismatches, 1 if mismatches else 0)

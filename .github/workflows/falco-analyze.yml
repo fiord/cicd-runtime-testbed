@@ -402,24 +402,82 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Collect telemetry (T2)
+        id: collect_telemetry
         if: always()
         run: |
+          set -uo pipefail
           mkdir -p telemetry
           if [ -f "$GITHUB_STEP_SUMMARY" ]; then
             cp "$GITHUB_STEP_SUMMARY" telemetry/job-summary.md
           fi
-          for f in hashes.txt outbound.txt proc.txt files_written.txt \
-                   dns_extract_json.txt containers.txt udp_extract.txt \
-                   top_connection.txt topprocs_net.txt; do
+
+          # 期待するテレメトリファイル (extract-* / hashes 入力をすべて true
+          # にしているため、9 ファイルすべてが期待値)。"Analyze capture"
+          # ステップには continue-on-error: true が付いている
+          # (required_engine_version の不整合を実際に観測するため) ため、
+          # analyze action がエンジンのロード拒否等で実質的に失敗しても
+          # ジョブ自体は続行してしまう。その結果 telemetry-falco-analyze の
+          # 中身が job-summary.md だけという「収集不完全なのに成功扱い」の
+          # 成果物が上がりうる (sensor-monitor.yml / sensor-enforce.yml で
+          # 実地確認した不具合と同種のもの)。ここで期待ファイルの取得可否を
+          # telemetry-manifest.txt / job summary に明記し、1つも取得できて
+          # いなければこのジョブを失敗させる (docs/SPEC.md §6)。
+          expected_files="hashes.txt outbound.txt proc.txt files_written.txt dns_extract_json.txt containers.txt udp_extract.txt top_connection.txt topprocs_net.txt"
+          total=0
+          found=0
+          missing_names=""
+
+          {
+            echo "# telemetry-manifest.txt"
+            echo "# analyze job of falco-analyze.yml (run ${{ github.run_id }})"
+            echo "# format: <expected-file>: OK | MISSING"
+          } > telemetry/telemetry-manifest.txt
+
+          for f in ${expected_files}; do
+            total=$((total + 1))
             if [ -f "/tmp/${f}" ]; then
               cp "/tmp/${f}" "telemetry/${f}"
+              found=$((found + 1))
+              echo "${f}: OK" >> telemetry/telemetry-manifest.txt
+            else
+              missing_names="${missing_names}${f} "
+              echo "${f}: MISSING" >> telemetry/telemetry-manifest.txt
             fi
           done
-          if [ "${{ inputs.upload_raw_capture }}" = "true" ] && [ -f /tmp/capture.scap ]; then
-            echo "upload_raw_capture=true: including raw capture.scap in telemetry-falco-analyze"
-            cp /tmp/capture.scap telemetry/capture.scap
+
+          if [ "${{ inputs.upload_raw_capture }}" = "true" ]; then
+            if [ -f /tmp/capture.scap ]; then
+              echo "upload_raw_capture=true: including raw capture.scap in telemetry-falco-analyze"
+              cp /tmp/capture.scap telemetry/capture.scap
+              echo "capture.scap: OK (upload_raw_capture=true)" >> telemetry/telemetry-manifest.txt
+            else
+              echo "::warning::upload_raw_capture=true but /tmp/capture.scap was not found; capture.scap will be missing from telemetry-falco-analyze"
+              echo "capture.scap: MISSING (upload_raw_capture=true but /tmp/capture.scap not found)" >> telemetry/telemetry-manifest.txt
+            fi
           else
             echo "upload_raw_capture=false (default): raw capture.scap is not included (docs/SPEC.md §1-6)"
+            echo "capture.scap: N/A (upload_raw_capture=false)" >> telemetry/telemetry-manifest.txt
+          fi
+
+          {
+            echo "## Telemetry collection summary (T2)"
+            echo ""
+            echo "- extracted files collected: ${found} / ${total}"
+            if [ -n "${missing_names}" ]; then
+              echo "- missing: ${missing_names}"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${found}" -eq 0 ]; then
+            echo "::error::telemetry collection failed: none of the expected extracted telemetry files (${expected_files}) were produced by the Analyze capture step (outcome=${{ steps.analyze.outcome }}). See telemetry-manifest.txt / job summary."
+            echo "❌ **0 / ${total} expected extracted telemetry files collected. Failing this job (docs/SPEC.md §6).**" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          elif [ "${found}" -lt "${total}" ]; then
+            echo "::warning::telemetry collection partial: missing ${missing_names}(collected ${found}/${total}). See telemetry-manifest.txt in the uploaded telemetry-falco-analyze artifact."
+            echo "⚠️ **${found} / ${total} expected extracted telemetry files collected. Missing: ${missing_names}(see telemetry-manifest.txt).**" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "✅ **${found} / ${total} expected extracted telemetry files collected.**" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload telemetry-falco-analyze

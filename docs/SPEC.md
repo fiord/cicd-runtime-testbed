@@ -119,24 +119,36 @@ cicd-runtime-testbed/
 漏洩検証の中核。**各カナリアは「どの経路で漏れるか」を個別に切り分けるために存在する**。
 形式は `KEY=VALUE` の shell source 可能な形式とし、値はすべて一意で grep 可能なこと。
 
-| ID | 注入経路 | 値の制約 | 期待結果 | 適用範囲 | 検証する仮説 |
-| --- | --- | --- | --- | --- | --- |
-| `CANARY_ENV` | 環境変数（GitHub Secrets 経由） | 任意 | **漏れない** | 両方 | GH のログ自動マスキングが効く／センサーは env を収集しない |
-| `CANARY_FILE` | ファイル**内容**（`~/.aws/credentials`） | 任意 | **漏れない** | 両方 | 両ツールともファイル内容は読まない（パスのみ記録） |
-| `CANARY_PATH` | ファイル**パス**（`/tmp/CNRY.../marker`） | 任意 | **漏れる** | 両方 | cicd-sensor はパスを redact しない |
-| `CANARY_ARGV_SHORT` | プロセス argv（キーワードなし・**12 バイト以下**） | 12 バイト以下／`token`,`key`,`auth`,`pass`,`secret`,`cred`,`bearer`,`AKIA`,`ghp_`,`glpat-` を**含まない** | **漏れる** | 両方 | redaction ヒューリスティックのキーワード依存の穴 |
-| `CANARY_ARGV_LONG` | プロセス argv（キーワードなし・13 バイト以上） | 上記キーワードを含まない | **漏れない**（`<truncated, N bytes>` になる） | 両方 | 12 バイト超の切り詰めが効く |
-| `CANARY_ARGV_FLAG` | プロセス argv（`--header "Authorization: Bearer <値>"`） | 任意 | **漏れない** | 両方 | フラグ名ベースの redaction が効く |
-| `CANARY_URL_QUERY` | 平文 HTTP の**クエリ文字列** | 任意 | **漏れない** | 両方 | eBPF 内でクエリが除去される |
-| `CANARY_URL_PATH` | 平文 HTTP の**パス** | 任意 | **漏れる** | 両方 | HTTP path は redact 対象外 |
-| `CANARY_DNS` | DNS クエリのラベル（`<値>.test.invalid`） | DNS ラベルとして妥当（英数字とハイフン、63 文字以下） | **漏れる** | 両方 | ドメイン名は redact 対象外 |
-| `CANARY_SCAP` | 生の syscall バッファ（`echo` の引数＋ファイル書き込み） | 200 バイト以下 | **falco の capture.scap でのみ漏れる** | **falco 固有** | snaplen 256 の生キャプチャに素通りで入る |
+| ID | 注入経路 | 値の制約 | 期待結果 | 適用範囲 | 観測に必要な証跡粒度 | 検証する仮説 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `CANARY_ENV` | 環境変数（GitHub Secrets 経由） | 任意 | **漏れない** | 両方 | 集計（predicate）でも判定対象 | GH のログ自動マスキングが効く／センサーは env を収集しない |
+| `CANARY_FILE` | ファイル**内容**（`~/.aws/credentials`） | 任意 | **漏れない** | 両方 | **詳細以上**（HTML レポート／falco の個別イベント情報が必要） | 両ツールともファイル内容は読まない（パスのみ記録） |
+| `CANARY_PATH` | ファイル**パス**（`/tmp/CNRY.../marker`） | 任意 | **漏れる** | 両方 | **詳細以上**（predicate に `fileAccess` は無い。§6 参照） | cicd-sensor はパスを redact しない |
+| `CANARY_ARGV_SHORT` | プロセス argv（キーワードなし・**12 バイト以下**） | 12 バイト以下／`token`,`key`,`auth`,`pass`,`secret`,`cred`,`bearer`,`AKIA`,`ghp_`,`glpat-` を**含まない** | **漏れる** | 両方 | **詳細以上**（predicate に argv は無い） | redaction ヒューリスティックのキーワード依存の穴 |
+| `CANARY_ARGV_LONG` | プロセス argv（キーワードなし・13 バイト以上） | 上記キーワードを含まない | **漏れない**（`<truncated, N bytes>` になる） | 両方 | **詳細以上**（predicate に argv は無い） | 12 バイト超の切り詰めが効く |
+| `CANARY_ARGV_FLAG` | プロセス argv（`--header "Authorization: Bearer <値>"`） | 任意 | **漏れない** | 両方 | **詳細以上**（predicate に argv は無い） | フラグ名ベースの redaction が効く |
+| `CANARY_URL_QUERY` | 平文 HTTP の**クエリ文字列** | 任意 | **漏れない** | 両方 | **詳細以上**（predicate の domains には host しか無く、path/query は無い） | eBPF 内でクエリが除去される |
+| `CANARY_URL_PATH` | 平文 HTTP の**パス** | 任意 | **漏れる** | 両方 | **詳細以上**（predicate の domains には host しか無く、path/query は無い） | HTTP path は redact 対象外 |
+| `CANARY_DNS` | DNS クエリのラベル（`<値>.test.invalid`） | DNS ラベルとして妥当（英数字とハイフン、63 文字以下） | **漏れる** | 両方 | 集計（predicate）でも判定対象（`domains` 配列に host 単位で載る） | ドメイン名は redact 対象外 |
+| `CANARY_SCAP` | 生の syscall バッファ（`echo` の引数＋ファイル書き込み） | 200 バイト以下 | **falco の capture.scap でのみ漏れる** | **falco 固有** | 生（capture.scap そのもの） | snaplen 256 の生キャプチャに素通りで入る |
 
 「適用範囲」は、そのカナリアの期待結果が意味を持つツールを示す（`tools/render-matrix.py`
 の `CANARY_APPLIES_TO`、§7 参照）。`CANARY_SCAP` のみ falco 固有（cicd-sensor は
 `capture.scap` を作らないため、cicd-sensor 単独の run を走査しても判定しようがない）。
 それ以外は cicd-sensor の redaction 挙動の検証が主目的だが、falco 側のテレメトリに
 現れることも観測対象として有意なため両方に適用する。
+
+「観測に必要な証跡粒度」は、実地実行 (run 32381640678, sensor-monitor.yml) で判明した
+問題への対応として追加した列（§6, §7 参照）。cicd-sensor の standalone モードで得られる
+attestation predicate は**集計のみ**で、個別イベントの timestamp / argv / プロセスツリー、
+ファイルアクセスのパス（`fileAccess` フィールドは未実装）、`collect` アクションのヒット、
+HTTP の path/host（`domains` にはホスト名のみ）を一切含まない。このため
+「詳細以上」と書かれたカナリアは、走査対象に HTML レポートや falco の詳細テレメトリと
+いった、集計より詳細な証跡が一つも含まれていない場合、原理的に観測できない
+（「漏れなかった」のではなく「見る場所が無い」）。`tools/render-matrix.py` はこれを
+⚠️ ではなく N/A として扱う（§7 参照）。`CANARY_DNS` は `domains` 配列に host 単位で
+現れるため、集計レベルの証跡だけでも判定できる唯一の「漏れる」カナリアである
+（今回の実地実行で実際にこれが確認できた、唯一の有効な観測だった）。
 
 ### 値の命名規則
 
@@ -341,6 +353,37 @@ CEL の制約に注意:
 - Manager は構築しない（standalone のみ）。理由は導入コストと、
   本テストの目的が「GitHub-hosted で何が見えるか」であるため
 
+**standalone モードで得られる証跡の限界（実地実行 run 32381640678 で確認済み）**:
+standalone モードで得られる証跡は attestation predicate（集計）と
+HTML レポートの 2 種類に限られる。**個別イベント（timestamp / argv / プロセスツリー /
+ファイルアクセスのパス等）の詳細ログを得るには Manager が必要**であり、
+このテストベッドは Manager を構築しない方針のため、そのようなログはそもそも
+生成されない。attestation predicate は特に集計のみで、次を一切含まない
+（cicd-sensor のドキュメントにも明記されており、実地実行でも確認した）:
+
+- 個別イベントの timestamp / argv / プロセスツリー（`detections` は
+  ルールごとの `count` のみ）
+- ファイルアクセスの**パス**（`fileAccess` フィールドは未実装）
+- `collect` アクションのヒット（`detect` / `terminate` のみが載る。
+  `testbed_collect_marker` が predicate に一切現れないことを実地で確認した）
+- HTTP の path / host（`domains` 配列にはホスト名のみで、path/query は無い）
+
+このため §3「観測に必要な証跡粒度」で「詳細以上」と指定されたカナリアは、
+predicate しか無い状況では原理的に観測できない。§7 の N/A 判定を参照。
+
+### collect-telemetry ジョブの完全性
+
+`sensor-monitor.yml` / `sensor-enforce.yml` の collect-telemetry ジョブ、および
+`falco-analyze.yml` の analyze ジョブの telemetry 収集ステップは、期待する
+アーティファクト／抽出ファイルのうちどれが実際に取得できたかを job summary と
+`telemetry-manifest.txt`（各 telemetry アーティファクトに含める、収集結果一覧）
+に明記する。1 つも取得できなかった場合はそのジョブを失敗させ、一部だけ
+取得できた場合は `::warning::` を出して続行する（実地実行 run 32381640678 で
+`cicd-sensor-report` の取得失敗が黙って進み、predicate.json 1 ファイルだけの
+テレメトリが「成功」として上がっていたことが判明したための対応）。
+`tools/scan-leaks.sh` は `telemetry-manifest.txt` を走査対象から除外しない
+（カナリアを含まないため実害がなく、後から追跡できる利点があるため）。
+
 ### 出力
 
 各ワークフローは `telemetry-<tool>-<mode>` という名前でアーティファクトを上げる。
@@ -365,6 +408,7 @@ CEL の制約に注意:
   "run_id": "1234567890",
   "scan_root": "downloaded-artifacts",
   "scanned_file_count": 0,
+  "canary_match_mode": "case_insensitive",
   "findings": [
     {
       "canary_id": "CANARY_PATH",
@@ -396,6 +440,13 @@ CEL の制約に注意:
   「期待と実測の乖離」と区別する（後述）。
 - **カナリアの実値を `leak-report.json` に書かないこと**（スキャナ出力自体が漏洩源になるため）。
   `canary_id` のみ記録する。
+- `canary_match_mode` は `findings`（カナリア本走査）が大文字小文字非依存
+  （`case_insensitive`）で行なわれたことを示す固定値。DNS 名はリゾルバによって
+  小文字に正規化されるため、`CANARY_DNS` のような値は predicate 中では
+  小文字化されて現れる。以前の大文字小文字を区別する実装では、これを
+  見逃す偽陰性が実地実行（run 32381640678）で発生した。`runner_token_findings`
+  （二次走査）はこの値の対象外で、常に大文字小文字を区別する
+  （`ghs_`/`ghp_` 等のプレフィックスや JWT の `eyJ` は大小に意味があるため）。
 
 ### 二次走査: ランナー由来トークンのパターン検出
 
@@ -484,6 +535,35 @@ CEL の制約に注意:
   既知の `telemetry-*` パターンに一つも一致しない場合は、**判定不能として扱い、
   安全側に倒して全カナリアを判定対象にする**（N/A で見逃すより、⚠️ で気づける方が
   良いため）。
+
+#### 対象外（N/A）判定：証跡の粒度によるカナリアの絞り込み（実地実行 run 32381640678 で追加）
+
+上記の「ツール種別による N/A」とは独立に、証跡の**粒度**によるもう一つの N/A 判定を行なう。
+§6 のとおり、cicd-sensor の standalone モードで得られる attestation predicate は集計のみで、
+個別イベントの timestamp / argv / プロセスツリー、ファイルアクセスのパス、`collect`
+アクションのヒット、HTTP の path/host を一切含まない。§3「観測に必要な証跡粒度」で
+「詳細以上」と指定されたカナリア（`CANARY_PATH` / `CANARY_FILE` / `CANARY_ARGV_SHORT` /
+`CANARY_ARGV_LONG` / `CANARY_ARGV_FLAG` / `CANARY_URL_QUERY` / `CANARY_URL_PATH`）は、
+predicate（集計レベル）しか無い状況では原理的に観測できない。「漏れなかった」のではなく
+「見る場所が無い」ため、これらを ⚠️ として扱ってはいけない。
+
+- `render-matrix.py` は `scan_root` 配下を走査し、次の 3 段階で証跡の粒度を判定する
+  （低い順）:
+  - `aggregate`（集計）: `cicd-sensor-attestation`（predicate.json）のみ
+  - `detail`（詳細）: `cicd-sensor-report`（HTML レポート）、または
+    `telemetry-falco-*` 配下に何らかのテレメトリ（`falco_events.json` や
+    抽出ファイル等の個別イベント情報）がある
+  - `raw`（生）: `telemetry-falco-*` 配下に `capture.scap` がある
+- 判定できた証跡の粒度が `detail` 未満（＝ `aggregate` または証跡なし）の場合、
+  「詳細以上」を要求するカナリアは ⚠️ ではなく **N/A（この証跡粒度では観測不能）** と表示し、
+  乖離件数にも exit code にも算入しない。
+- `CANARY_DNS` は predicate の `domains` 配列に host 単位で載るため、この N/A 判定の
+  対象に**含めない**（集計レベルでも判定対象。今回の実地実行で確認した唯一の有効な観測）。
+- マトリクスの冒頭に、今回の走査で利用できた証跡の粒度を明記する。
+- `scan_root` にアクセスできない場合は判定不能として扱い、ツール種別による N/A と同様に
+  安全側に倒して全カナリアを通常どおり判定する。
+- **ツール種別による N/A とこの証跡粒度による N/A は独立した仕組みであり、両方が同時に
+  機能する。** 一方がすでに N/A と判定していれば、そちらの理由が優先される。
 
 #### leak-scan.yml の対象にできるワークフロー
 

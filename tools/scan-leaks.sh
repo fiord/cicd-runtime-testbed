@@ -25,6 +25,13 @@
 #   - tools/ ディレクトリ (このスクリプトと render-matrix.py 自身)
 #   - スキャナ自身の出力ファイル (leak-report.json、任意のファイル名)
 #
+#   意図的に除外しないもの:
+#   - `telemetry-manifest.txt` (collect-telemetry ジョブが書く、テレメトリ
+#     収集結果の一覧。docs/SPEC.md §6)。カナリアの実値を含まないファイル
+#     なので走査対象から除外する実害がなく、むしろ走査対象に含めておくことで
+#     「後から何が収集できていた/いなかったか」を leak-report.json の
+#     locations 経由で追跡できる (この観点であえて除外リストに入れていない)。
+#
 # 期待される検知内容:
 #   検知シナリオではない。docs/SPEC.md 3節の「期待結果」列と、実際に
 #   telemetry アーティファクト中にカナリア値が現れたかどうかを突き合わせる
@@ -55,6 +62,37 @@
 #   文字列) と `scanned_file_count` (実際に走査したファイル数) を含む。
 #   これは tools/render-matrix.py が「走査対象 0 件 (＝テスト不成立)」を
 #   期待と実測の乖離と区別して扱うために使う (docs/SPEC.md §7)。
+#
+# カナリア走査の大文字小文字非依存化 (実地実行 run 32381640678 で判明した
+# 偽陰性の修正):
+#   DNS 名は解決前にリゾルバによって小文字に正規化されるため、
+#   CANARY_DNS (canaries.env 上は `CNRY-DNS-DONOTUSE-18ebf5`) は
+#   attestation predicate の domains 配列には `cnry-dns-donotuse-18ebf5...`
+#   として (小文字化・search domain 付加のうえ) 現れる。以前の実装は
+#   `grep -aFo` (大文字小文字を区別する完全一致 *ではない* 部分一致) で、
+#   `grep -c` では 0 件だったが `grep -ci` では 1 件ヒットすることを実測で
+#   確認した。つまり実際には漏れていたのに見逃していた (偽陰性)。
+#   これを修正するため、カナリア本走査は `grep -aFio` (大文字小文字非依存の
+#   固定文字列・部分一致) に変更した。カナリア値は `CNRY` + 一意な英数字の
+#   組み合わせで構成されており、大文字小文字を無視しても他の文字列との
+#   衝突・誤検出の可能性は極めて低いため、全カナリアにこの変更を適用してよい
+#   と判断した。マッチが大文字小文字非依存で行なわれたことは、
+#   leak-report.json のトップレベルキー `canary_match_mode` にも明記する
+#   (この節と合わせて二重に記録することで、後から leak-report.json だけを
+#   読む場合でも判定条件が分かるようにする)。
+#
+#   なお「部分一致で拾えている (完全一致を要求していない) か」も実測で
+#   確認済み: `grep -aFo -- "${value}" "${f}"` は行全体一致ではなく
+#   部分文字列一致であり、DNS ラベルに付加される resolver の search domain
+#   (`.zuup3ixw3die3n0bckkvpevybe.bx.internal.cloudapp.net` 等) が後ろに
+#   付いていても正しくヒットする。この挙動は変更していない。
+#
+#   一方で `runner_token_findings` (二次走査、下記) は**意図的に**大文字
+#   小文字を区別したままにしている。`ghs_`/`ghp_`/`gho_`/`ghu_`/`ghr_`
+#   といった GitHub トークンのプレフィックスや JWT の `eyJ` は仕様上すべて
+#   小文字・大文字が固定されており意味を持つため、非依存にすると
+#   (例えば大文字小文字を無視した結果、無関係な文字列を誤ってトークン
+#   らしきものとして拾ってしまう等) 誤検出が増えるだけでメリットがない。
 #
 set -uo pipefail
 
@@ -166,8 +204,11 @@ for canary_id in "${canary_ids[@]}"; do
     for f in "${CANDIDATE_FILES[@]}"; do
       # -a: バイナリファイル (capture.scap 等) もテキストとして扱って
       # 検索する。-F: 固定文字列検索 (正規表現メタ文字を無視)。
+      # -i: 大文字小文字を区別しない (DNS 名は小文字に正規化されるため。
+      # スクリプト冒頭のコメント参照。実地実行 run 32381640678 で判明した
+      # 偽陰性の修正)。
       # -o: マッチ箇所ごとに1行出力するので wc -l で出現回数になる。
-      count="$(grep -aFo -- "${value}" "${f}" 2>/dev/null | wc -l | tr -d ' ')"
+      count="$(grep -aFio -- "${value}" "${f}" 2>/dev/null | wc -l | tr -d ' ')"
       if [ -n "${count}" ] && [ "${count}" -gt 0 ]; then
         found="true"
         rel="${f#"${TARGET_DIR}"/}"
@@ -303,6 +344,11 @@ scan_root_escaped="${scan_root_escaped//\"/\\\"}"
   echo "  \"run_id\": \"${run_id}\","
   echo "  \"scan_root\": \"${scan_root_escaped}\","
   echo "  \"scanned_file_count\": ${scanned_file_count},"
+  # findings (カナリア本走査) は大文字小文字非依存 (grep -aFio) で行なわれた
+  # ことを明記する (スクリプト冒頭のコメント参照。run 32381640678 で判明した
+  # 偽陰性の再発防止)。runner_token_findings (二次走査) は対象外で、
+  # 引き続き大文字小文字を区別する。
+  echo "  \"canary_match_mode\": \"case_insensitive\","
   echo "  \"findings\": $(cat "${FINDINGS_TMP}"),"
   echo "  \"runner_token_findings\": $(cat "${TOKEN_FINDINGS_TMP}")"
   echo "}"
