@@ -64,7 +64,21 @@
 #     | ----------------------- | ------------------------------------------------------------ | ------------- |
 #     | upstream / 0.39.0       | falcosecurity/falco-actions/...@558a3ceeee9403e1c875ffbeb704c34c93e24752 | 0.39.0        |
 #     | upstream / 0.39.2       | 同上                                                            | 0.39.2        |
-#     | fork-fixed / 0.39.2     | fiord/falco-actions/...@360d62c72985b790bff96abde043b14ae053efe5         | 0.39.2        |
+#     | fork-fixed / 0.39.2     | fiord/falco-actions/...@fix/cicd-rules-mount-path (branch)      | 0.39.2        |
+#
+#   --- 検証用の一時的な例外 (docs/SPEC.md §8 / docs/SAFETY.md の「uses: は全て
+#   コミット SHA でピン留めする」方針に対する意図的な例外) ---
+#
+#   `live-forked` ジョブの action 参照先は、上の修正コミット
+#   (360d62c72985b790bff96abde043b14ae053efe5) への SHA pin ではなく、
+#   fiord/falco-actions の `fix/cicd-rules-mount-path` ブランチへの参照にして
+#   ある。このブランチには継続的に追加修正を入れている最中で、そのたびに
+#   このリポジトリの SHA を追いかけて更新するのは非効率なため。参照先は
+#   自分 (fiord) が管理する fork のブランチであり、第三者のリポジトリでは
+#   ない。**検証が完了し、fork 側の修正が安定したら、必ずコミット SHA pin に
+#   戻すこと。** upstream (`falcosecurity/falco-actions`、`live` ジョブ) 側の
+#   参照は SHA pin のまま変更しない。詳細は該当ステップ直上のコメントと
+#   docs/SAFETY.md のチェックリストを参照。
 #
 #   `live-forked` ジョブは `live` ジョブと処理内容 (シナリオ実行・テレメトリ収集・
 #   preflight) がほぼ重複するが、可読性を優先してあえて重複させている。
@@ -720,7 +734,9 @@ jobs:
     # preflight) がほぼ重複するコピーである。可読性を優先してあえて重複を
     # 許容している。`live` との差分は次の3点のみ:
     #   1. falco-actions の参照先 (upstream の 558a3ce... ではなく fork の
-    #      360d62c... = start/action.yaml:70 のマウントパスバグ修正版)
+    #      fix/cicd-rules-mount-path ブランチ = start/action.yaml:70 の
+    #      マウントパスバグ修正版。検証用の一時的なブランチ参照であり、
+    #      検証完了後は SHA pin に戻す。詳細はファイル冒頭のコメント参照)
     #   2. falco-version (matrix ではなく 0.39.2 固定の 1 leg)
     #   3. テレメトリアーティファクト名 (telemetry-falco-live-forked-0.39.2)
     # `uses:` に式は使えないため、この leg を `live` ジョブの matrix に
@@ -827,7 +843,15 @@ jobs:
         # 落とさない。後続ステップは falco が起動していなくても実行され、
         # 「検知されなかった」という結果自体が観測データになる。
         continue-on-error: true
-        uses: fiord/falco-actions/start@360d62c72985b790bff96abde043b14ae053efe5 # fork-fixed: fiord/falco-actions, fixes start/action.yaml:70 cicd-rules mount-path bug (see https://github.com/fiord/falco-actions/commit/360d62c72985b790bff96abde043b14ae053efe5)
+        # 検証用の一時的な例外 (docs/SPEC.md §8 / docs/SAFETY.md の「uses: は
+        # 全てコミット SHA でピン留めする」方針に対する意図的な例外):
+        # 参照先は自分 (fiord) が管理する fork のブランチであり、第三者の
+        # リポジトリではない。fix/cicd-rules-mount-path ブランチに継続的に
+        # 追加修正を入れている最中のため、SHA pin ではなくブランチ参照に
+        # している。検証が完了したら必ずコミット SHA pin に戻すこと。
+        # upstream (falcosecurity/falco-actions, 上の `live` ジョブ) 側の
+        # 参照は SHA pin のまま変更しないこと。
+        uses: fiord/falco-actions/start@fix/cicd-rules-mount-path # TEMPORARY EXCEPTION: fork-fixed branch ref (self-managed fork, actively iterating on start/action.yaml:70 cicd-rules mount-path fix); revert to SHA pin once stabilized
         with:
           mode: live
           falco-version: "0.39.2"
@@ -1066,7 +1090,8 @@ jobs:
         # を指すため、リポジトリ直下 rules/ への相対パスがずれ、存在しない
         # マウント元パスが Docker によって暗黙に空ディレクトリへ置き換わり、
         # CI/CD ルールファイルが一度もロードされない) を、起動ログから実地確認する。
-        # このジョブは fork-fixed 版 (fiord/falco-actions@360d62c7...) を使うため、
+        # このジョブは fork-fixed 版 (fiord/falco-actions@fix/cicd-rules-mount-path,
+        # 検証用の一時的なブランチ参照) を使うため、
         # 期待される判定は「ロードされた形跡あり」。判定は「/tmp/falco_start_logs.txt
         # (直前のステップが生成) に cicd_rules.yaml または rules.d への言及が
         # 現れるか」で行なう。観測が目的のステップなので、期待に反する結果が出ても
@@ -1117,8 +1142,8 @@ jobs:
             echo ""
             echo "## CI/CD ルールはロードされたか (job: ${{ github.job }}, leg: fork-fixed / falco 0.39.2)"
             echo ""
-            echo "action 参照先: \`fiord/falco-actions/start@360d62c72985b790bff96abde043b14ae053efe5\`"
-            echo "(fork-fixed。start/action.yaml:70 のマウントパスバグ修正版:"
+            echo "action 参照先: \`fiord/falco-actions/start@fix/cicd-rules-mount-path\` (branch, 検証用の一時的な例外)"
+            echo "(fork-fixed。start/action.yaml:70 のマウントパスバグ修正版。修正の起点:"
             echo "https://github.com/fiord/falco-actions/commit/360d62c72985b790bff96abde043b14ae053efe5)。"
             echo ""
             case "$CICD_LOADED" in
@@ -1252,7 +1277,15 @@ jobs:
 
       - name: Stop Falco (live mode) and build job summary
         if: always()
-        uses: fiord/falco-actions/stop@360d62c72985b790bff96abde043b14ae053efe5 # fork-fixed: fiord/falco-actions, same commit as start above
+        # 検証用の一時的な例外 (docs/SPEC.md §8 / docs/SAFETY.md の「uses: は
+        # 全てコミット SHA でピン留めする」方針に対する意図的な例外):
+        # 参照先は自分 (fiord) が管理する fork のブランチであり、第三者の
+        # リポジトリではない。fix/cicd-rules-mount-path ブランチに継続的に
+        # 追加修正を入れている最中のため、SHA pin ではなくブランチ参照に
+        # している (Start Falco ステップと同じ理由)。検証が完了したら必ず
+        # コミット SHA pin に戻すこと。upstream (falcosecurity/falco-actions,
+        # 上の `live` ジョブ) 側の参照は SHA pin のまま変更しないこと。
+        uses: fiord/falco-actions/stop@fix/cicd-rules-mount-path # TEMPORARY EXCEPTION: fork-fixed branch ref (self-managed fork, same as start above); revert to SHA pin once stabilized
         with:
           mode: live
           verbose: true
@@ -1264,7 +1297,7 @@ jobs:
             echo ""
             echo "## falco-live matrix note"
             echo "- \`falco-version\`: \`0.39.2\`"
-            echo "- action source: fork-fixed fiord/falco-actions@360d62c72985b790bff96abde043b14ae053efe5"
+            echo "- action source: fork-fixed fiord/falco-actions@fix/cicd-rules-mount-path (branch ref, temporary verification exception)"
             echo "- required_engine_version of the bundled CI/CD rules: \`0.43.0\`"
             echo "- falcosecurity/falco-no-driver の実際の上限 (Docker Hub, メンテナンス終了): \`0.39.2\`"
             echo "- \`Start Falco\` step outcome: \`${{ steps.start_falco.outcome }}\`"

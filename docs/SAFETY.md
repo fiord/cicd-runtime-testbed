@@ -178,3 +178,7 @@ public repo で実行すると、`Notice: raw capture exposure on a public repos
       権限宣言が `contents: read` のみ、`actions/cache` を使っていない) を
       fork 先で崩していないか。崩した場合は public repo での実行可否を再評価したか
 - [ ] トリガーを `push` / `pull_request` に変えていないか (`workflow_dispatch` のみを維持する)
+- [ ] fork のブランチ参照 (`falco-live.yml` の `live-forked` ジョブが使う
+      `fiord/falco-actions/start` / `stop@fix/cicd-rules-mount-path`) が、
+      検証用の一時例外のまま残っていないか。検証が完了していれば
+      コミット SHA pin に戻っているべき (docs/SPEC.md §8 参照)
