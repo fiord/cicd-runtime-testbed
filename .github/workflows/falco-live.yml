@@ -203,6 +203,48 @@ jobs:
           falco-version: ${{ matrix.falco-version }}
           verbose: true
 
+      - name: "Stream Falco logs to file (survive --rm container disappearance)"
+        # docker run --rm -d の Falco コンテナは異常終了すると即座に消え、消える
+        # 直前の docker logs 出力 (クラッシュ理由を含む最後の行) ごと失われる。
+        # これを防ぐため、Start Falco の直後に docker logs -f をバックグラウンドで
+        # 起動し、出力を /tmp/falco_stream.log に追記し続ける。このファイルは
+        # コンテナが消えても残るため、後続の起動完了ポーリングとテレメトリ収集は
+        # (docker logs を都度叩くのではなく) このファイルを主たる情報源として使う。
+        # あわせて docker events もバックグラウンドで記録し、--rm のため
+        # docker inspect では取れない終了コードを die イベントから拾えないか試みる。
+        # バックグラウンドプロセスの PID は GITHUB_ENV に記録し、後続の
+        # "Stop background log/event capture processes" ステップで確実に
+        # 終了させる。観測目的のステップなので失敗させない。
+        id: stream_falco_logs
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          STREAM_LOG="/tmp/falco_stream.log"
+          EVENTS_LOG="/tmp/falco_events_docker.log"
+          : > "$STREAM_LOG"
+          : > "$EVENTS_LOG"
+
+          if docker ps -a --filter "name=falco" 2>/dev/null | grep -q falco; then
+            nohup docker logs -f falco > "$STREAM_LOG" 2>&1 &
+            STREAM_PID=$!
+            disown "$STREAM_PID" 2>/dev/null || true
+            echo "FALCO_STREAM_PID=${STREAM_PID}" >> "$GITHUB_ENV"
+            echo "[stream] started 'docker logs -f falco' (pid=${STREAM_PID}) -> ${STREAM_LOG}"
+          else
+            echo "(falco container not found when starting log stream; Start Falco step likely failed)" >> "$STREAM_LOG"
+            echo "[stream] falco container not found; nothing to stream."
+          fi
+
+          SINCE_TS=$(( $(date -u +%s) - 60 ))
+          nohup docker events --filter "container=falco" --since "${SINCE_TS}" > "$EVENTS_LOG" 2>&1 &
+          EVENTS_PID=$!
+          disown "$EVENTS_PID" 2>/dev/null || true
+          echo "FALCO_DOCKER_EVENTS_PID=${EVENTS_PID}" >> "$GITHUB_ENV"
+          echo "[events] started 'docker events' recorder (pid=${EVENTS_PID}) -> ${EVENTS_LOG}"
+          exit 0
+
       - name: "Capture Falco startup logs (required_engine_version check, T1)"
         # falco-actions 同梱の CI/CD ルール (rules/falco_cicd_rules.yaml) は
         # `required_engine_version: 0.43.0` を宣言している。一方 falco-actions が
@@ -213,80 +255,143 @@ jobs:
         # required_engine_version / engine version 関連の記述の有無を拾い、
         # ロード成功・拒否・警告のみのいずれだったかの手がかりを job summary と
         # telemetry に残す (docs/RESULTS-TEMPLATE.md T1 の記入欄に対応)。
+        #
+        # ポーリングは docker logs を都度叩くのではなく /tmp/falco_stream.log
+        # (直前のステップが docker logs -f で継続的に書き続けているファイル) の
+        # 内容に対して行なう。コンテナが --rm で消えてもファイルは残るため、
+        # クラッシュ直前の最後の出力まで確実に拾える。ポーリング間隔は 0.2秒
+        # (旧: 1秒) に短縮し、取りこぼしを減らす。
         if: always()
         shell: bash
         run: |
           set -uo pipefail
           LOG_FILE="/tmp/falco_start_logs.txt"
           MARKER_STATUS_FILE="/tmp/falco_startup_marker_status.txt"
+          STREAM_LOG="/tmp/falco_stream.log"
+          EVENTS_LOG="/tmp/falco_events_docker.log"
           STARTUP_TIMEOUT=60
-          POLL_INTERVAL=1
+          POLL_INTERVAL=0.2
           MARKER_REGEX="Enabled event sources|Opening 'syscall' source"
 
           {
             echo "# falco startup log capture (engine requirement check, falco-version=${{ matrix.falco-version }})"
+            echo "# primary source: ${STREAM_LOG} (docker logs -f, streamed continuously since"
+            echo "# right after Start Falco; content survives the --rm container disappearing)"
             echo ""
           } > "$LOG_FILE"
 
           STARTUP_MARKER_FOUND="no"
-          CONTAINER_DISAPPEARED="no"
-          HAVE_LOGS="no"
-          LAST_LOGS=""
-          ELAPSED=0
+          CONTAINER_NEVER_STARTED="no"
+          ITERS=0
+          MAX_ITERS=$(awk -v t="$STARTUP_TIMEOUT" -v p="$POLL_INTERVAL" 'BEGIN{printf "%d", (t/p)+0.5}')
 
-          if docker ps -a --filter "name=falco" | grep -q falco; then
-            # 起動完了 (Falco がイベントソースを開き終える) を示すマーカーが現れる
-            # まで docker logs をポーリングする。ここで一度だけ docker logs を
-            # 叩くと、ルール読み込みの結末 (成功して起動完了したのか、途中で
-            # 拒否/クラッシュしたのか) が記録される前にログを取ってしまうため。
-            while [ "$ELAPSED" -lt "$STARTUP_TIMEOUT" ]; do
-              if CURRENT_LOGS="$(docker logs falco 2>&1)"; then
-                LAST_LOGS="$CURRENT_LOGS"
-                HAVE_LOGS="yes"
-                if printf '%s\n' "$CURRENT_LOGS" | grep -qE "$MARKER_REGEX"; then
-                  STARTUP_MARKER_FOUND="yes"
-                  break
-                fi
-              else
-                # docker logs 自体が失敗した = コンテナが消えた可能性が高い
-                # (docker run --rm のため Falco が異常終了するとコンテナごと
-                # 消える)。それまでに取得できていた最後の内容 (LAST_LOGS) は
-                # 上書きしない。
-                if [ "$HAVE_LOGS" = "yes" ]; then
-                  CONTAINER_DISAPPEARED="yes"
-                fi
+          if [ -f "$STREAM_LOG" ] && grep -q "falco container not found when starting log stream" "$STREAM_LOG" 2>/dev/null; then
+            CONTAINER_NEVER_STARTED="yes"
+          elif [ ! -f "$STREAM_LOG" ]; then
+            echo "(warning: ${STREAM_LOG} not found; 'Stream Falco logs to file' step may not have run)" >> "$LOG_FILE"
+          fi
+
+          if [ "$CONTAINER_NEVER_STARTED" = "no" ] && [ -f "$STREAM_LOG" ]; then
+            # 起動完了 (Falco がイベントソースを開き終える) を示すマーカーが
+            # ストリームファイルに現れるまでポーリングする。
+            while [ "$ITERS" -lt "$MAX_ITERS" ]; do
+              if grep -qE "$MARKER_REGEX" "$STREAM_LOG" 2>/dev/null; then
+                STARTUP_MARKER_FOUND="yes"
                 break
               fi
+              ITERS=$((ITERS + 1))
               sleep "$POLL_INTERVAL"
-              ELAPSED=$((ELAPSED + POLL_INTERVAL))
             done
+          fi
 
-            if [ "$HAVE_LOGS" = "yes" ]; then
-              printf '%s\n' "$LAST_LOGS" >> "$LOG_FILE"
+          ELAPSED="$(awk -v i="$ITERS" -v p="$POLL_INTERVAL" 'BEGIN{printf "%.1f", i*p}')"
+          DOCKER_PS_OUTPUT="$(docker ps -a --filter "name=falco" 2>&1 || true)"
+          CONTAINER_ALIVE="no"
+          if printf '%s' "$DOCKER_PS_OUTPUT" | grep -q falco; then
+            CONTAINER_ALIVE="yes"
+          fi
+
+          {
+            echo "## docker ps -a --filter name=falco (container status, checked after polling)"
+            echo '```'
+            echo "$DOCKER_PS_OUTPUT"
+            echo '```'
+            echo ""
+            echo "## ${STREAM_LOG} (full content)"
+            echo '```'
+            if [ -f "$STREAM_LOG" ]; then
+              cat "$STREAM_LOG"
             else
-              echo "(docker logs falco failed on every poll attempt; no log content could be captured)" >> "$LOG_FILE"
+              echo "(not found)"
             fi
-
-            {
-              echo ""
-              if [ "$STARTUP_MARKER_FOUND" = "yes" ]; then
-                echo "[poll] startup completion marker detected after ~${ELAPSED}s (matched: ${MARKER_REGEX})."
-              elif [ "$CONTAINER_DISAPPEARED" = "yes" ]; then
-                echo "[poll] falco container disappeared during polling after ~${ELAPSED}s (docker run --rm; likely crashed). Captured the last successful 'docker logs' output above (not overwritten by the failed poll)."
-              else
-                echo "[poll] startup completion marker NOT observed within ${STARTUP_TIMEOUT}s timeout. Rule-loading outcome could not be confirmed from this log alone; captured logs may be incomplete."
-              fi
-            } >> "$LOG_FILE"
-
-            HAS_ENGINE_MENTION="no"
-            if grep -qiE "required_engine_version|engine version|rules requiring" "$LOG_FILE"; then
-              HAS_ENGINE_MENTION="yes"
+            echo '```'
+            echo ""
+            if [ "$CONTAINER_NEVER_STARTED" = "yes" ]; then
+              echo "(falco container not found; Start Falco step likely failed — see its outcome)"
+            elif [ "$STARTUP_MARKER_FOUND" = "yes" ]; then
+              echo "[poll] startup completion marker detected after ~${ELAPSED}s (matched: ${MARKER_REGEX})."
+            elif [ "$CONTAINER_ALIVE" = "yes" ]; then
+              echo "[poll] startup completion marker NOT observed within ${STARTUP_TIMEOUT}s timeout; container is still present. Rule-loading outcome could not be confirmed from this log alone; captured logs may be incomplete."
+            else
+              echo "[poll] falco container is gone (docker run --rm; likely crashed). The stream log above was captured via 'docker logs -f' running continuously in the background since right after Start Falco, so it should contain everything Falco printed up to the moment it died — unlike a single docker logs snapshot, which would have been lost together with the container."
             fi
-          else
-            echo "(falco container not found; Start Falco step likely failed — see its outcome)" >> "$LOG_FILE"
+          } >> "$LOG_FILE"
+
+          if [ "$CONTAINER_NEVER_STARTED" = "yes" ]; then
             HAS_ENGINE_MENTION="n/a"
             STARTUP_MARKER_FOUND="n/a"
+          elif grep -qiE "required_engine_version|engine version|rules requiring" "$LOG_FILE"; then
+            HAS_ENGINE_MENTION="yes"
+          else
+            HAS_ENGINE_MENTION="no"
           fi
+
+          # docker events の die イベントから終了コードを拾えないか試みる
+          # (--rm のため docker inspect では取得できない)。実機の Docker は
+          # デフォルトのテキスト出力に `exitCode=N` を含むため、まずそれを
+          # 探す。取れなければ (podman 環境など) JSON 系フォーマットで使われる
+          # ContainerExitCode / exitCode キーも探す。どちらも見つからなくても
+          # 失敗させない。
+          EXIT_CODE_INFO="not captured"
+          DIE_LINE=""
+          if [ -f "$EVENTS_LOG" ] && [ -s "$EVENTS_LOG" ]; then
+            DIE_LINE="$(grep -iE 'die' "$EVENTS_LOG" | grep -F 'falco' | tail -1 || true)"
+            if [ -n "$DIE_LINE" ]; then
+              EXIT_CODE="$(printf '%s' "$DIE_LINE" | grep -oE 'exitCode=[0-9]+' | head -1 || true)"
+              if [ -z "$EXIT_CODE" ]; then
+                RAW_CODE="$(printf '%s' "$DIE_LINE" | grep -oE '"?[Cc]ontainerExitCode"?[:= ]+"?[0-9]+"?' | grep -oE '[0-9]+' | tail -1 || true)"
+                if [ -n "$RAW_CODE" ]; then
+                  EXIT_CODE="ContainerExitCode=${RAW_CODE}"
+                fi
+              fi
+              if [ -n "$EXIT_CODE" ]; then
+                EXIT_CODE_INFO="${EXIT_CODE} (from docker events)"
+              else
+                EXIT_CODE_INFO="die event observed but no exit-code attribute could be parsed"
+              fi
+            fi
+          fi
+
+          {
+            echo ""
+            echo "## falco コンテナの終了コード (docker events, best-effort — --rm のため docker inspect 不可)"
+            echo ""
+            echo "- 終了コード: **${EXIT_CODE_INFO}**"
+            if [ -n "$DIE_LINE" ]; then
+              echo "  該当イベント行:"
+              echo '  ```'
+              echo "  ${DIE_LINE}"
+              echo '  ```'
+            fi
+            if [ -f "$EVENTS_LOG" ] && [ -s "$EVENTS_LOG" ]; then
+              echo "  ${EVENTS_LOG} の全内容:"
+              echo '  ```'
+              sed 's/^/  /' "$EVENTS_LOG"
+              echo '  ```'
+            else
+              echo "  (${EVENTS_LOG} は空、または作成されなかった)"
+            fi
+          } >> "$LOG_FILE"
 
           printf '%s' "$STARTUP_MARKER_FOUND" > "$MARKER_STATUS_FILE"
 
@@ -320,6 +425,9 @@ jobs:
                 echo "  ルールロードの成否そのものを確認できない。"
                 ;;
             esac
+            echo ""
+            echo "## falco コンテナの終了コード (docker events, best-effort)"
+            echo "- **${EXIT_CODE_INFO}**"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: "Assert (observational): CI/CD rules loaded?"
@@ -484,6 +592,29 @@ jobs:
             echo "(falco container not found; it may have already been removed — e.g. docker run --rm after a crash — or Start Falco never succeeded)" >> "$LOG_FILE"
           fi
 
+      - name: "Stop background log/event capture processes"
+        # "Stream Falco logs to file" ステップで起動した docker logs -f /
+        # docker events のバックグラウンドプロセスを、GITHUB_ENV に記録して
+        # おいた PID を使って確実に終了させる。既に終了している場合や PID が
+        # 記録されていない場合でも失敗させない。
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          if [ -n "${FALCO_STREAM_PID:-}" ]; then
+            kill "${FALCO_STREAM_PID}" 2>/dev/null || true
+            echo "stopped docker logs -f stream (pid=${FALCO_STREAM_PID})"
+          else
+            echo "(FALCO_STREAM_PID not set; nothing to stop)"
+          fi
+          if [ -n "${FALCO_DOCKER_EVENTS_PID:-}" ]; then
+            kill "${FALCO_DOCKER_EVENTS_PID}" 2>/dev/null || true
+            echo "stopped docker events recorder (pid=${FALCO_DOCKER_EVENTS_PID})"
+          else
+            echo "(FALCO_DOCKER_EVENTS_PID not set; nothing to stop)"
+          fi
+          exit 0
+
       - name: Stop Falco (live mode) and build job summary
         if: always()
         uses: falcosecurity/falco-actions/stop@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README (upstream)
@@ -555,6 +686,17 @@ jobs:
           # "Capture Falco logs before stop" ステップが生成する)。
           if [ -f /tmp/falco_stop_logs.txt ]; then
             cp /tmp/falco_stop_logs.txt telemetry/falco_stop_logs.txt
+          fi
+          # "Stream Falco logs to file" ステップが docker logs -f で継続的に
+          # 書き続けた生ログ。--rm でコンテナが消えても内容が残るため、
+          # クラッシュ理由の手がかりとして最も確実な一次情報。
+          if [ -f /tmp/falco_stream.log ]; then
+            cp /tmp/falco_stream.log telemetry/falco_stream.log
+          fi
+          # 同ステップが docker events から記録した生ログ (die イベント /
+          # exitCode の手がかり、取得できた場合)。
+          if [ -f /tmp/falco_events_docker.log ]; then
+            cp /tmp/falco_events_docker.log telemetry/falco_docker_events.log
           fi
           # scenarios/lib/common.sh が書く実行ログ。仕様必須ではないが、
           # 検知結果の突き合わせに有用なため追加で回収する。
@@ -691,6 +833,48 @@ jobs:
           falco-version: "0.39.2"
           verbose: true
 
+      - name: "Stream Falco logs to file (survive --rm container disappearance)"
+        # docker run --rm -d の Falco コンテナは異常終了すると即座に消え、消える
+        # 直前の docker logs 出力 (クラッシュ理由を含む最後の行) ごと失われる。
+        # これを防ぐため、Start Falco の直後に docker logs -f をバックグラウンドで
+        # 起動し、出力を /tmp/falco_stream.log に追記し続ける。このファイルは
+        # コンテナが消えても残るため、後続の起動完了ポーリングとテレメトリ収集は
+        # (docker logs を都度叩くのではなく) このファイルを主たる情報源として使う。
+        # あわせて docker events もバックグラウンドで記録し、--rm のため
+        # docker inspect では取れない終了コードを die イベントから拾えないか試みる。
+        # バックグラウンドプロセスの PID は GITHUB_ENV に記録し、後続の
+        # "Stop background log/event capture processes" ステップで確実に
+        # 終了させる。観測目的のステップなので失敗させない。
+        id: stream_falco_logs
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          STREAM_LOG="/tmp/falco_stream.log"
+          EVENTS_LOG="/tmp/falco_events_docker.log"
+          : > "$STREAM_LOG"
+          : > "$EVENTS_LOG"
+
+          if docker ps -a --filter "name=falco" 2>/dev/null | grep -q falco; then
+            nohup docker logs -f falco > "$STREAM_LOG" 2>&1 &
+            STREAM_PID=$!
+            disown "$STREAM_PID" 2>/dev/null || true
+            echo "FALCO_STREAM_PID=${STREAM_PID}" >> "$GITHUB_ENV"
+            echo "[stream] started 'docker logs -f falco' (pid=${STREAM_PID}) -> ${STREAM_LOG}"
+          else
+            echo "(falco container not found when starting log stream; Start Falco step likely failed)" >> "$STREAM_LOG"
+            echo "[stream] falco container not found; nothing to stream."
+          fi
+
+          SINCE_TS=$(( $(date -u +%s) - 60 ))
+          nohup docker events --filter "container=falco" --since "${SINCE_TS}" > "$EVENTS_LOG" 2>&1 &
+          EVENTS_PID=$!
+          disown "$EVENTS_PID" 2>/dev/null || true
+          echo "FALCO_DOCKER_EVENTS_PID=${EVENTS_PID}" >> "$GITHUB_ENV"
+          echo "[events] started 'docker events' recorder (pid=${EVENTS_PID}) -> ${EVENTS_LOG}"
+          exit 0
+
       - name: "Capture Falco startup logs (required_engine_version check, T1)"
         # falco-actions 同梱の CI/CD ルール (rules/falco_cicd_rules.yaml) は
         # `required_engine_version: 0.43.0` を宣言している。一方 falco-actions が
@@ -701,80 +885,143 @@ jobs:
         # required_engine_version / engine version 関連の記述の有無を拾い、
         # ロード成功・拒否・警告のみのいずれだったかの手がかりを job summary と
         # telemetry に残す (docs/RESULTS-TEMPLATE.md T1 の記入欄に対応)。
+        #
+        # ポーリングは docker logs を都度叩くのではなく /tmp/falco_stream.log
+        # (直前のステップが docker logs -f で継続的に書き続けているファイル) の
+        # 内容に対して行なう。コンテナが --rm で消えてもファイルは残るため、
+        # クラッシュ直前の最後の出力まで確実に拾える。ポーリング間隔は 0.2秒
+        # (旧: 1秒) に短縮し、取りこぼしを減らす。
         if: always()
         shell: bash
         run: |
           set -uo pipefail
           LOG_FILE="/tmp/falco_start_logs.txt"
           MARKER_STATUS_FILE="/tmp/falco_startup_marker_status.txt"
+          STREAM_LOG="/tmp/falco_stream.log"
+          EVENTS_LOG="/tmp/falco_events_docker.log"
           STARTUP_TIMEOUT=60
-          POLL_INTERVAL=1
+          POLL_INTERVAL=0.2
           MARKER_REGEX="Enabled event sources|Opening 'syscall' source"
 
           {
             echo "# falco startup log capture (engine requirement check, falco-version=0.39.2, fork-fixed)"
+            echo "# primary source: ${STREAM_LOG} (docker logs -f, streamed continuously since"
+            echo "# right after Start Falco; content survives the --rm container disappearing)"
             echo ""
           } > "$LOG_FILE"
 
           STARTUP_MARKER_FOUND="no"
-          CONTAINER_DISAPPEARED="no"
-          HAVE_LOGS="no"
-          LAST_LOGS=""
-          ELAPSED=0
+          CONTAINER_NEVER_STARTED="no"
+          ITERS=0
+          MAX_ITERS=$(awk -v t="$STARTUP_TIMEOUT" -v p="$POLL_INTERVAL" 'BEGIN{printf "%d", (t/p)+0.5}')
 
-          if docker ps -a --filter "name=falco" | grep -q falco; then
-            # 起動完了 (Falco がイベントソースを開き終える) を示すマーカーが現れる
-            # まで docker logs をポーリングする。ここで一度だけ docker logs を
-            # 叩くと、ルール読み込みの結末 (成功して起動完了したのか、途中で
-            # 拒否/クラッシュしたのか) が記録される前にログを取ってしまうため。
-            while [ "$ELAPSED" -lt "$STARTUP_TIMEOUT" ]; do
-              if CURRENT_LOGS="$(docker logs falco 2>&1)"; then
-                LAST_LOGS="$CURRENT_LOGS"
-                HAVE_LOGS="yes"
-                if printf '%s\n' "$CURRENT_LOGS" | grep -qE "$MARKER_REGEX"; then
-                  STARTUP_MARKER_FOUND="yes"
-                  break
-                fi
-              else
-                # docker logs 自体が失敗した = コンテナが消えた可能性が高い
-                # (docker run --rm のため Falco が異常終了するとコンテナごと
-                # 消える)。それまでに取得できていた最後の内容 (LAST_LOGS) は
-                # 上書きしない。
-                if [ "$HAVE_LOGS" = "yes" ]; then
-                  CONTAINER_DISAPPEARED="yes"
-                fi
+          if [ -f "$STREAM_LOG" ] && grep -q "falco container not found when starting log stream" "$STREAM_LOG" 2>/dev/null; then
+            CONTAINER_NEVER_STARTED="yes"
+          elif [ ! -f "$STREAM_LOG" ]; then
+            echo "(warning: ${STREAM_LOG} not found; 'Stream Falco logs to file' step may not have run)" >> "$LOG_FILE"
+          fi
+
+          if [ "$CONTAINER_NEVER_STARTED" = "no" ] && [ -f "$STREAM_LOG" ]; then
+            # 起動完了 (Falco がイベントソースを開き終える) を示すマーカーが
+            # ストリームファイルに現れるまでポーリングする。
+            while [ "$ITERS" -lt "$MAX_ITERS" ]; do
+              if grep -qE "$MARKER_REGEX" "$STREAM_LOG" 2>/dev/null; then
+                STARTUP_MARKER_FOUND="yes"
                 break
               fi
+              ITERS=$((ITERS + 1))
               sleep "$POLL_INTERVAL"
-              ELAPSED=$((ELAPSED + POLL_INTERVAL))
             done
+          fi
 
-            if [ "$HAVE_LOGS" = "yes" ]; then
-              printf '%s\n' "$LAST_LOGS" >> "$LOG_FILE"
+          ELAPSED="$(awk -v i="$ITERS" -v p="$POLL_INTERVAL" 'BEGIN{printf "%.1f", i*p}')"
+          DOCKER_PS_OUTPUT="$(docker ps -a --filter "name=falco" 2>&1 || true)"
+          CONTAINER_ALIVE="no"
+          if printf '%s' "$DOCKER_PS_OUTPUT" | grep -q falco; then
+            CONTAINER_ALIVE="yes"
+          fi
+
+          {
+            echo "## docker ps -a --filter name=falco (container status, checked after polling)"
+            echo '```'
+            echo "$DOCKER_PS_OUTPUT"
+            echo '```'
+            echo ""
+            echo "## ${STREAM_LOG} (full content)"
+            echo '```'
+            if [ -f "$STREAM_LOG" ]; then
+              cat "$STREAM_LOG"
             else
-              echo "(docker logs falco failed on every poll attempt; no log content could be captured)" >> "$LOG_FILE"
+              echo "(not found)"
             fi
-
-            {
-              echo ""
-              if [ "$STARTUP_MARKER_FOUND" = "yes" ]; then
-                echo "[poll] startup completion marker detected after ~${ELAPSED}s (matched: ${MARKER_REGEX})."
-              elif [ "$CONTAINER_DISAPPEARED" = "yes" ]; then
-                echo "[poll] falco container disappeared during polling after ~${ELAPSED}s (docker run --rm; likely crashed). Captured the last successful 'docker logs' output above (not overwritten by the failed poll)."
-              else
-                echo "[poll] startup completion marker NOT observed within ${STARTUP_TIMEOUT}s timeout. Rule-loading outcome could not be confirmed from this log alone; captured logs may be incomplete."
-              fi
-            } >> "$LOG_FILE"
-
-            HAS_ENGINE_MENTION="no"
-            if grep -qiE "required_engine_version|engine version|rules requiring" "$LOG_FILE"; then
-              HAS_ENGINE_MENTION="yes"
+            echo '```'
+            echo ""
+            if [ "$CONTAINER_NEVER_STARTED" = "yes" ]; then
+              echo "(falco container not found; Start Falco step likely failed — see its outcome)"
+            elif [ "$STARTUP_MARKER_FOUND" = "yes" ]; then
+              echo "[poll] startup completion marker detected after ~${ELAPSED}s (matched: ${MARKER_REGEX})."
+            elif [ "$CONTAINER_ALIVE" = "yes" ]; then
+              echo "[poll] startup completion marker NOT observed within ${STARTUP_TIMEOUT}s timeout; container is still present. Rule-loading outcome could not be confirmed from this log alone; captured logs may be incomplete."
+            else
+              echo "[poll] falco container is gone (docker run --rm; likely crashed). The stream log above was captured via 'docker logs -f' running continuously in the background since right after Start Falco, so it should contain everything Falco printed up to the moment it died — unlike a single docker logs snapshot, which would have been lost together with the container."
             fi
-          else
-            echo "(falco container not found; Start Falco step likely failed — see its outcome)" >> "$LOG_FILE"
+          } >> "$LOG_FILE"
+
+          if [ "$CONTAINER_NEVER_STARTED" = "yes" ]; then
             HAS_ENGINE_MENTION="n/a"
             STARTUP_MARKER_FOUND="n/a"
+          elif grep -qiE "required_engine_version|engine version|rules requiring" "$LOG_FILE"; then
+            HAS_ENGINE_MENTION="yes"
+          else
+            HAS_ENGINE_MENTION="no"
           fi
+
+          # docker events の die イベントから終了コードを拾えないか試みる
+          # (--rm のため docker inspect では取得できない)。実機の Docker は
+          # デフォルトのテキスト出力に `exitCode=N` を含むため、まずそれを
+          # 探す。取れなければ (podman 環境など) JSON 系フォーマットで使われる
+          # ContainerExitCode / exitCode キーも探す。どちらも見つからなくても
+          # 失敗させない。
+          EXIT_CODE_INFO="not captured"
+          DIE_LINE=""
+          if [ -f "$EVENTS_LOG" ] && [ -s "$EVENTS_LOG" ]; then
+            DIE_LINE="$(grep -iE 'die' "$EVENTS_LOG" | grep -F 'falco' | tail -1 || true)"
+            if [ -n "$DIE_LINE" ]; then
+              EXIT_CODE="$(printf '%s' "$DIE_LINE" | grep -oE 'exitCode=[0-9]+' | head -1 || true)"
+              if [ -z "$EXIT_CODE" ]; then
+                RAW_CODE="$(printf '%s' "$DIE_LINE" | grep -oE '"?[Cc]ontainerExitCode"?[:= ]+"?[0-9]+"?' | grep -oE '[0-9]+' | tail -1 || true)"
+                if [ -n "$RAW_CODE" ]; then
+                  EXIT_CODE="ContainerExitCode=${RAW_CODE}"
+                fi
+              fi
+              if [ -n "$EXIT_CODE" ]; then
+                EXIT_CODE_INFO="${EXIT_CODE} (from docker events)"
+              else
+                EXIT_CODE_INFO="die event observed but no exit-code attribute could be parsed"
+              fi
+            fi
+          fi
+
+          {
+            echo ""
+            echo "## falco コンテナの終了コード (docker events, best-effort — --rm のため docker inspect 不可)"
+            echo ""
+            echo "- 終了コード: **${EXIT_CODE_INFO}**"
+            if [ -n "$DIE_LINE" ]; then
+              echo "  該当イベント行:"
+              echo '  ```'
+              echo "  ${DIE_LINE}"
+              echo '  ```'
+            fi
+            if [ -f "$EVENTS_LOG" ] && [ -s "$EVENTS_LOG" ]; then
+              echo "  ${EVENTS_LOG} の全内容:"
+              echo '  ```'
+              sed 's/^/  /' "$EVENTS_LOG"
+              echo '  ```'
+            else
+              echo "  (${EVENTS_LOG} は空、または作成されなかった)"
+            fi
+          } >> "$LOG_FILE"
 
           printf '%s' "$STARTUP_MARKER_FOUND" > "$MARKER_STATUS_FILE"
 
@@ -808,6 +1055,9 @@ jobs:
                 echo "  ルールロードの成否そのものを確認できない。"
                 ;;
             esac
+            echo ""
+            echo "## falco コンテナの終了コード (docker events, best-effort)"
+            echo "- **${EXIT_CODE_INFO}**"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: "Assert (observational): CI/CD rules loaded?"
@@ -977,6 +1227,29 @@ jobs:
             echo "(falco container not found; it may have already been removed — e.g. docker run --rm after a crash — or Start Falco never succeeded)" >> "$LOG_FILE"
           fi
 
+      - name: "Stop background log/event capture processes"
+        # "Stream Falco logs to file" ステップで起動した docker logs -f /
+        # docker events のバックグラウンドプロセスを、GITHUB_ENV に記録して
+        # おいた PID を使って確実に終了させる。既に終了している場合や PID が
+        # 記録されていない場合でも失敗させない。
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          if [ -n "${FALCO_STREAM_PID:-}" ]; then
+            kill "${FALCO_STREAM_PID}" 2>/dev/null || true
+            echo "stopped docker logs -f stream (pid=${FALCO_STREAM_PID})"
+          else
+            echo "(FALCO_STREAM_PID not set; nothing to stop)"
+          fi
+          if [ -n "${FALCO_DOCKER_EVENTS_PID:-}" ]; then
+            kill "${FALCO_DOCKER_EVENTS_PID}" 2>/dev/null || true
+            echo "stopped docker events recorder (pid=${FALCO_DOCKER_EVENTS_PID})"
+          else
+            echo "(FALCO_DOCKER_EVENTS_PID not set; nothing to stop)"
+          fi
+          exit 0
+
       - name: Stop Falco (live mode) and build job summary
         if: always()
         uses: fiord/falco-actions/stop@360d62c72985b790bff96abde043b14ae053efe5 # fork-fixed: fiord/falco-actions, same commit as start above
@@ -1048,6 +1321,17 @@ jobs:
           # "Capture Falco logs before stop" ステップが生成する)。
           if [ -f /tmp/falco_stop_logs.txt ]; then
             cp /tmp/falco_stop_logs.txt telemetry/falco_stop_logs.txt
+          fi
+          # "Stream Falco logs to file" ステップが docker logs -f で継続的に
+          # 書き続けた生ログ。--rm でコンテナが消えても内容が残るため、
+          # クラッシュ理由の手がかりとして最も確実な一次情報。
+          if [ -f /tmp/falco_stream.log ]; then
+            cp /tmp/falco_stream.log telemetry/falco_stream.log
+          fi
+          # 同ステップが docker events から記録した生ログ (die イベント /
+          # exitCode の手がかり、取得できた場合)。
+          if [ -f /tmp/falco_events_docker.log ]; then
+            cp /tmp/falco_events_docker.log telemetry/falco_docker_events.log
           fi
           # scenarios/lib/common.sh が書く実行ログ。仕様必須ではないが、
           # 検知結果の突き合わせに有用なため追加で回収する。
