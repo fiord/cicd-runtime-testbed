@@ -314,6 +314,78 @@ job summary の「ランナー由来トークンのパターン検出」セク�
 
 ---
 
+## 実測結果（run 32544606013, sensor-enforce.yml）— kill されなかった
+
+このセクションも記入用テンプレートではなく、実際に得られた実測結果の記録。
+**T1 (kill テスト) が失敗した run であり、このリポジトリで初めて
+`sensor-enforce.yml` の `assert` ジョブが失敗した実例**。
+
+- 対象 run: `sensor-enforce.yml` の run
+  [32544606013](https://github.com/fiord/cicd-runtime-testbed/actions/runs/32544606013)
+  (commit `ffb7b46`)。
+- **結果: kill されなかった。** `scenarios/90-killme.sh` の実行ログに
+  `REACHED_AFTER_KILLME` が出力され (`killme` ステップの outcome は
+  `success`)、`assert` ジョブは設計どおり失敗した。
+
+### 原因: `testbed_canary_http_host` (`event_type: http_request`) がプロジェクト設定全体を破棄した
+
+`Start cicd-sensor` ステップの実ログ:
+
+```
+==> Loaded .cicd-sensor/config.yaml from repo
+OK: 1 file(s) bundled into /home/runner/work/_temp/cicd-sensor-config/rules.bundle.yaml
+error: bundle: ruleset_id=cicd_runtime_testbed/canary_observability rule_id=testbed_canary_http_host: unsupported event type "http_request"
+rule validate: bundle failed validation
+##[warning]project config fetch failed: /home/runner/work/_temp/cicd-sensor-staging/extracted/cicd-sensorctl-linux-amd64 exited with status 1; agent will run with baseline rules
+==> Registering project start
+```
+
+- ワークフローの `Install cicd-sensorctl` ステップは `gh release download
+  v0.0.38 --repo cicd-sensor/cicd-sensor` に失敗し (`::warning::failed to
+  download cicd-sensorctl`)、`Validate .cicd-sensor/rules` ステップは
+  (当時の実装では) 警告のみでスキップされていた。そのためローカルの
+  `cicd-sensorctl rule validate` はそもそも実行されず、この不整合を
+  ワークフロー内で事前に検出できなかった。
+- `cicd-sensor-action` は `cicd-sensor-version` 入力を明示していないため
+  既定値が使われ、実際にダウンロードされた agent は **v0.0.45**
+  (2026-08-09) だった。以前の記録では v0.0.38 と混同していたが誤り
+  (action 本体のピン留めタグが v0.0.38 であることと、agent バイナリの
+  バージョンは別物)。v0.0.45 も `http_request` (実装は 2026-08-11) 未対応
+  であるため、結論自体は変わらない。
+- attestation predicate (`cicd-sensor-attestation/predicate.json`) と HTML
+  レポート (`cicd-sensor-report.html`) の両方で、`testbed_kill_marker`
+  ルールが **`action: detect`** として記録されていた
+  (`ruleset_id: cicd_runtime_testbed/kill_test`)。`monitor_mode: false`
+  (このワークフローが `.cicd-sensor/config.yaml` に書き込んだ値) が
+  agent に反映されていなかったことの直接証拠。
+- `rules_summary` は `{"rule_count": 65, "warnings_count": 1}`
+  (run 32519409901 の `sensor-monitor.yml` と同一の値)。
+
+### 対応 (この commit で実施)
+
+1. `.cicd-sensor/rules/testbed.yaml` の `testbed_canary_http_host` を
+   コメントアウトして無効化 (削除はしない。`canary_observability`
+   ruleset 自体と、兄弟ルール2本は維持)。
+2. `sensor-monitor.yml` / `sensor-enforce.yml` の `Validate .cicd-sensor/rules`
+   ステップを、検証失敗時にジョブを失敗させるように変更 (`cicd-sensorctl`
+   自体の入手に失敗した場合は従来どおり警告のみで続行するが、job summary
+   に「検証をスキップした」ことを明記する)。
+3. `sensor-enforce.yml` の `assert` ジョブに、`testbed_kill_marker` の実際の
+   `action` を attestation predicate / HTML レポートから読み取って job
+   summary に出すステップを追加。`action` が `detect` の場合は `::error::`
+   で `monitor_mode` / プロジェクト設定フェッチ失敗の可能性を明示する。
+
+### 教訓
+
+**未対応のイベント型を使うルールが1本でもあると、それとは無関係な他の
+カスタムルールや `monitor_mode` の意味まで変わってしまう。** ローカルの
+`cicd-sensorctl rule validate` (HEAD からビルドしたもの) はこの不整合を
+検出できない (むしろ通ってしまう) ため、実際に GitHub Actions 上で走らせて
+job summary / ジョブログを確認するまで気づけない。README.md「既知の制約」
+を参照。
+
+---
+
 ## 総合所見
 
 - T1 / T2 / T3 を通じて得られた、falco-actions と cicd-sensor それぞれの強み・弱み:

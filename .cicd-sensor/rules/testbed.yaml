@@ -77,7 +77,13 @@
 #     collect する。ヒットの payload.path / payload.method を通じて
 #     CANARY_URL_PATH / CANARY_URL_QUERY (query は payload.path には
 #     含まれない仕様のため、query 側は「除去された」ことの確認になる)
-#     が観測できるようになる。
+#     が観測できるようになる想定だった。
+#
+#     ##################################################################
+#     # 現在コメントアウトして無効化中 (run 32544606013、2026-08-22)。 #
+#     # 詳細は下の rule 定義箇所のコメントブロックを参照。             #
+#     ##################################################################
+#
 #   `domain` イベント (CANARY_DNS) は既に attestation predicate の
 #   `domains` 配列に現れる (集計レベルでも観測できる) ため、専用の
 #   観測用ルールは追加しない。
@@ -194,48 +200,93 @@ rule_sets:
         condition: is_write && path.endsWith("/canary-path-probe.marker")
         action: collect
 
-      - rule_id: testbed_canary_http_host
-        rule_name: "Testbed: plaintext HTTP request to example.com"
-        description: |
-          What:
-            Matches outgoing plaintext HTTP requests whose Host is
-            example.com, the only HTTP endpoint this testbed is allowed
-            to contact (docs/SPEC.md 1節).
-          Why:
-            scenarios/02-exfil.sh sends CANARY_URL_PATH in the request
-            path and CANARY_URL_QUERY in the query string. Per the same
-            root cause as the other two rules in this ruleset, without a
-            matching rule the http_request event carrying
-            payload.path / payload.method is never recorded, so neither
-            the "path survives" nor the "query string is stripped"
-            hypothesis (docs/SPEC.md 3節) can actually be observed from
-            the report.
-          Notes:
-            This is a testbed rule, not a security detection.
-            example.com is an IANA reserved domain; matching on it here
-            does not reference any real IOC.
-
-            KNOWN GAP (confirmed via run 32519409901, sensor-monitor.yml):
-            the http_request event type does not exist yet in the
-            cicd-sensor version this testbed pins
-            (cicd-sensor-action@6511eb44c91d71b2b93d71193b1bf2cb18352f66,
-            v0.0.38, 2026-06-13). Support for capturing cleartext HTTP
-            request metadata was only added on 2026-08-11 in commit
-            bdec37f2 ("feat(agent): capture cleartext HTTP request
-            metadata (#139)"), and is still absent from the latest
-            tagged release as of this writing (releases/v0.0.45,
-            2026-08-09) - it currently exists only on cicd-sensor's main
-            branch. Against the pinned v0.0.38 binary, this rule is
-            silently dropped at load time (rules_summary.warnings_count
-            increments; there is no hard error and cicd-sensorctl rule
-            validate, built from a HEAD checkout, still passes), so it
-            never fires and CANARY_URL_PATH / CANARY_URL_QUERY cannot be
-            observed for that reason (not because they were redacted).
-            This rule is left in place unchanged so it starts firing
-            automatically once the pinned cicd-sensor version is
-            upgraded past the point where http_request lands in a
-            release. See README.md "既知の制約" and
-            tools/render-matrix.py's http_request capability handling.
-        event_type: http_request
-        condition: host == "example.com"
-        action: collect
+      # ----------------------------------------------------------------
+      # testbed_canary_http_host — DISABLED (commented out), not deleted.
+      #
+      # なぜコメントアウトしているか:
+      #   このルールの event_type: http_request は、実際にこのテストベッド
+      #   が使う cicd-sensor のリリース (README.md "既知の制約" 参照:
+      #   cicd-sensor-action の入力 cicd-sensor-version の既定値は
+      #   v0.0.45、2026-08-09 時点のタグ) にまだ実装されていない。
+      #   http_request 対応 (commit bdec37f2, 2026-08-11) は現時点で
+      #   cicd-sensor の main ブランチにしか存在せず、v0.0.45 を含む
+      #   どのリリース済みタグにも含まれていない。
+      #
+      # 実測で判明した最重要の事実 (run 32544606013,
+      # https://github.com/fiord/cicd-runtime-testbed/actions/runs/32544606013,
+      # sensor-enforce.yml, 2026-08-22):
+      #   このルールが有効なままだと、単に「このルールだけが静かに
+      #   drop される」のではなく、**プロジェクト設定バンドル全体
+      #   (.cicd-sensor/ 配下の monitor_mode と全カスタムルール) の
+      #   検証が失敗し、agent 側がフォールバックする** ことが実機で
+      #   確認された。実際のジョブログ (Start cicd-sensor ステップ):
+      #
+      #     ==> Loaded .cicd-sensor/config.yaml from repo
+      #     OK: 1 file(s) bundled into
+      #       /home/runner/work/_temp/cicd-sensor-config/rules.bundle.yaml
+      #     error: bundle: ruleset_id=cicd_runtime_testbed/canary_observability
+      #       rule_id=testbed_canary_http_host: unsupported event type
+      #       "http_request"
+      #     rule validate: bundle failed validation
+      #     ##[warning]project config fetch failed:
+      #       /home/runner/work/_temp/cicd-sensor-staging/extracted/
+      #       cicd-sensorctl-linux-amd64 exited with status 1; agent will
+      #       run with baseline rules
+      #     ==> Registering project start
+      #
+      #   この run は sensor-enforce.yml (monitor_mode: false のはず)
+      #   だったが、上記の理由で .cicd-sensor/config.yaml の
+      #   monitor_mode: false が agent に届かず、testbed_kill_marker
+      #   (action: terminate のはず) が attestation predicate / HTML
+      #   レポートの両方で action: detect として記録され、
+      #   REACHED_AFTER_KILLME がログに出力された (= プロセスは
+      #   kill されなかった)。つまり **不対応のイベント型を使う
+      #   ルールが1本あるだけで、プロジェクト設定全体
+      #   (monitor_mode を含む) が無効化され、他の正常なカスタム
+      #   ルールの意味まで変わってしまう。** README.md "既知の制約"
+      #   に以前書かれていた「rules_summary.warnings_count が増える
+      #   だけでハードエラーにはならない」という説明は、
+      #   (sensor-monitor.yml 相当の) 別の実行経路での観測であり、
+      #   sensor-enforce.yml のこの実行では成り立たなかった。
+      #
+      # 有効化してよい条件:
+      #   このテストベッドがピン留めする cicd-sensor-action /
+      #   cicd-sensor-version が、http_request イベント型に対応した
+      #   リリースを指すようになったとき。その時点でこのコメントを
+      #   外すだけで、変更なしに発火するようになる想定
+      #   (canary_observability ruleset の他の2ルールと同じ形)。
+      #   有効化した後は、まず GitHub Actions 上で実際に走らせて
+      #   job summary の rules_summary / ::warning:: 注釈と、
+      #   sensor-enforce.yml の assert ジョブが追加出力する
+      #   testbed_kill_marker の実際の action を確認すること
+      #   (`cicd-sensorctl rule validate` はローカルでは通ってしまい、
+      #   この不整合を検出できない)。
+      #
+      # ruleset 自体 (cicd_runtime_testbed/canary_observability) は
+      # 残す: 兄弟ルール testbed_canary_argv_carrier /
+      # testbed_canary_path_probe は http_request に依存せず、
+      # 引き続き有効。
+      # ----------------------------------------------------------------
+      # - rule_id: testbed_canary_http_host
+      #   rule_name: "Testbed: plaintext HTTP request to example.com"
+      #   description: |
+      #     What:
+      #       Matches outgoing plaintext HTTP requests whose Host is
+      #       example.com, the only HTTP endpoint this testbed is allowed
+      #       to contact (docs/SPEC.md 1節).
+      #     Why:
+      #       scenarios/02-exfil.sh sends CANARY_URL_PATH in the request
+      #       path and CANARY_URL_QUERY in the query string. Per the same
+      #       root cause as the other two rules in this ruleset, without a
+      #       matching rule the http_request event carrying
+      #       payload.path / payload.method is never recorded, so neither
+      #       the "path survives" nor the "query string is stripped"
+      #       hypothesis (docs/SPEC.md 3節) can actually be observed from
+      #       the report.
+      #     Notes:
+      #       This is a testbed rule, not a security detection.
+      #       example.com is an IANA reserved domain; matching on it here
+      #       does not reference any real IOC.
+      #   event_type: http_request
+      #   condition: host == "example.com"
+      #   action: collect

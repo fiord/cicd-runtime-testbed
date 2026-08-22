@@ -389,6 +389,28 @@ CEL の制約に注意:
 
 検証は `cicd-sensorctl rule validate .cicd-sensor/rules` で行なう。ワークフローにこの検証ステップを含めること。
 
+**kill テストの前提条件 (run 32544606013 で判明): ルールバンドルの検証が通っていること。**
+`.cicd-sensor/rules/` に、実際に使う cicd-sensor バージョンが未対応の
+`event_type` を使うルールが1本でも混入していると、cicd-sensor-action 内部の
+プロジェクト設定フェッチ (config.yaml + ルールバンドルの検証) が**丸ごと
+失敗**し、`monitor_mode` を含むプロジェクト設定全体が agent に届かなくなる
+(実際のログ: `error: bundle: ... unsupported event type "..."` →
+`rule validate: bundle failed validation` →
+`##[warning]project config fetch failed: ... agent will run with baseline rules`)。
+この状態では `sensor-enforce.yml` が `monitor_mode: false` に書き換えても
+反映されず、`testbed_kill_marker` (`action: terminate`) が `action: detect`
+として評価され、kill が起きない。したがって、kill テストの run を評価する
+前に、必ず次を確認すること。
+
+- ワークフローの `Validate .cicd-sensor/rules` ステップ (§後述、
+  `cicd-sensorctl rule validate` を実行し、失敗時はジョブを失敗させる) が
+  成功していること
+- `Start cicd-sensor` ステップのログに `##[warning]project config fetch failed`
+  が出ていないこと
+
+これらが崩れている状態での `assert` ジョブの成否は、kill 動作そのものの
+検証結果として意味を持たない。
+
 ### 判定方法
 
 `sensor-enforce.yml` は次の構造にする。
@@ -410,6 +432,18 @@ CEL の制約に注意:
 
 **注意:** kill されなかった場合に `assert` が失敗する設計なので、この 1 本だけは
 「失敗が正常」ではなく「成功が正常」になる。README に明記すること。
+
+**原因切り分けの補強 (run 32544606013 への対応):** `assert` ジョブは、上記の
+2 つの output に加えて、`collect-telemetry` が取得するのと同じ
+`cicd-sensor-report.html` / `cicd-sensor-attestation` を (読み取り専用で)
+ダウンロードし、そこから `testbed_kill_marker` の実際の `action`
+(`terminate` であるべき) を読み取って job summary に出す。`action` が
+`detect` だった場合は `::error::` で、`monitor_mode` が有効なままか、
+プロジェクト設定 (bundle 検証失敗など) が agent に届いていない可能性がある
+旨と、`Start cicd-sensor` ステップのログ確認を促す。kill されなかったときに
+「そもそも terminate ルールとして評価されていたか」をすぐ判定できるように
+するための追加であり、上記の判定方法自体 (killme_outcome /
+reached_after_killme) を置き換えるものではない。
 
 ---
 

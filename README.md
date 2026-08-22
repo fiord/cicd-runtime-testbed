@@ -107,27 +107,75 @@
 
 ## 既知の制約
 
-実地実行 (run 32519409901, sensor-monitor.yml) で判明した、現時点のピン留め
-バージョンに起因する制約です。**ルールが静かに無効化されても
-`cicd-sensorctl rule validate` はローカルでは通ってしまうため、この不整合は
-ローカル検証だけでは検出できません。** 実際の run の job summary
-(`rules_summary` / `::warning::` 注釈) を必ず確認してください。
+### 🚨 最重要: 無効なルールが1本あるだけでプロジェクト設定全体 (`monitor_mode` を含む) が破棄される
+
+実地実行 (**run 32544606013**, `sensor-enforce.yml`) で判明した、**このリポジトリ
+全体の運用における最大の落とし穴**です。**必ず読んでください。**
+
+`.cicd-sensor/rules/` に `event_type` がそのバージョンの cicd-sensor に
+未対応のルールが**1本でも**あると、cicd-sensor-action 内部のプロジェクト設定
+フェッチ (config.yaml + ルールバンドルの検証) が**丸ごと失敗**し、
+`.cicd-sensor/config.yaml` の `monitor_mode` を含む**プロジェクト設定全体**が
+agent に届かなくなります。実際のジョブログ (`sensor-enforce.yml` の
+`Start cicd-sensor` ステップ、run 32544606013):
+
+```
+==> Loaded .cicd-sensor/config.yaml from repo
+OK: 1 file(s) bundled into /home/runner/work/_temp/cicd-sensor-config/rules.bundle.yaml
+error: bundle: ruleset_id=cicd_runtime_testbed/canary_observability rule_id=testbed_canary_http_host: unsupported event type "http_request"
+rule validate: bundle failed validation
+##[warning]project config fetch failed: /home/runner/work/_temp/cicd-sensor-staging/extracted/cicd-sensorctl-linux-amd64 exited with status 1; agent will run with baseline rules
+==> Registering project start
+```
+
+この run は `sensor-enforce.yml` (`monitor_mode: false` を書き込んでいたはず)
+だったが、上記の理由で `monitor_mode: false` が agent に届かず、
+`testbed_kill_marker` ルール (`action: terminate` のはず) が attestation
+predicate / HTML レポートの両方で **`action: detect`** として記録され、
+`REACHED_AFTER_KILLME` がログに出力された (= **プロセスは kill されなかった**)。
+`assert` ジョブは (設計どおり) この乖離を検出して失敗した。
+
+**教訓**: たった1本の未対応イベント型ルールが、それとは無関係な他の
+カスタムルールや `monitor_mode` の意味まで変えてしまう。ローカルの
+`cicd-sensorctl rule validate`（HEAD からビルドしたもの）は通ってしまうため、
+**この不整合はローカル検証だけでは検出できません。** 実際の run の
+`Start cicd-sensor` ステップログに `##[warning]project config fetch failed`
+が出ていないか、job summary の `rules_summary` を必ず確認してください。
+この教訓を踏まえ、`sensor-monitor.yml` / `sensor-enforce.yml` の
+`Validate .cicd-sensor/rules` ステップは、検証に失敗した場合に
+**そのステップ自体でジョブを失敗させる**ように変更済みです
+(`cicd-sensorctl` の入手自体に失敗した場合は、従来どおり警告のみで続行し、
+その旨を job summary に記録します)。
+
+### `http_request` イベント型 (平文 HTTP 捕捉) が未対応
+
+上記の直接の原因になった、現時点のピン留めバージョンに起因する制約です。
 
 - このリポジトリは `cicd-sensor-action@6511eb44c91d71b2b93d71193b1bf2cb18352f66`
-  (v0.0.38、2026-06-13 時点のコミット) をピン留めして使っています。
+  (action 本体のタグ v0.0.38、2026-06-13 時点のコミット) をピン留めして
+  使っています。**ただしこれは action 本体のバージョンで、実際に
+  ダウンロード・実行される cicd-sensor の agent バイナリのバージョンは
+  別です。** ワークフローは action の `cicd-sensor-version` 入力を
+  明示していないため既定値が使われ、run 32544606013 の実ログで
+  `cicd-sensor-version: v0.0.45` が実際に使われていたことを確認しました
+  (以前の記載では、action 本体の v0.0.38 と agent バイナリのバージョンを
+  混同し、両方とも v0.0.38 であるかのように書かれていましたが誤りです)。
 - `http_request` イベント (平文 HTTP リクエストの捕捉) が実装されたのは
   **2026-08-11** (cicd-sensor リポジトリの commit `bdec37f2`
   "feat(agent): capture cleartext HTTP request metadata (#139)") です。
-  ピン留めしている v0.0.38 はこれより前のバージョンで、
-  `internal/agent/bpf/http_hooks.bpf.h` を含みません。さらに、
-  **最新のリリース済みタグ `releases/v0.0.45` (2026-08-09) 時点でもまだ
-  この実装は含まれていません**。`http_request` は現時点では cicd-sensor の
-  main ブランチにしか存在しません。
-- このため、`.cicd-sensor/rules/testbed.yaml` の `testbed_canary_http_host`
-  ルール (`event_type: http_request`) は、このリポジトリがピン留めしている
-  バージョンの cicd-sensor では**静かに読み込まれず、一度も発火しません**
-  (HTML レポートの `rules_summary.warnings_count` に計上されるだけで、
-  ハードエラーにはなりません)。
+  実際にダウンロードされる agent バイナリの **v0.0.45 (2026-08-09)** は
+  これより**前**のバージョンで、`internal/agent/bpf/http_hooks.bpf.h` を
+  含みません。`http_request` は現時点では cicd-sensor の main ブランチに
+  しか存在せず、リリース済みタグには (v0.0.45 を含め) まだ含まれて
+  いません。
+- **このため、`.cicd-sensor/rules/testbed.yaml` の `testbed_canary_http_host`
+  ルール (`event_type: http_request`) はコメントアウトして無効化済みです。**
+  上記「最重要」の事実が判明する前は「静かに読み込まれず、ハードエラーには
+  ならない」という説明でしたが、これは `sensor-monitor.yml` 相当の実行での
+  観測に基づくものであり、`sensor-enforce.yml` の run 32544606013 では
+  実際には**プロジェクト設定全体を破棄するハードエラー**として作用しました。
+  ルールファイル (`.cicd-sensor/rules/testbed.yaml`) のコメントアウトされた
+  ルール本体に、再有効化してよい条件を明記しています。
 - その結果、`CANARY_URL_PATH` / `CANARY_URL_QUERY` は現状 **N/A**
   (`tools/render-matrix.py` の判定で「http_request 未対応のため観測不能」)
   になります。これは「漏れなかった」ことの確認ではなく、「そもそも観測する
@@ -147,8 +195,9 @@
   気づけます。
 - ピン留めしている `cicd-sensor-action` のバージョンを、`http_request` を
   含むバージョン (main ブランチに含まれる時点以降、将来的なリリース) に
-  更新すれば、`testbed_canary_http_host` ルールは変更なしに発火するように
-  なり、`CANARY_URL_PATH` / `CANARY_URL_QUERY` も通常どおり ✅/⚠️ で
+  更新すれば、`.cicd-sensor/rules/testbed.yaml` の `testbed_canary_http_host`
+  ルールのコメントを外すだけで変更なしに発火するようになり、
+  `CANARY_URL_PATH` / `CANARY_URL_QUERY` も通常どおり ✅/⚠️ で
   判定されるようになります。
 
 ---

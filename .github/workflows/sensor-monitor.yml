@@ -75,11 +75,57 @@ jobs:
           fi
 
       - name: Validate .cicd-sensor/rules
+        # 実地実行 (run 32544606013, sensor-enforce.yml) で判明した事実への
+        # 対応: 以前はこのステップが失敗しても ::warning:: を出すだけで
+        # 後続 (cicd-sensor-action) に進んでいた。しかし
+        # testbed_canary_http_host (event_type: http_request, 当時ピン留め
+        # していたバージョン未対応) が1本混入していただけで、
+        # cicd-sensor-action 内部の project config fetch がバンドル
+        # 検証エラーで失敗し、.cicd-sensor/config.yaml の monitor_mode を
+        # 含むプロジェクト設定全体が agent に届かずベースラインへ
+        # フォールバックする、という重大な不具合を静かに見逃していた。
+        # そのため、ここで実際に検証が失敗した場合はこのステップ自体で
+        # ジョブを失敗させ、以降のワークフロー実行者が気づけるようにする。
+        # cicd-sensorctl そのものが入手できなかった場合 (README「セットアップ」
+        # 3節、入手経路が未検証のため) は、従来どおり警告のみで続行して
+        # よいが、「検証をスキップした」ことを job summary に残す。
         run: |
+          set -uo pipefail
           if command -v cicd-sensorctl >/dev/null 2>&1; then
-            cicd-sensorctl rule validate .cicd-sensor/rules
+            if cicd-sensorctl rule validate .cicd-sensor/rules; then
+              {
+                echo "## Validate .cicd-sensor/rules: OK"
+                echo ""
+                echo "\`cicd-sensorctl rule validate .cicd-sensor/rules\` passed."
+              } >> "$GITHUB_STEP_SUMMARY"
+            else
+              status=$?
+              {
+                echo "## Validate .cicd-sensor/rules: FAILED"
+                echo ""
+                echo "\`cicd-sensorctl rule validate .cicd-sensor/rules\` exited with status ${status}."
+                echo ""
+                echo "未対応のイベント型を使っていないか確認すること。**1本でも無効な"
+                echo "ルールがあると、プロジェクト設定全体 (\`monitor_mode\` を含む) が"
+                echo "agent に届かなくなる** (run 32544606013 で実機確認済み。"
+                echo "README.md \"既知の制約\" 参照)。"
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::cicd-sensorctl rule validate failed (exit ${status}). Check whether a rule uses an event type unsupported by the pinned cicd-sensor release (e.g. http_request). Even a single invalid rule discards the ENTIRE project config bundle at agent startup — not just that one rule — so monitor_mode and every other custom rule silently fail to reach the agent too. See README.md known limitations (run 32544606013)."
+              exit "${status}"
+            fi
           else
-            echo "::warning::cicd-sensorctl not available; rule validation skipped"
+            {
+              echo "## Validate .cicd-sensor/rules: SKIPPED"
+              echo ""
+              echo "\`cicd-sensorctl\` was not available (see the previous step), so"
+              echo "\`cicd-sensorctl rule validate .cicd-sensor/rules\` was **not run** for"
+              echo "this job. A rule using an unsupported event type would therefore"
+              echo "NOT be caught here — it would only surface later, as a project-config"
+              echo "fetch failure inside the \"Start cicd-sensor\" step below, which"
+              echo "silently discards \`monitor_mode\` and all custom rules if it happens"
+              echo "(see README.md known limitations, run 32544606013)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::cicd-sensorctl not available; rule validation skipped (see job summary — this means an invalid rule would not be caught locally)"
           fi
 
       - name: Start cicd-sensor (standalone mode)

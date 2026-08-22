@@ -95,11 +95,59 @@ jobs:
           fi
 
       - name: Validate .cicd-sensor/rules
+        # 実地実行 (run 32544606013) で判明した事実への対応: 以前はこの
+        # ステップが失敗しても ::warning:: を出すだけで後続
+        # (cicd-sensor-action) に進んでいた。しかし testbed_canary_http_host
+        # (event_type: http_request, 当時ピン留めしていたバージョン未対応)
+        # が1本混入していただけで、cicd-sensor-action 内部の project
+        # config fetch がバンドル検証エラーで失敗し、
+        # .cicd-sensor/config.yaml の monitor_mode を含むプロジェクト設定
+        # 全体が agent に届かずベースラインへフォールバックする、という
+        # 重大な不具合を静かに見逃していた (この run では
+        # testbed_kill_marker が action: terminate ではなく action: detect
+        # として評価され、kill が起きなかった)。そのため、ここで実際に
+        # 検証が失敗した場合はこのステップ自体でジョブを失敗させ、以降の
+        # ワークフロー実行者が気づけるようにする。cicd-sensorctl そのものが
+        # 入手できなかった場合 (README「セットアップ」3節、入手経路が
+        # 未検証のため) は、従来どおり警告のみで続行してよいが、
+        # 「検証をスキップした」ことを job summary に残す。
         run: |
+          set -uo pipefail
           if command -v cicd-sensorctl >/dev/null 2>&1; then
-            cicd-sensorctl rule validate .cicd-sensor/rules
+            if cicd-sensorctl rule validate .cicd-sensor/rules; then
+              {
+                echo "## Validate .cicd-sensor/rules: OK"
+                echo ""
+                echo "\`cicd-sensorctl rule validate .cicd-sensor/rules\` passed."
+              } >> "$GITHUB_STEP_SUMMARY"
+            else
+              status=$?
+              {
+                echo "## Validate .cicd-sensor/rules: FAILED"
+                echo ""
+                echo "\`cicd-sensorctl rule validate .cicd-sensor/rules\` exited with status ${status}."
+                echo ""
+                echo "未対応のイベント型を使っていないか確認すること。**1本でも無効な"
+                echo "ルールがあると、プロジェクト設定全体 (\`monitor_mode\` を含む) が"
+                echo "agent に届かなくなる** (run 32544606013 で実機確認済み。"
+                echo "README.md \"既知の制約\" 参照)。"
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::cicd-sensorctl rule validate failed (exit ${status}). Check whether a rule uses an event type unsupported by the pinned cicd-sensor release (e.g. http_request). Even a single invalid rule discards the ENTIRE project config bundle at agent startup — not just that one rule — so monitor_mode and every other custom rule silently fail to reach the agent too. See README.md known limitations (run 32544606013)."
+              exit "${status}"
+            fi
           else
-            echo "::warning::cicd-sensorctl not available; rule validation skipped"
+            {
+              echo "## Validate .cicd-sensor/rules: SKIPPED"
+              echo ""
+              echo "\`cicd-sensorctl\` was not available (see the previous step), so"
+              echo "\`cicd-sensorctl rule validate .cicd-sensor/rules\` was **not run** for"
+              echo "this job. A rule using an unsupported event type would therefore"
+              echo "NOT be caught here — it would only surface later, as a project-config"
+              echo "fetch failure inside the \"Start cicd-sensor\" step below, which"
+              echo "silently discards \`monitor_mode\` and all custom rules if it happens"
+              echo "(see README.md known limitations, run 32544606013)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::cicd-sensorctl not available; rule validation skipped (see job summary — this means an invalid rule would not be caught locally)"
           fi
 
       - name: Start cicd-sensor (standalone mode)
@@ -143,7 +191,8 @@ jobs:
     needs: enforce
     if: always()
     runs-on: ubuntu-24.04
-    permissions: {}
+    permissions:
+      actions: read
     steps:
       - name: Verify the kill-trigger process was terminated
         run: |
@@ -175,6 +224,131 @@ jobs:
           fi
 
           echo "OK: the kill-trigger process was terminated before reaching REACHED_AFTER_KILLME."
+
+      # ----------------------------------------------------------------
+      # 実効性確認 (run 32544606013 で判明した不具合への対応):
+      # 上の "Verify the kill-trigger process was terminated" ステップは
+      # killme ステップの成否と REACHED_AFTER_KILLME の有無しか見ておらず、
+      # 「kill されなかった」ときに *なぜ* 起きなかったかを判定できない。
+      # 実地実行 (run 32544606013) では、testbed_kill_marker が
+      # action: terminate ではなく action: detect として評価されていた
+      # (= .cicd-sensor/config.yaml の monitor_mode: false がプロジェクト
+      # 設定バンドル検証の失敗により agent に届いていなかった) ことが
+      # attestation predicate / HTML レポートの両方から確認できた。
+      # 次回以降、同じ失敗が起きた場合に原因をすぐ切り分けられるよう、
+      # ここで同じ確認を自動化する。cicd-sensor-action がこれらの
+      # アーティファクトを既にアップロード済み (enforce ジョブの
+      # post-step) であることを前提に、continue-on-error でダウンロード
+      # するだけの読み取り専用ステップで、collect-telemetry ジョブが
+      # 行なう retention-days:1 化・削除 (実効的な "所有" 処理) には
+      # 一切関与しない。
+      # ----------------------------------------------------------------
+      - name: Download cicd-sensor-attestation (monitor_mode reality check)
+        id: download_attestation_check
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cicd-sensor-attestation
+          path: ${{ runner.temp }}/kill-check/cicd-sensor-attestation
+
+      - name: Download cicd-sensor-report.html (monitor_mode reality check)
+        id: download_report_check
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cicd-sensor-report.html
+          path: ${{ runner.temp }}/kill-check/cicd-sensor-report
+
+      - name: Check actual testbed_kill_marker action (monitor_mode reality check)
+        if: always()
+        run: |
+          set -uo pipefail
+          python3 - <<'PYEOF'
+          import json
+          import os
+          import re
+
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+          runner_temp = os.environ["RUNNER_TEMP"]
+          action = None
+          source = None
+
+          predicate_path = os.path.join(
+              runner_temp, "kill-check", "cicd-sensor-attestation", "predicate.json"
+          )
+          if os.path.isfile(predicate_path):
+              try:
+                  with open(predicate_path, encoding="utf-8") as f:
+                      predicate = json.load(f)
+                  monitor_log = predicate.get("monitorLog", {})
+                  for key, hits in monitor_log.items():
+                      if not key.endswith("/detections/v1alpha1"):
+                          continue
+                      for hit in hits:
+                          if hit.get("rule_id") == "testbed_kill_marker":
+                              action = hit.get("action")
+                              source = "cicd-sensor-attestation/predicate.json"
+                              break
+                      if action is not None:
+                          break
+              except Exception as exc:
+                  print(f"::warning::failed to parse predicate.json: {exc}")
+
+          if action is None:
+              report_path = os.path.join(
+                  runner_temp, "kill-check", "cicd-sensor-report", "cicd-sensor-report.html"
+              )
+              if os.path.isfile(report_path):
+                  try:
+                      with open(report_path, encoding="utf-8") as f:
+                          html = f.read()
+                      m = re.search(
+                          r"window\.REPORT_DATA\s*=\s*JSON\.parse\((\".*?\")\)\s*;",
+                          html,
+                          re.S,
+                      )
+                      if m:
+                          inner_json_text = json.loads(m.group(1))
+                          report_data = json.loads(inner_json_text)
+                          for hit in report_data.get("hits", []):
+                              if hit.get("rule_id") == "testbed_kill_marker":
+                                  action = hit.get("action")
+                                  source = "cicd-sensor-report.html"
+                                  break
+                  except Exception as exc:
+                      print(f"::warning::failed to parse cicd-sensor-report.html: {exc}")
+
+          with open(summary_path, "a", encoding="utf-8") as f:
+              f.write("## testbed_kill_marker: actual action evaluated by the agent\n\n")
+              if action is None:
+                  f.write(
+                      "- Could not determine the actual `action` for `testbed_kill_marker` "
+                      "(neither `cicd-sensor-attestation/predicate.json` nor "
+                      "`cicd-sensor-report.html` was available/parseable for this run).\n"
+                  )
+              else:
+                  f.write(f"- Source: `{source}`\n")
+                  f.write(f"- `testbed_kill_marker` action: `{action}`\n")
+                  if action != "terminate":
+                      f.write(
+                          "- **This is NOT `terminate`.** `monitor_mode` may still be "
+                          "enabled, or the project config (including `monitor_mode`) may not "
+                          "have reached the agent at all. Check the `Start cicd-sensor` step "
+                          "log in the `enforce` job for a `project config fetch failed` "
+                          "warning (see README.md known limitations, run 32544606013).\n"
+                      )
+
+          if action is not None and action != "terminate":
+              print(
+                  "::error::testbed_kill_marker was evaluated with action='"
+                  + action
+                  + "', not 'terminate'. monitor_mode が有効なままか、プロジェクト設定が"
+                  + " agent に届いていない可能性がある。Start cicd-sensor ステップのログで"
+                  + " 'project config fetch failed' の警告が出ていないか確認すること."
+              )
+          PYEOF
 
   collect-telemetry:
     name: "collect telemetry (T2)"
