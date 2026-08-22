@@ -107,6 +107,76 @@
 
 ## 既知の制約
 
+### 🚨🚨 最も根本的な事実: 設定・ルールはワークスペースではなくコミット SHA から取得される（実行時の書き換えは効かない）
+
+このリポジトリの以前の設計には、これより下の全ての「既知の制約」の前提を
+覆す誤りがありました。**必ず最初に読んでください。**
+
+`cicd-sensor-action` は、プロジェクト設定 (`.cicd-sensor/config.yaml`) と
+カスタムルール (`.cicd-sensor/rules/`) を、ジョブのワークスペース上の
+ファイルからではなく **GitHub Contents API 経由でコミット SHA
+(`GITHUB_SHA`) から取得します。** 根拠 (cicd-sensor-action v0.0.38,
+commit `6511eb44c91d71b2b93d71193b1bf2cb18352f66`, `src/main.js:643-666`):
+
+```js
+const repo = process.env.GITHUB_REPOSITORY || '';
+const ref  = process.env.GITHUB_SHA || '';
+if (repo && ref) {
+  const cfg = await fetchRepoFile(githubToken, repo, ref, '.cicd-sensor/config.yaml');
+  ...
+  const ruleFiles = await fetchRepoDirectoryFiles(githubToken, repo, ref, '.cicd-sensor/rules');
+```
+
+以前の `sensor-monitor.yml` / `sensor-enforce.yml` は、`actions/checkout` の
+後にジョブ内で `.cicd-sensor/config.yaml` を `cat > ... <<'EOF'` で書き換え、
+`sensor-monitor.yml` では `monitor_mode: true` のまま、`sensor-enforce.yml`
+では `monitor_mode: false` に切り替えるつもりでした。しかし action は
+ワークスペース上のこの変更を一切見ないため、**この書き換えステップは完全に
+無意味 (no-op) でした。** 実際に使われていたのは常にリポジトリに
+コミットされている値 (`monitor_mode: true`) であり、これが原因で
+`sensor-enforce.yml` の `testbed_kill_marker` (`action: terminate`) が
+`action: detect` に降格され、kill が起きませんでした
+(run 32544606013, 32545681004 の両方で実機確認)。両ワークフローの
+当該ステップは削除し、削除理由のコメントを残しています。
+
+**この挙動自体は cicd-sensor の良い設計です。** ジョブ内で実行される
+プロセス (侵害されている可能性のあるビルドスクリプトや依存パッケージの
+postinstall なども含む) が、ワークスペース上の `monitor_mode` やカスタム
+ルールを書き換えて自分自身への監視を無効化する、という攻撃を構造的に
+防いでいます。監視設定がジョブから独立した信頼できる場所 (コミット SHA)
+から取得されるのは、セキュリティ上むしろ正しい設計です。
+
+この帰結として、**`monitor_mode` はリポジトリ全体で1つの値しか持てず、
+`sensor-monitor.yml` と `sensor-enforce.yml` の間で切り替えることはできません。**
+このリポジトリでは kill テスト (`sensor-enforce.yml`) を機能させることを
+優先し、`.cicd-sensor/config.yaml` のコミット値そのものを
+`monitor_mode: false` にしています。これにより `sensor-monitor.yml` でも
+terminate ルールが有効になりますが、影響を評価した結果は次のとおりです。
+
+- 自作ルールで `action: terminate` を持つのは `testbed_kill_marker` のみ。
+  発火条件の `cicd-sensor-killme.marker` への書き込みは
+  `scenarios/90-killme.sh` (`sensor-enforce.yml` 専用) だけが行なうため、
+  `sensor-monitor.yml` では発火しません。
+- ベースラインルール (`cicd-sensor/rules/`) で `action: terminate` を
+  持つのは、実際にリポジトリを読んで列挙した次の7件のみです:
+  `docker_upstream_socket_access` (`docker-upstream.sock` への
+  `unix_socket_connect`)、`mini_shaihulud_antv_c2_domain` /
+  `mastra_npm_compromise_c2_ip` / `asyncapi_npm_compromise_c2_ip` /
+  `asyncapi_miasma_dht_bootstrap_domain` / `miasma_systemd_unit_write` /
+  `keyv_shaihulud_math_symbol_artifact`。`sensor-monitor.yml` の
+  `scenarios/00〜07` は、実在の IOC ドメイン・IP に一切通信せず
+  (通信先は `example.com` と `*.test.invalid` のみ)、
+  `docker-upstream.sock` にもアクセスせず、`systemd` 配下に `miasma` を
+  含むパスへの書き込みも `node_modules/keyv/Math_Symbol.js` の読み書きも
+  行なわないため、現状これらは発火しません。
+- **ただし、万一 `sensor-monitor.yml` のシナリオが将来変更されて上記
+  いずれかのベースライン terminate ルールの条件に触れた場合、
+  `monitor_mode: false` の下では実際にそのジョブが kill されるリスクが
+  残ります。** これは正直に記載しておきます。
+
+詳細は `docs/SPEC.md` §5 と `.cicd-sensor/config.yaml` のコメントを
+参照してください。
+
 ### 🚨 最重要: 無効なルールが1本あるだけでプロジェクト設定全体 (`monitor_mode` を含む) が破棄される
 
 実地実行 (**run 32544606013**, `sensor-enforce.yml`) で判明した、**このリポジトリ
@@ -285,7 +355,7 @@ gh release view v0.0.38 --repo cicd-sensor/cicd-sensor
 | --- | --- | --- | --- |
 | `falco-live.yml` | falco live モードでの検知 (`falco-version` 0.39.0 / 0.39.2 の matrix) | Actions タブから workflow_dispatch で実行 (入力なし) | falco-actions を呼ぶ前に、指定した `falco-version` タグが Docker Hub に実在するかを preflight ステップが確認する (存在しなければジョブをここで明確に落とす)。各バージョンの `telemetry-falco-live-<version>` アーティファクトに job summary と (取得できれば) `falco_events.json` / `falco_start_logs.txt` が入る。`required_engine_version: 0.43.0` のルールを実際の上限バージョン (0.39.x) が読み込めたか/拒否したか/警告のみで通ったかを job summary の "matrix note" / "required_engine_version" セクションで確認する。**なぜ 0.39.x が上限か**: falco-actions がハードコードして使う `falcosecurity/falco-no-driver` イメージは、Docker Hub 上の数値タグが `0.39.2` で公開停止しているため (`0.43.0` は実在しない) |
 | `falco-analyze.yml` | falco analyze モードでの検知と生キャプチャ | workflow_dispatch。`upload_raw_capture` (既定 false) で生キャプチャの取り扱いを制御 | `analyze` ジョブは falco-actions/analyze を呼ぶ前に、`falco-version: 0.39.2` (falcosecurity/falco-no-driver の実際の上限) が Docker Hub に実在するかを preflight ステップが確認する。`telemetry-falco-analyze` アーティファクトに job summary・抽出情報 (processes/connections/dns/containers/written-files/hashes) が入る。`upload_raw_capture: true` のときのみ `capture.scap` も含む。同梱ルール (`required_engine_version: 0.43.0`) を 0.39.2 エンジンが実際にロードできたかは job summary の "required_engine_version" セクションを参照 (要手動確認) |
-| `sensor-monitor.yml` | cicd-sensor の検知 (kill なし、`monitor_mode: true`) | workflow_dispatch (入力なし) | 全シナリオ (00〜07。07 は detect / collect ルール専用) が実行され、`telemetry-cicd-sensor-monitor` に HTML レポートと attestation predicate が入る。collect-telemetry ジョブは取得できたアーティファクトを `telemetry-manifest.txt` と job summary に明記し、1 つも取得できなければジョブを失敗させる |
+| `sensor-monitor.yml` | cicd-sensor の検知 (自作ルールでの kill は起きない想定。ただし `monitor_mode` はコミット値 `false` でリポジトリ全体共通、詳細は既知の制約「🚨🚨 最も根本的な事実」参照) | workflow_dispatch (入力なし) | 全シナリオ (00〜07。07 は detect / collect ルール専用) が実行され、`telemetry-cicd-sensor-monitor` に HTML レポートと attestation predicate が入る。collect-telemetry ジョブは取得できたアーティファクトを `telemetry-manifest.txt` と job summary に明記し、1 つも取得できなければジョブを失敗させる |
 | `sensor-enforce.yml` | cicd-sensor の kill 動作の検証。**成功が正常** | workflow_dispatch (入力なし) | `assert` ジョブが **成功** すれば kill が確認できたことを意味する。失敗した場合は kill が起きなかったことを意味し、要調査。**このワークフローが実行する `scenarios/90-killme.sh` はカナリアを注入しない** (`load_canaries` を呼ばない) ため、この run の run_id は `leak-scan.yml` の入力にはできない (対象外として弾かれる)。collect-telemetry ジョブのテレメトリ収集完全性チェックは `sensor-monitor.yml` と同様 |
 | `leak-scan.yml` | 漏洩マトリクスの生成 (T3) | workflow_dispatch。`run_id` に `falco-live.yml` / `falco-analyze.yml` / `sensor-monitor.yml` いずれかの run ID を入力 (`sensor-enforce.yml` の run ID は不可。上記参照) | 対象 run の `telemetry-*` アーティファクトを横断的に走査し、job summary と (常に) ステップログの両方にカナリアごとの 期待 vs 実測 のマトリクスを出す。走査対象に含まれないツール向けのカナリア (`CANARY_SCAP` は falco 固有) は ⚠️ ではなく N/A (対象外) と表示され、判定にも exit code にも影響しない。**証跡の粒度が足りない場合も同様に N/A になる** (例: cicd-sensor の attestation predicate 集計のみで、HTML レポートや falco の詳細テレメトリが無い場合、`CANARY_PATH` 等の「詳細以上」を要求するカナリアは N/A (この証跡粒度では観測不能) と表示される。`CANARY_DNS` は predicate だけでも判定対象)。**終了コードが 2 種類あり、意味が異なる**: exit 1 = 期待と実測の乖離あり (「発見」。仮説と現実が食い違ったことを目立たせるための意図的な失敗で、job summary の ⚠️ 行と `::error::` 注釈にどのカナリアが食い違ったかが出る)、exit 2 = 走査不成立 (「テスト自体が成立していない」。対象 run に `telemetry-*` アーティファクトが無かった、または `sensor-enforce.yml` の run を誤って指定した等で走査対象 0 件/対象外になったケース。カナリアの判定は行なわれない)。どちらもワークフローとしては失敗 (赤) になるが、job summary の内容でどちらかを区別できる |
 

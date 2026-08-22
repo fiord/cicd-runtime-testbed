@@ -7,6 +7,30 @@
 #   scenarios/90-killme.sh は kill 発火専用で、このワークフローからのみ
 #   呼び出す (docs/SPEC.md §4)。
 #
+# 重要 (仕様の根本的な誤りの修正、docs/SPEC.md §5。旧版のこのワークフローは
+# 「実行時に .cicd-sensor/config.yaml を monitor_mode: false へ書き換える」
+# ステップを持っていたが、これは完全に無意味 (no-op) だった):
+#   cicd-sensor-action は、プロジェクト設定 (.cicd-sensor/config.yaml) と
+#   カスタムルール (.cicd-sensor/rules/) を、ジョブのワークスペース上の
+#   ファイルからではなく GitHub Contents API 経由でコミット SHA
+#   (GITHUB_SHA) から取得する (cicd-sensor-action v0.0.38,
+#   src/main.js:643-666)。そのため、このワークフローが checkout 後に
+#   .cicd-sensor/config.yaml を書き換えても action はその変更を一切見ず、
+#   常にコミット済みの内容 (当時は monitor_mode: true) が使われていた。
+#   これが原因で testbed_kill_marker (action: terminate) が
+#   action: detect に降格され、kill が起きなかった (run 32544606013,
+#   32545681004 で実機確認)。対応として、実行時の書き換えステップを
+#   削除し、.cicd-sensor/config.yaml のコミット値そのものを
+#   monitor_mode: false にした (詳細は同ファイルのコメント参照)。
+#   この結果、monitor_mode はリポジトリ全体で1つの値しか持てず、
+#   sensor-monitor.yml と本ワークフローで切り替えることはできない
+#   (sensor-monitor.yml への影響は同ワークフローのコメントと
+#   README.md「既知の制約」を参照)。
+#
+#   なお、ジョブ内のプロセスがワークスペース上の設定ファイルを書き換えて
+#   自分自身への監視を無効化できない、というこの action の挙動自体は
+#   良い設計であり、否定的に書くべき欠陥ではない。
+#
 # ============================================================================
 # 重要 (README にも明記): このワークフローだけは「成功が正常」である。
 # 他の 4 本 (falco-live / falco-analyze / sensor-monitor / leak-scan) は
@@ -66,14 +90,19 @@ jobs:
       - name: Checkout cicd-runtime-testbed
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set monitor_mode false in .cicd-sensor/config.yaml
-        run: |
-          cat > .cicd-sensor/config.yaml <<'EOF'
-          monitor_mode: false
-          default_max_alerts_per_rule: 50
-          EOF
-          echo "-- .cicd-sensor/config.yaml --"
-          cat .cicd-sensor/config.yaml
+      # 削除済み: 以前ここに「Set monitor_mode false in
+      # .cicd-sensor/config.yaml」という、チェックアウト後のワークスペース
+      # 上の .cicd-sensor/config.yaml を書き換えるステップがあった。
+      # cicd-sensor-action はプロジェクト設定を GitHub Contents API
+      # 経由でコミット SHA から取得する (src/main.js:643-666) ため、
+      # ワークスペース上のこのファイルへの変更を action は一切見ない。
+      # このステップは常に no-op であり、実際に使われていたのはリポジトリ
+      # にコミットされている .cicd-sensor/config.yaml の内容 (当時
+      # monitor_mode: true) だった。これが run 32544606013 /
+      # 32545681004 で kill が起きなかった直接の原因であり、読む人を
+      # 誤解させるステップだったため削除した。現在は
+      # .cicd-sensor/config.yaml のコミット値そのものを
+      # monitor_mode: false にしている (同ファイルのコメント参照)。
 
       - name: Install cicd-sensorctl
         env:
@@ -333,19 +362,30 @@ jobs:
                   f.write(f"- `testbed_kill_marker` action: `{action}`\n")
                   if action != "terminate":
                       f.write(
-                          "- **This is NOT `terminate`.** `monitor_mode` may still be "
-                          "enabled, or the project config (including `monitor_mode`) may not "
-                          "have reached the agent at all. Check the `Start cicd-sensor` step "
-                          "log in the `enforce` job for a `project config fetch failed` "
-                          "warning (see README.md known limitations, run 32544606013).\n"
+                          "- **This is NOT `terminate`.** First check whether "
+                          "`.cicd-sensor/config.yaml`'s **committed** `monitor_mode` value "
+                          "is `false` at the commit this run checked out — "
+                          "cicd-sensor-action fetches project config and rules via the "
+                          "GitHub Contents API from `GITHUB_SHA` "
+                          "(`src/main.js:643-666`), NOT from the workspace, so any "
+                          "runtime rewrite of this file has no effect. If the committed "
+                          "value is already `false`, then the project config (including "
+                          "`monitor_mode`) may not have reached the agent at all — check "
+                          "the `Start cicd-sensor` step log in the `enforce` job for a "
+                          "`project config fetch failed` warning (see README.md known "
+                          "limitations, run 32544606013 / 32545681004).\n"
                       )
 
           if action is not None and action != "terminate":
               print(
                   "::error::testbed_kill_marker was evaluated with action='"
                   + action
-                  + "', not 'terminate'. monitor_mode が有効なままか、プロジェクト設定が"
-                  + " agent に届いていない可能性がある。Start cicd-sensor ステップのログで"
+                  + "', not 'terminate'. .cicd-sensor/config.yaml の monitor_mode が"
+                  + " このワークフローが checkout したコミットで false になっているか"
+                  + " 確認すること。cicd-sensor-action は設定・ルールを GITHUB_SHA から"
+                  + " GitHub Contents API 経由で取得する (src/main.js:643-666) ため、"
+                  + " 実行時にこのファイルを書き換えても効かない。コミット値が既に"
+                  + " false なら、Start cicd-sensor ステップのログで"
                   + " 'project config fetch failed' の警告が出ていないか確認すること."
               )
           PYEOF

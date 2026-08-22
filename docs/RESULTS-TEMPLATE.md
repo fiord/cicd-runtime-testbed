@@ -83,7 +83,7 @@
 - 発火したルール:
 - シナリオごとの検知有無 (falco-live.yml と同じ形式で記入):
 
-### sensor-monitor.yml (`monitor_mode: true`)
+### sensor-monitor.yml (`monitor_mode`: コミット値。現在 `false`。docs/SPEC.md §5 参照)
 
 - run URL:
 - 発火した検知ルール (Detection Log から転記):
@@ -383,6 +383,84 @@ rule validate: bundle failed validation
 検出できない (むしろ通ってしまう) ため、実際に GitHub Actions 上で走らせて
 job summary / ジョブログを確認するまで気づけない。README.md「既知の制約」
 を参照。
+
+---
+
+## 実測結果（run 32545681004, sensor-enforce.yml）— 設定バンドルは検証を通ったが kill されなかった
+
+このセクションも記入用テンプレートではなく、実際に得られた実測結果の記録。
+run 32544606013 の対応 (`testbed_canary_http_host` のコメントアウトと
+`Validate .cicd-sensor/rules` ステップの失敗時ジョブ落とし) を反映した後の
+再実行だが、**依然として kill されなかった**。この run が、config.yaml の
+実行時書き換えが no-op であるという根本原因の発見につながった。
+
+- 対象 run: `sensor-enforce.yml` の run 32545681004。
+- **結果: 今回もプロセスは kill されなかった。** `scenarios/90-killme.sh` の
+  実行ログに `REACHED_AFTER_KILLME` が出力され、`assert` ジョブは
+  (設計どおり) 失敗した。
+- **run 32544606013 との違い: 今回はプロジェクト設定バンドルの検証自体は
+  成功していた。** `Validate .cicd-sensor/rules` ステップ、および
+  `Start cicd-sensor` ステップのログのいずれにも
+  `project config fetch failed` の警告は出ておらず、
+  `.cicd-sensor/config.yaml` と `.cicd-sensor/rules/` は正常に agent に
+  読み込まれていた。つまり run 32544606013 の原因 (バンドル検証失敗による
+  プロジェクト設定全体の破棄) はこの run には当てはまらない。
+- にもかかわらず、`assert` ジョブが追加でダウンロードした
+  `cicd-sensor-attestation/predicate.json` を確認すると、
+  `testbed_kill_marker` (`ruleset_id: cicd_runtime_testbed/kill_test`) は
+  **`action: detect`** として記録されていた。バンドルは正しく読み込まれた
+  にもかかわらず、`monitor_mode` が有効 (`true`) なまま評価されていた
+  ことになる。
+- **原因調査の結果、`sensor-enforce.yml` の「Set monitor_mode false in
+  .cicd-sensor/config.yaml」ステップ (`actions/checkout` 後にワークスペース
+  上の `.cicd-sensor/config.yaml` を `cat > ... <<'EOF'` で上書きするだけの
+  ステップ) が、実際には何の効果も持っていなかったことが判明した。**
+  `cicd-sensor-action` (v0.0.38, commit
+  `6511eb44c91d71b2b93d71193b1bf2cb18352f66`) のソース
+  (`src/main.js:643-666`、`artifacts-received/action-main.js` に写しあり) を
+  確認したところ、プロジェクト設定・ルールは次のとおりワークスペースの
+  ファイルではなく **GitHub Contents API 経由でコミット SHA
+  (`GITHUB_SHA`) から取得**していた:
+
+  ```js
+  const repo = process.env.GITHUB_REPOSITORY || '';
+  const ref  = process.env.GITHUB_SHA || '';
+  if (repo && ref) {
+    const cfg = await fetchRepoFile(githubToken, repo, ref, '.cicd-sensor/config.yaml');
+    ...
+    const ruleFiles = await fetchRepoDirectoryFiles(githubToken, repo, ref, '.cicd-sensor/rules');
+  ```
+
+  この run の時点で `.cicd-sensor/config.yaml` のコミット値は
+  `monitor_mode: true` だったため、ワークフローがワークスペース上で
+  `monitor_mode: false` に書き換えても action には一切反映されず、
+  `testbed_kill_marker` が `action: detect` に降格されて kill が
+  起きなかった。
+
+### 対応 (この commit で実施)
+
+1. `.cicd-sensor/config.yaml` のコミット値を `monitor_mode: false` に変更
+   (実行時切り替えができない以上、これが kill テストを機能させる唯一の
+   方法)。同ファイルのヘッダコメントを、この根本原因の説明に全面的に
+   書き換えた。
+2. `sensor-monitor.yml` / `sensor-enforce.yml` から、no-op だった
+   「Set monitor_mode ... in .cicd-sensor/config.yaml」ステップを削除し、
+   削除理由のコメントを残した。
+3. `sensor-enforce.yml` の `assert` ジョブの診断メッセージに、
+   「`monitor_mode` はコミット値で決まり、実行時の書き換えは効かない」
+   旨を追記した。
+4. `docs/SPEC.md` §5 を全面的に書き換え、`README.md` 既知の制約に
+   この挙動 (セキュリティ上は良い設計であることも含め) を追記した。
+
+### 教訓
+
+**「config.yaml は1つしか置けないため、ワークフロー側で実行時に書き換える」
+という設計そのものが誤りだった。** cicd-sensor-action はプロジェクト設定と
+ルールをコミット SHA から取得する設計であり、これはジョブ内のプロセスが
+自分自身への監視設定を書き換えられないようにするための、意図された
+良い設計である。この制約の下では、`monitor_mode` はリポジトリ全体で1つの
+値しか持てず、ワークフローごとの実行時切り替えは原理的に不可能。
+kill テストを行なうには、コミット値そのものを `false` にするしかない。
 
 ---
 

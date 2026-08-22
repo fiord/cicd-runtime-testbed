@@ -5,17 +5,84 @@
 #   モード)。docs/user-guide/github-hosted.md の config.yaml スキーマに
 #   従う。
 #
-# 安全性:
-#   コミットされる既定値は安全側に倒し、`monitor_mode: true`
-#   (terminate ルールを detect として扱う) にしている。
+# 重要 (仕様の根本的な誤りの修正、docs/SPEC.md 5節。旧版のこのコメントは
+# 誤りだったので全面的に書き換えた):
+#   以前このファイルのコメントは「monitor_mode の切り替えはワークフロー側
+#   (sensor-monitor.yml / sensor-enforce.yml) が実行時にこのファイルを
+#   書き換える方式を取る」と説明していたが、これは誤りだった。
 #
-# 重要 (docs/SPEC.md 5節):
-#   config.yaml は1つしか置けないため、monitor_mode の切り替えは
-#   ワークフロー側 (sensor-monitor.yml / sensor-enforce.yml。担当外) が
-#   実行時にこのファイルを書き換える方式を取る。
-#     - sensor-monitor.yml: monitor_mode: true のまま (検知のみ)
-#     - sensor-enforce.yml: monitor_mode: false に書き換えて実行 (kill テスト)
-#   このリポジトリにコミットされている値は sensor-monitor.yml 相当の
-#   安全な既定値である。
-monitor_mode: true
+#   cicd-sensor-action は、プロジェクト設定 (このファイル) とカスタム
+#   ルール (.cicd-sensor/rules/) を、ジョブのワークスペース上のファイルを
+#   読むのではなく、GitHub Contents API 経由で **コミット SHA
+#   (GITHUB_SHA)** から取得する。根拠 (cicd-sensor-action v0.0.38,
+#   commit 6511eb44c91d71b2b93d71193b1bf2cb18352f66, src/main.js:643-666):
+#
+#     const repo = process.env.GITHUB_REPOSITORY || '';
+#     const ref  = process.env.GITHUB_SHA || '';
+#     if (repo && ref) {
+#       const cfg = await fetchRepoFile(githubToken, repo, ref, '.cicd-sensor/config.yaml');
+#       ...
+#       const ruleFiles = await fetchRepoDirectoryFiles(githubToken, repo, ref, '.cicd-sensor/rules');
+#
+#   そのため、ワークフローが `actions/checkout` 後にこのファイルを
+#   `cat > .cicd-sensor/config.yaml <<'EOF' ... EOF` で書き換えても、
+#   action はそのワークスペース上の変更を一切見ない。読むのは常に
+#   コミット済みの内容であり、ジョブ実行中の書き換えは完全に無意味
+#   (no-op) だった。この設計ミスが原因で、`sensor-enforce.yml` が
+#   `monitor_mode: false` を書き込んだつもりでも実際には
+#   `monitor_mode: true` (このファイルのコミット値) が使われ続け、
+#   `testbed_kill_marker` (action: terminate) が `action: detect` に
+#   降格されて kill が起きなかった (run 32544606013, 32545681004 の
+#   両方で実機確認済み)。
+#
+#   なお、この「ジョブ内のファイル書き換えを action が見ない」という
+#   挙動自体は cicd-sensor の **良い設計**である。ジョブ内で実行される
+#   プロセス (ビルドスクリプトや依存パッケージの postinstall など、
+#   侵害されている可能性があるものを含む) が、ワークスペース上の
+#   monitor_mode やルールを書き換えて自分自身への監視を無効化する、
+#   という攻撃を構造的に防いでいる。
+#
+#   この帰結として、config.yaml がコミットから取得される以上、
+#   **monitor_mode はリポジトリ全体で1つの値しか持てない。**
+#   sensor-monitor.yml と sensor-enforce.yml の間で切り替えることは
+#   (ワークフロー実行時の書き換えでは) できない。
+#
+# 現在のコミット値: monitor_mode: false (terminate 有効)
+#   実行時切り替えができない以上、sensor-enforce.yml の kill テスト
+#   (testbed_kill_marker) を機能させるには、コミット値そのものを
+#   `false` にする以外の方法がない。
+#
+#   これにより生じるリスク (sensor-monitor.yml への影響):
+#     monitor_mode: false は sensor-monitor.yml 側でも同じ agent 設定に
+#     反映されるため、sensor-monitor.yml の実行でも terminate ルールが
+#     有効になる。
+#       - 自作ルールで action: terminate を持つのは
+#         .cicd-sensor/rules/testbed.yaml の testbed_kill_marker のみ。
+#         これは cicd-sensor-killme.marker への書き込みで発火するが、
+#         そのマーカーを書くのは scenarios/90-killme.sh であり、
+#         sensor-monitor.yml はこのスクリプトを実行しない
+#         (90-killme.sh は sensor-enforce.yml 専用、docs/SPEC.md 4節)。
+#         そのため sensor-monitor.yml でこのルールが発火することはない。
+#       - ベースラインルール (cicd-sensor/rules/) で action: terminate を
+#         持つものは次の7件 (2026-08-22 時点でリポジトリを実際に読んで
+#         列挙): generic-tracking-escape.yaml の
+#         docker_upstream_socket_access (docker-upstream.sock への
+#         unix_socket_connect)、ioc.yaml の
+#         mini_shaihulud_antv_c2_domain / mastra_npm_compromise_c2_ip /
+#         asyncapi_npm_compromise_c2_ip /
+#         asyncapi_miasma_dht_bootstrap_domain / miasma_systemd_unit_write /
+#         keyv_shaihulud_math_symbol_artifact。sensor-monitor.yml が実行
+#         する scenarios/00〜07 はこれらのいずれの条件にも触れない
+#         (docker-upstream.sock にアクセスしない、上記の実在ドメイン/IP に
+#         通信しない、systemd 配下に "miasma" を含むパスへ書き込まない、
+#         node_modules/keyv/Math_Symbol.js を読み書きしない。通信先は
+#         example.com (HTTP/HTTPS) と *.test.invalid (解決失敗前提の DNS)
+#         のみ、docs/SPEC.md 1節)。
+#       - **ただし、万一 sensor-monitor.yml のシナリオが将来変更されて
+#         上記いずれかのベースライン terminate ルールの条件に触れた場合、
+#         monitor_mode: false のこの状態では実際にジョブが kill される。**
+#         これは sensor-monitor.yml が本来「検知のみで kill しない」こと
+#         を目的としたワークフローであることに対するリスクとして、
+#         正直に記載しておく (README.md「既知の制約」参照)。
+monitor_mode: false
 default_max_alerts_per_rule: 50

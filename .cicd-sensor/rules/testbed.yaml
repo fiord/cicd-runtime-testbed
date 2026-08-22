@@ -37,9 +37,12 @@
 # 期待される検知内容:
 #   - testbed_kill_marker: scenarios/90-killme.sh が書く
 #     cicd-sensor-killme.marker への書き込みで発火し、action: terminate。
-#     sensor-enforce.yml (monitor_mode: false) ではプロセスが実際に
-#     kill される想定。sensor-monitor.yml (monitor_mode: true) では
-#     terminate は detect として扱われる。
+#     monitor_mode はコミット値で false (config.yaml のコメント参照。
+#     cicd-sensor-action はコミット SHA から設定を取得するため実行時の
+#     切り替えができない) なので、sensor-enforce.yml ではプロセスが
+#     実際に kill される想定。sensor-monitor.yml はこのマーカーへの
+#     書き込みを行なわない (90-killme.sh は sensor-enforce.yml 専用) ため、
+#     terminate 自体は有効だがこのルールは発火しない。
 #   - testbed_detect_marker / testbed_collect_marker: detect / collect
 #     アクションを個別に確認するための自己完結ルール。
 #     scenarios/07-rule-markers.sh (sensor-monitor.yml から実行) が
@@ -103,11 +106,16 @@ rule_sets:
             when monitor_mode is disabled. This is a self-contained
             trigger that does not rely on any real IOC.
           Notes:
-            This is a testbed rule, not a security detection. Under
-            sensor-enforce.yml (monitor_mode: false) a match is expected
-            to terminate the job. Under sensor-monitor.yml
-            (monitor_mode: true) terminate is downgraded to detect, so
-            the rule matches but nothing is killed.
+            This is a testbed rule, not a security detection. monitor_mode
+            is committed as false repo-wide (cicd-sensor-action fetches
+            config/rules from GITHUB_SHA via the GitHub Contents API, so
+            it cannot be toggled per workflow at runtime — see
+            .cicd-sensor/config.yaml). Under sensor-enforce.yml a match is
+            expected to terminate the job. sensor-monitor.yml never
+            writes cicd-sensor-killme.marker (only
+            scenarios/90-killme.sh does, and only sensor-enforce.yml
+            runs it), so this rule does not fire there even though
+            terminate is enabled.
         event_type: file_open
         condition: is_write && path.endsWith("/cicd-sensor-killme.marker")
         action: terminate

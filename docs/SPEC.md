@@ -315,14 +315,84 @@ HTTP の path/host（`domains` にはホスト名のみ）を一切含まない�
 
 ### `.cicd-sensor/config.yaml`
 
-`sensor-monitor.yml` と `sensor-enforce.yml` で `monitor_mode` を切り替える必要がある。
-config.yaml は 1 つしか置けないため、**ワークフロー側で実行時に書き換える**方式とする。
-リポジトリにコミットする既定値は安全側に倒し `monitor_mode: true` とすること。
+**重要（仕様の根本的な誤りの修正。以前のこの節は「ワークフロー側で実行時に
+書き換える」と書いていたが、これは誤りだった。旧版の記述は削除した）:**
+
+cicd-sensor-action は、プロジェクト設定 (`.cicd-sensor/config.yaml`) と
+カスタムルール (`.cicd-sensor/rules/`) を、ジョブのワークスペース上の
+ファイルからではなく **GitHub Contents API 経由でコミット SHA
+(`GITHUB_SHA`) から取得する。** 根拠 (cicd-sensor-action v0.0.38,
+commit `6511eb44c91d71b2b93d71193b1bf2cb18352f66`, `src/main.js:643-666`):
+
+```js
+const repo = process.env.GITHUB_REPOSITORY || '';
+const ref  = process.env.GITHUB_SHA || '';
+if (repo && ref) {
+  const cfg = await fetchRepoFile(githubToken, repo, ref, '.cicd-sensor/config.yaml');
+  ...
+  const ruleFiles = await fetchRepoDirectoryFiles(githubToken, repo, ref, '.cicd-sensor/rules');
+```
+
+つまり `actions/checkout` の後にワークフロー側が
+`.cicd-sensor/config.yaml` をワークスペース上で書き換えても、action は
+その変更を一切見ない。読むのは常にコミット済みの内容であり、**実行時の
+書き換えは完全に無意味 (no-op) である。** 以前の版のこのリポジトリは
+`sensor-monitor.yml` / `sensor-enforce.yml` の両方に「実行時に
+monitor_mode を書き換える」ステップを持っていたが、これが原因で
+`sensor-enforce.yml` が `monitor_mode: false` を書き込んだつもりでも
+実際にはコミット値 (`monitor_mode: true`) が使われ続け、
+`testbed_kill_marker` (`action: terminate`) が `action: detect` に
+降格されて kill が起きなかった (run 32544606013, 32545681004 で実機
+確認済み)。両ワークフローの当該ステップは削除済みで、削除理由の
+コメントを残している。
+
+なお、この「ジョブ内のファイル書き換えを action が見ない」という挙動
+自体は cicd-sensor の**良い設計**である。ジョブ内で実行されるプロセス
+(侵害されている可能性のあるビルドスクリプトや依存パッケージの
+postinstall なども含む) が、ワークスペース上の `monitor_mode` や
+カスタムルールを書き換えて自分自身への監視を無効化する、という攻撃を
+構造的に防いでいる。
+
+この帰結として、**`monitor_mode` はリポジトリ全体で1つの値しか持てず、
+`sensor-monitor.yml` と `sensor-enforce.yml` の間で切り替えることはできない**
+(ワークフロー実行時の書き換えでは実現不可能)。kill テスト
+(`sensor-enforce.yml`) を機能させるには、コミット値そのものを `false`
+にする以外に方法がない。
 
 ```yaml
-monitor_mode: true
+monitor_mode: false
 default_max_alerts_per_rule: 50
 ```
+
+**この選択に伴うリスク（`sensor-monitor.yml` への影響、正直に記載する）:**
+`monitor_mode: false` はコミットから取得される値なので、
+`sensor-monitor.yml` の実行でも同じ値が使われ、terminate ルールが有効に
+なる。
+
+- 自作ルールで `action: terminate` を持つのは `testbed_kill_marker` のみ。
+  発火条件は `cicd-sensor-killme.marker` への書き込みだが、これを書く
+  `scenarios/90-killme.sh` は `sensor-enforce.yml` からのみ実行され
+  (§4)、`sensor-monitor.yml` は実行しないため発火しない。
+- ベースラインルール (`cicd-sensor/rules/`) で `action: terminate` を
+  持つものは、リポジトリを実際に読んで列挙した次の7件のみである:
+  `generic-tracking-escape.yaml` の `docker_upstream_socket_access`
+  (`docker-upstream.sock` への `unix_socket_connect`)、`ioc.yaml` の
+  `mini_shaihulud_antv_c2_domain` / `mastra_npm_compromise_c2_ip` /
+  `asyncapi_npm_compromise_c2_ip` /
+  `asyncapi_miasma_dht_bootstrap_domain` / `miasma_systemd_unit_write` /
+  `keyv_shaihulud_math_symbol_artifact`。`sensor-monitor.yml` が実行する
+  `scenarios/00〜07` は、実在の IOC ドメイン・IP には一切通信せず
+  (通信先は `example.com` と `*.test.invalid` のみ、§1)、
+  `docker-upstream.sock` にもアクセスせず、`systemd` 配下に `miasma` を
+  含むパスへの書き込みも行なわず、`node_modules/keyv/Math_Symbol.js` の
+  読み書きも行なわない。したがって現状のシナリオではこれらのいずれも
+  発火しない。
+- **ただし、万一 `sensor-monitor.yml` のシナリオが将来変更されて上記の
+  いずれかのベースライン terminate ルールの条件に触れた場合、
+  `monitor_mode: false` の下では実際にそのジョブが kill される。**
+  これは「検知のみで kill しない」ことを目的とする
+  `sensor-monitor.yml` に対して残るリスクとして、正直に明記しておく
+  (README.md「既知の制約」も参照)。
 
 ### 前提：cicd-sensor はルールに一致したイベントの詳細しか記録しない（実地実行 run 32510077347 で確認）
 
@@ -397,10 +467,10 @@ CEL の制約に注意:
 (実際のログ: `error: bundle: ... unsupported event type "..."` →
 `rule validate: bundle failed validation` →
 `##[warning]project config fetch failed: ... agent will run with baseline rules`)。
-この状態では `sensor-enforce.yml` が `monitor_mode: false` に書き換えても
-反映されず、`testbed_kill_marker` (`action: terminate`) が `action: detect`
-として評価され、kill が起きない。したがって、kill テストの run を評価する
-前に、必ず次を確認すること。
+この状態ではコミット済みの `.cicd-sensor/config.yaml` (`monitor_mode: false`
+のはず) すら agent に反映されず、`testbed_kill_marker`
+(`action: terminate`) が `action: detect` として評価され、kill が起きない。
+したがって、kill テストの run を評価する前に、必ず次を確認すること。
 
 - ワークフローの `Validate .cicd-sensor/rules` ステップ (§後述、
   `cicd-sensorctl rule validate` を実行し、失敗時はジョブを失敗させる) が
@@ -784,8 +854,8 @@ predicate（集計レベル）しか無い状況では原理的に観測でき�
 | --- | --- | --- | --- |
 | `falco-live.yml` | `ubuntu-latest` | falco live モードでの検知 | `falco-version` を `0.39.0` と `0.39.2` の matrix にする。**falcosecurity/falco-no-driver イメージ (falco-actions がハードコードして使う) は Docker Hub 上の数値タグが `0.39.2` で公開停止しているため、`required_engine_version: 0.43.0` を満たすバージョンはそもそも指定できない。** 各ジョブは falco-actions を呼ぶ前に Docker Hub のタグ API を叩く preflight ステップでタグの実在を確認し、`0.39.x` エンジンが `required_engine_version: 0.43.0` のルールを実際にロードできたか/拒否したか/警告のみで通ったかを観測する。`fail-fast: false`（ただし preflight 自体がタグ不在で失敗した場合はそのジョブを fail-fast させてよい。原因が明確なため） |
 | `falco-analyze.yml` | `ubuntu-latest` | falco analyze モードでの検知と生キャプチャ | `custom-rule-file` に CI/CD ルールを**明示的に渡す**（渡さないと効かないため）。`falco-version` は `0.39.2`（falcosecurity/falco-no-driver の実際の上限。理由は上記と同じ）。`analyze` ジョブは falco-actions/analyze を呼ぶ前に同様の preflight ステップでタグの実在を確認する。`upload_raw_capture` 入力で scap のアップロードを制御（既定 `false`）。**ジョブを停止するガードは置かない**（§1-6）。public リポジトリで実行された場合は、`capture.scap` に何が入りうるかを `::warning::` と job summary で告知する情報提供ステップのみを置く |
-| `sensor-monitor.yml` | `ubuntu-24.04` | cicd-sensor の検知（kill なし） | `monitor_mode: true`。全シナリオを実行 |
-| `sensor-enforce.yml` | `ubuntu-24.04` | cicd-sensor の kill 動作 | `monitor_mode: false`。§5 の 2 ジョブ構成。`90-killme.sh` は `load_canaries` を呼ばずカナリアを注入しないため、**この run の run_id は `leak-scan.yml` の対象にできない**（§4、§7） |
+| `sensor-monitor.yml` | `ubuntu-24.04` | cicd-sensor の検知（自作ルールでの kill は起きない想定） | `monitor_mode` はコミット値で `false`（§5。config.yaml はコミット SHA から取得されるため、`monitor_mode` はワークフローごとに切り替えられずリポジトリ全体で共通。§5「sensor-monitor.yml への影響」参照）。全シナリオを実行 |
+| `sensor-enforce.yml` | `ubuntu-24.04` | cicd-sensor の kill 動作 | `monitor_mode` はコミット値で `false`（上記と同一の値。§5）。§5 の 2 ジョブ構成。`90-killme.sh` は `load_canaries` を呼ばずカナリアを注入しないため、**この run の run_id は `leak-scan.yml` の対象にできない**（§4、§7） |
 | `leak-scan.yml` | `ubuntu-latest` | 漏洩マトリクスの生成 | 入力で対象 run_id を受け取り、その run のアーティファクトを DL して走査。ダウンロード結果が空、または `telemetry-cicd-sensor-enforce` のみだった場合はジョブを早期に落とすガードを持つ（§7） |
 
 ### falco-actions / cicd-sensor-action のバージョン

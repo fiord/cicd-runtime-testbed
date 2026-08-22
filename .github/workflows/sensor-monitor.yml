@@ -2,12 +2,32 @@
 #
 # 検証目的 (docs/SPEC.md T1 / T2 / §8):
 #   cicd-sensor を GitHub-hosted standalone モード (Manager なし) で動かし、
-#   `monitor_mode: true` (docs/SPEC.md §5) の状態で検知シナリオ
-#   (scenarios/00〜07) を実行した際に、何が検知され、どんな成果物
-#   (HTML レポート / attestation predicate) が得られるかを確認する。
-#   `monitor_mode: true` なので .cicd-sensor/rules/testbed.yaml の
-#   `action: terminate` ルールも `detect` として扱われ、プロセスは
-#   kill されない (kill の検証は sensor-enforce.yml が担当する)。
+#   検知シナリオ (scenarios/00〜07) を実行した際に、何が検知され、どんな
+#   成果物 (HTML レポート / attestation predicate) が得られるかを確認する。
+#
+# 重要 (仕様の根本的な誤りの修正、docs/SPEC.md §5。旧版のこのコメントは
+# 誤りだったので書き換えた):
+#   cicd-sensor-action は、プロジェクト設定 (.cicd-sensor/config.yaml) と
+#   カスタムルール (.cicd-sensor/rules/) を、ジョブのワークスペース上の
+#   ファイルからではなく GitHub Contents API 経由でコミット SHA
+#   (GITHUB_SHA) から取得する (cicd-sensor-action v0.0.38,
+#   src/main.js:643-666)。そのため .cicd-sensor/config.yaml の
+#   monitor_mode は、このリポジトリにコミットされている値
+#   (現在 `false`) で常に決まり、ワークフロー実行時に書き換えることは
+#   できない (旧版はこのファイルを実行時に書き換える no-op ステップを
+#   持っていたが削除した。理由は下記参照)。
+#
+#   これにより、このワークフローも monitor_mode: false (terminate 有効)
+#   で動く。.cicd-sensor/rules/testbed.yaml の testbed_kill_marker
+#   (action: terminate) は cicd-sensor-killme.marker への書き込みでのみ
+#   発火するが、そのマーカーを書く scenarios/90-killme.sh はこの
+#   ワークフローからは実行しない (sensor-enforce.yml 専用) ため発火しない。
+#   ベースラインルールで action: terminate を持つものの列挙と、この
+#   ワークフローが実行する scenarios/00〜07 がそれらに触れないことの
+#   根拠は .cicd-sensor/config.yaml のコメントと README.md「既知の制約」
+#   を参照。万一将来シナリオが変更されてベースラインの terminate 条件に
+#   触れた場合、このワークフローのジョブも実際に kill されるリスクが
+#   残ることをここに明記しておく。
 #
 #   scenarios/07-rule-markers.sh は、レビューで見つかった仕様の穴
 #   (testbed_detect_marker / testbed_collect_marker ルールを発火させる
@@ -15,17 +35,8 @@
 #   これにより detect / collect (このワークフロー) と terminate
 #   (sensor-enforce.yml の 90-killme.sh) の3アクションすべてが
 #   実地検証できる。
-#
-#   .cicd-sensor/config.yaml はリポジトリに 1 つしか置けないため、
-#   monitor_mode の切り替えはワークフロー側で実行時に上書きする
-#   (docs/SPEC.md §5)。config.yaml を書き換えるにはリポジトリの
-#   チェックアウトが必要なため、cicd-sensor-action は
-#   「actions/checkout より前に置ける」という一般的な推奨位置ではなく、
-#   checkout と config.yaml 書き換えの後に配置している。そのため
-#   checkout ステップ自体は cicd-sensor の監視対象に含まれない
-#   (README に明記)。
 
-name: "sensor-monitor: cicd-sensor detection scenarios (monitor_mode: true)"
+name: "sensor-monitor: cicd-sensor detection scenarios (monitor_mode: false, committed)"
 
 on:
   workflow_dispatch: {}
@@ -42,14 +53,17 @@ jobs:
       - name: Checkout cicd-runtime-testbed
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set monitor_mode true in .cicd-sensor/config.yaml
-        run: |
-          cat > .cicd-sensor/config.yaml <<'EOF'
-          monitor_mode: true
-          default_max_alerts_per_rule: 50
-          EOF
-          echo "-- .cicd-sensor/config.yaml --"
-          cat .cicd-sensor/config.yaml
+      # 削除済み: 以前ここに「Set monitor_mode true in
+      # .cicd-sensor/config.yaml」という、チェックアウト後のワークスペース
+      # 上の .cicd-sensor/config.yaml を書き換えるステップがあった。
+      # cicd-sensor-action はプロジェクト設定を GitHub Contents API
+      # 経由でコミット SHA から取得する (src/main.js:643-666) ため、
+      # ワークスペース上のこのファイルへの変更を action は一切見ない。
+      # つまりこのステップは常に no-op であり、実際に使われる値は
+      # リポジトリにコミットされている .cicd-sensor/config.yaml の内容
+      # (現在 monitor_mode: false) だった。読む人を誤解させるだけなので
+      # 削除した。詳細は .cicd-sensor/config.yaml のコメントと
+      # docs/SPEC.md §5、README.md「既知の制約」を参照。
 
       - name: Install cicd-sensorctl
         env:

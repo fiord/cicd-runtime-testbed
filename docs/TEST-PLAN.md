@@ -6,14 +6,24 @@
 ## 実行順序
 
 ```
-1. sensor-monitor.yml   (monitor_mode: true, kill なし, 全シナリオ)
+1. sensor-monitor.yml   (monitor_mode: false [コミット値、全ワークフロー共通。SPEC.md §5参照],
+                          自作ルールでの kill なし, 全シナリオ)
    falco-live.yml       (live mode, matrix, 全シナリオ)   ─ 1 と並行実行可
    falco-analyze.yml    (analyze mode, 全シナリオ)         ─ 1 と並行実行可
-2. sensor-enforce.yml   (monitor_mode: false, 90-killme.sh のみ)
+2. sensor-enforce.yml   (monitor_mode: false [同上], 90-killme.sh のみ)
 3. leak-scan.yml        (1 の run_id のいずれかを対象に T3 を確認。
                           2 (sensor-enforce.yml) の run_id は使えない —
                           90-killme.sh はカナリアを注入しないため)
 ```
+
+`monitor_mode` は `.cicd-sensor/config.yaml` のコミット値で決まり、
+`cicd-sensor-action` がコミット SHA から設定を取得する仕様上
+（`docs/SPEC.md` §5）、ワークフローごとに切り替えることはできない。
+`sensor-monitor.yml` でも `monitor_mode: false` が使われるが、自作ルールで
+`action: terminate` を持つ `testbed_kill_marker` は `sensor-enforce.yml`
+専用の `90-killme.sh` でしか発火しないため、通常はこのワークフローで
+kill は起きない（ベースラインの terminate ルールに触れた場合を除く。
+詳細は `docs/SPEC.md` §5 / `README.md` 既知の制約を参照）。
 
 1 のワークフローは互いに独立しているため並行実行して構わない。2 は
 1 とは独立した検証 (kill 動作のみ) であり、どの順序でもよいが、
