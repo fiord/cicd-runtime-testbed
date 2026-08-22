@@ -47,31 +47,90 @@
 
 ---
 
+## 調査結果: upstream falco-actions の cicd-rules マウントパスバグと fork 修正版の比較
+
+`falco-live.yml` は `live` ジョブ (upstream falcosecurity/falco-actions、
+`falco-version` 0.39.0 / 0.39.2 の matrix) と `live-forked` ジョブ (fork 修正版
+`fiord/falco-actions@360d62c72985b790bff96abde043b14ae053efe5`、
+https://github.com/fiord/falco-actions/commit/360d62c72985b790bff96abde043b14ae053efe5 、
+`falco-version: 0.39.2` 固定) を同一 run 内で実行する。upstream の
+`start/action.yaml:70` は CI/CD ルール (`cicd-rules`、既定 `true`) のマウント元パスが
+誤っており (`github.action_path` は `start/` を指すのに、実体はリポジトリ直下の
+`rules/` にある)、Docker がマウント元の欠落を空ディレクトリで補うため CI/CD ルールが
+一度もロードされない (デフォルト動作で検知が 0 件になるバグ)。以下の 2 軸で
+upstream 版と fork 修正版を比較し、バグの影響を定量的に記録すること。
+
+### 軸1: CI/CD ルールのロード有無
+
+各 leg の `falco_start_logs.txt` / job summary の
+"CI/CD ルールはロードされたか" セクションを見て記入する
+(`cicd_rules.yaml` / `rules.d` への言及の有無で判定):
+
+| leg | action 参照先 | falco-version | CI/CD ルールロード判定 (ロードされた/されなかった/不明) | 起動ログの根拠 (該当行を抜粋) |
+| --- | --- | --- | --- | --- |
+| upstream / 0.39.0 | `falcosecurity/falco-actions@558a3ce...` | 0.39.0 | | |
+| upstream / 0.39.2 | `falcosecurity/falco-actions@558a3ce...` | 0.39.2 | | |
+| fork-fixed / 0.39.2 | `fiord/falco-actions@360d62c7...` | 0.39.2 | | |
+
+- 期待される結果: upstream の 2 leg は「ロードされなかった」、fork-fixed leg のみ
+  「ロードされた」となるはず。この期待と一致したか:
+- 一致しなかった場合、考えられる原因:
+
+### 軸2: 検知イベント件数
+
+各 leg の `Run detection scenarios` ステップ・`falco_events.json` (取得できれば)・
+`Stop Falco` が生成する job summary から、CI/CD 特化ルール
+(`falco_cicd_rules.yaml` 由来。例: Source Code Overwrite 等) が実際に何件発火したかを記入する。
+標準ルール (falco 同梱のデフォルトルールセット) 由来の検知件数と分けて記入すること:
+
+| leg | CI/CD 特化ルール由来の検知件数 | 標準ルール由来の検知件数 | 発火したルール名 (job summary / `falco_events.json` から転記) |
+| --- | --- | --- | --- |
+| upstream / 0.39.0 | | | |
+| upstream / 0.39.2 | | | |
+| fork-fixed / 0.39.2 | | | |
+
+- 期待される結果: upstream の 2 leg は CI/CD 特化ルール由来の検知が 0 件、
+  fork-fixed leg のみ 1 件以上検知するはず。この期待と一致したか:
+- 一致しなかった場合、考えられる原因:
+
+### 総合評価
+
+- upstream バグの影響 (「デフォルト設定で CI/CD ルールが一度も効いていなかった」) は
+  この run で定量的に確認できたか:
+- fork 修正版 (`360d62c72985b790bff96abde043b14ae053efe5`) が upstream への PR の
+  裏付けとして十分な証拠になっているか:
+
+---
+
 ## T1: 検知が行なわれること。cicd-sensor ではプロセス kill が実際に発生すること
 
 ### falco-live.yml
 
 - run URL:
-- preflight ステップ (Docker Hub タグ実在確認) の結果 (両バージョンとも成功したはず。失敗した場合は原因を記入):
-- `falco-version: 0.39.0` の結果:
+- preflight ステップ (Docker Hub タグ実在確認) の結果 (upstream 2 leg + fork-fixed leg のいずれも成功したはず。失敗した場合は原因を記入):
+- `falco-version: 0.39.0` (upstream, `live` ジョブ) の結果:
   - `Start Falco` ステップの outcome:
   - required_engine_version (0.43.0) との不整合は実際に問題になったか (はい/いいえ、具体的な事象):
   - 発火したルール (job summary から転記):
-- `falco-version: 0.39.2` の結果:
+- `falco-version: 0.39.2` (upstream, `live` ジョブ) の結果:
   - `Start Falco` ステップの outcome:
   - required_engine_version (0.43.0) との不整合は実際に問題になったか (はい/いいえ、具体的な事象):
   - 発火したルール:
-- シナリオごとの検知有無:
+- `falco-version: 0.39.2` (fork-fixed, `live-forked` ジョブ、`fiord/falco-actions@360d62c7...`) の結果:
+  - `Start Falco` ステップの outcome:
+  - required_engine_version (0.43.0) との不整合は実際に問題になったか (はい/いいえ、具体的な事象):
+  - 発火したルール (CI/CD 特化ルールが upstream leg と異なり実際に発火するはず):
+- シナリオごとの検知有無 (upstream / fork-fixed で差があれば併記すること):
 
-| シナリオ | 検知されたルール | 備考 |
-| --- | --- | --- |
-| 00-seed | | |
-| 01-credential-access | | |
-| 02-exfil | | |
-| 03-npm-postinstall | | |
-| 04-persistence | | |
-| 05-memfd-exec | | |
-| 06-anti-forensics | | |
+| シナリオ | 検知されたルール (upstream) | 検知されたルール (fork-fixed) | 備考 |
+| --- | --- | --- | --- |
+| 00-seed | | | |
+| 01-credential-access | | | |
+| 02-exfil | | | |
+| 03-npm-postinstall | | | |
+| 04-persistence | | | |
+| 05-memfd-exec | | | |
+| 06-anti-forensics | | | |
 
 ### falco-analyze.yml
 

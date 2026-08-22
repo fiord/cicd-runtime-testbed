@@ -30,10 +30,53 @@
 #   ルールセットが自動的にマウントされる (falco-actions/start/action.yaml
 #   参照)。ここではその「デフォルト動作」をそのまま検証する。
 #
+#   --- 上流バグと fork 修正版の並行比較 (このワークフローの中核的な追加目的) ---
+#
+#   falcosecurity/falco-actions の start/action.yaml:70 には既知のバグがある。
+#   CI/CD ルール (cicd-rules, 既定 true) をマウントする行が
+#
+#     -v ${{github.action_path}}/rules/falco_cicd_rules.yaml:/etc/falco/rules.d/cicd_rules.yaml
+#
+#   となっているが、`github.action_path` は action.yaml 自身が置かれている
+#   ディレクトリ (= リポジトリの start/ 配下) を指す。一方ルールファイルの実体は
+#   リポジトリ直下の rules/ 配下にあり、start/rules/... というパスは存在しない。
+#   存在しないパスを bind mount のソースに指定すると Docker はソース側に空
+#   ディレクトリを暗黙に作ってそれをマウントするため、マウント先
+#   (/etc/falco/rules.d/cicd_rules.yaml) が空ディレクトリに置き換わり、CI/CD
+#   ルールは一度もロードされない。cicd-rules は既定 true なので、これは
+#   「デフォルト設定で使うと検知が 0 件になる」というバグである
+#   (実測: run 32550655759。起動ログには標準ルール 2 ファイルしか出ない)。
+#
+#   このバグの修正版を fiord/falco-actions (public fork) の commit
+#   360d62c72985b790bff96abde043b14ae053efe5 に用意した
+#   (https://github.com/fiord/falco-actions/commit/360d62c72985b790bff96abde043b14ae053efe5)。
+#   マウント元を `${{github.action_path}}/../rules/falco_cicd_rules.yaml` に
+#   修正しており、stop/action.yaml や analyze/action.yaml が同種のリポジトリ
+#   ルート参照で既に使っているパターンに揃えたもの。
+#
+#   `uses:` には式 (${{ matrix.* }} 等) を使えない (GitHub Actions の制約) ため、
+#   matrix で action の参照先 (upstream / fork) を切り替えることはできない。
+#   そのため upstream 用の `live` ジョブ (matrix: 0.39.0 / 0.39.2、従来どおり)
+#   とは別に、fork 修正版のみを使う `live-forked` ジョブ (falco-version 固定で
+#   0.39.2 の 1 leg) を追加し、次の 3 leg を同一 run 内で並べて比較する:
+#
+#     | leg                    | action の参照先                                              | falco-version |
+#     | ----------------------- | ------------------------------------------------------------ | ------------- |
+#     | upstream / 0.39.0       | falcosecurity/falco-actions/...@558a3ceeee9403e1c875ffbeb704c34c93e24752 | 0.39.0        |
+#     | upstream / 0.39.2       | 同上                                                            | 0.39.2        |
+#     | fork-fixed / 0.39.2     | fiord/falco-actions/...@360d62c72985b790bff96abde043b14ae053efe5         | 0.39.2        |
+#
+#   `live-forked` ジョブは `live` ジョブと処理内容 (シナリオ実行・テレメトリ収集・
+#   preflight) がほぼ重複するが、可読性を優先してあえて重複させている。
+#   両ジョブの差分は「action の参照先」「falco-version」「テレメトリアーティファクト名」
+#   の 3 点のみになるようにコピーしてある。両ジョブに「CI/CD ルールがロードされたか」
+#   のアサーション (非失敗、観測目的) を追加し、job summary を見比べればバグの
+#   影響が一目で分かるようにしている。
+#
 # トリガーは workflow_dispatch のみ。public repo で push / PR に反応して
 # 不用意に起動しないようにするため (docs/SPEC.md §8)。
 
-name: "falco-live: detection scenarios (live mode, engine-version matrix)"
+name: "falco-live: detection scenarios (live mode, engine-version matrix + upstream/fork comparison)"
 
 on:
   workflow_dispatch: {}
@@ -42,7 +85,7 @@ permissions: {}
 
 jobs:
   live:
-    name: "live / falco ${{ matrix.falco-version }}"
+    name: "live / upstream falco ${{ matrix.falco-version }}"
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -154,7 +197,7 @@ jobs:
         # 落とさない。後続ステップは falco が起動していなくても実行され、
         # 「検知されなかった」という結果自体が観測データになる。
         continue-on-error: true
-        uses: falcosecurity/falco-actions/start@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README
+        uses: falcosecurity/falco-actions/start@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README (upstream, falcosecurity/falco-actions, has the cicd-rules mount-path bug at start/action.yaml:70)
         with:
           mode: live
           falco-version: ${{ matrix.falco-version }}
@@ -223,6 +266,70 @@ jobs:
             esac
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: "Assert (observational): CI/CD rules loaded?"
+        # falcosecurity/falco-actions の start/action.yaml:70 の既知のバグ
+        # (github.action_path の解決先が action.yaml のあるディレクトリ (start/)
+        # を指すため、リポジトリ直下 rules/ への相対パスがずれ、存在しない
+        # マウント元パスが Docker によって暗黙に空ディレクトリへ置き換わり、
+        # CI/CD ルールファイルが一度もロードされない) を、起動ログから実地確認する。
+        # 判定は「/tmp/falco_start_logs.txt (直前のステップが生成) に
+        # cicd_rules.yaml または rules.d への言及が現れるか」で行なう。
+        # 観測が目的のステップなので、ロードされていなくてもジョブを失敗させない
+        # (結果を job summary に記録するだけ)。fork-fixed leg (live-forked ジョブ)
+        # と同じ判定ロジックを使い、job summary を並べて見比べられるようにしている。
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG_FILE="/tmp/falco_start_logs.txt"
+
+          CICD_LOADED="unknown"
+          if [ -f "$LOG_FILE" ]; then
+            if grep -qiE "cicd_rules\.yaml" "$LOG_FILE"; then
+              CICD_LOADED="yes"
+            elif grep -qiE "rules\.d" "$LOG_FILE"; then
+              CICD_LOADED="maybe"
+            else
+              CICD_LOADED="no"
+            fi
+          else
+            CICD_LOADED="n/a"
+          fi
+
+          {
+            echo ""
+            echo "## CI/CD ルールはロードされたか (job: ${{ github.job }}, leg: upstream / falco ${{ matrix.falco-version }})"
+            echo ""
+            echo "action 参照先: \`falcosecurity/falco-actions/start@558a3ceeee9403e1c875ffbeb704c34c93e24752\`"
+            echo "(upstream。start/action.yaml:70 に既知のマウントパスバグあり)。"
+            echo ""
+            case "$CICD_LOADED" in
+              yes)
+                echo "- **判定: ロードされた形跡あり** (\`cicd_rules.yaml\` への言及を起動ログで検出)。"
+                echo "  該当行:"
+                echo '  ```'
+                grep -iE "cicd_rules\.yaml" "$LOG_FILE" | sed 's/^/  /' | head -20
+                echo '  ```'
+                ;;
+              maybe)
+                echo "- **判定: 不明** (\`cicd_rules.yaml\` への直接の言及は無いが \`rules.d\`"
+                echo "  への言及はあった)。該当行:"
+                echo '  ```'
+                grep -iE "rules\.d" "$LOG_FILE" | sed 's/^/  /' | head -20
+                echo '  ```'
+                ;;
+              no)
+                echo "- **判定: ロードされた形跡なし** (\`cicd_rules.yaml\` / \`rules.d\` への"
+                echo "  言及が起動ログに一切見つからなかった)。start/action.yaml:70 のバグにより"
+                echo "  CI/CD ルールが一度もロードされていない可能性が高い。"
+                ;;
+              *)
+                echo "- 起動ログ (\`falco_start_logs.txt\`) が見つからず判定不能"
+                echo "  (Start Falco 自体が失敗した可能性が高い)。"
+                ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run detection scenarios
         shell: bash
         env:
@@ -262,7 +369,7 @@ jobs:
 
       - name: Stop Falco (live mode) and build job summary
         if: always()
-        uses: falcosecurity/falco-actions/stop@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README
+        uses: falcosecurity/falco-actions/stop@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README (upstream)
         with:
           mode: live
           verbose: true
@@ -274,6 +381,7 @@ jobs:
             echo ""
             echo "## falco-live matrix note"
             echo "- \`falco-version\`: \`${{ matrix.falco-version }}\`"
+            echo "- action source: upstream falcosecurity/falco-actions@558a3ceeee9403e1c875ffbeb704c34c93e24752"
             echo "- required_engine_version of the bundled CI/CD rules: \`0.43.0\`"
             echo "- falcosecurity/falco-no-driver の実際の上限 (Docker Hub, メンテナンス終了): \`0.39.2\`"
             echo "- \`Start Falco\` step outcome: \`${{ steps.start_falco.outcome }}\`"
@@ -308,6 +416,347 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: telemetry-falco-live-${{ matrix.falco-version }}
+          path: telemetry/
+          if-no-files-found: warn
+          retention-days: 1
+
+  live-forked:
+    name: "live-forked / fork-fixed falco 0.39.2"
+    runs-on: ubuntu-latest
+    # このジョブは `live` ジョブと処理内容 (シナリオ実行・テレメトリ収集・
+    # preflight) がほぼ重複するコピーである。可読性を優先してあえて重複を
+    # 許容している。`live` との差分は次の3点のみ:
+    #   1. falco-actions の参照先 (upstream の 558a3ce... ではなく fork の
+    #      360d62c... = start/action.yaml:70 のマウントパスバグ修正版)
+    #   2. falco-version (matrix ではなく 0.39.2 固定の 1 leg)
+    #   3. テレメトリアーティファクト名 (telemetry-falco-live-forked-0.39.2)
+    # `uses:` に式は使えないため、この leg を `live` ジョブの matrix に
+    # 混ぜることはできず、別ジョブとして実装している (ファイル冒頭コメント参照)。
+    permissions:
+      contents: read
+      # falco-actions の stop action (live モード) は、Falco イベントを
+      # ジョブの各ステップに対応付けるため GitHub API (jobs) を呼ぶ。
+      # README の注記: "actions: read permission is used to contact a
+      # Github endpoint to perform a best-effort correlation".
+      actions: read
+    steps:
+      - name: Checkout cicd-runtime-testbed
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: "Preflight: falcosecurity/falco-no-driver:0.39.2 タグの実在確認"
+        # falco-actions/start はイメージを falcosecurity/falco-no-driver に
+        # ハードコードしている (falco-actions/start/action.yaml)。このイメージは
+        # 数値タグの最大が 0.39.2 で公開が止まっているため、存在しないタグを
+        # 指定すると action の奥深くで `docker: ... manifest unknown` と
+        # exit 125 になり原因がわかりにくい (今回の障害そのもの)。ここで先に
+        # Docker Hub のタグ API を叩いて実在を確認し、無ければここで明確に
+        # 落とす。ネットワーク障害や rate limit で preflight 自体が失敗した
+        # 場合は、テストの可用性を落とさないよう警告のみで続行する。
+        shell: bash
+        env:
+          FALCO_VERSION: "0.39.2"
+        run: |
+          set -uo pipefail
+          API_URL="https://hub.docker.com/v2/repositories/falcosecurity/falco-no-driver/tags?page_size=100&ordering=last_updated"
+          RESPONSE_FILE="$(mktemp)"
+          HTTP_CODE="$(curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' --max-time 20 "$API_URL" 2>/dev/null)"
+          CURL_EXIT=$?
+          HTTP_CODE="${HTTP_CODE:-000}"
+
+          if [ "$CURL_EXIT" -ne 0 ] || [ "$HTTP_CODE" != "200" ]; then
+            echo "::warning title=falco-no-driver tag preflight skipped::Docker Hub API (${API_URL}) への接続に失敗しました (curl exit=${CURL_EXIT}, HTTP ${HTTP_CODE})。ネットワーク障害または rate limit の可能性があるため、preflight をスキップしてワークフローを続行します。falco-version=${FALCO_VERSION} が実在しない場合、後続のステップが manifest not found で失敗する可能性があります。"
+            {
+              echo "### preflight: falcosecurity/falco-no-driver:${FALCO_VERSION} (skipped)"
+              echo ""
+              echo "Docker Hub API への接続に失敗しました (curl exit=${CURL_EXIT}, HTTP ${HTTP_CODE})。"
+              echo "ネットワーク障害または rate limit の可能性があるため、確認をスキップして続行しました。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          python3 - "$FALCO_VERSION" "$RESPONSE_FILE" "$GITHUB_STEP_SUMMARY" <<'PYEOF'
+          import json
+          import re
+          import sys
+
+          falco_version, response_file, summary_file = sys.argv[1], sys.argv[2], sys.argv[3]
+
+          try:
+              with open(response_file, encoding="utf-8") as f:
+                  data = json.load(f)
+              results = data.get("results", [])
+              if not isinstance(results, list):
+                  raise ValueError("results is not a list")
+              tag_map = {t["name"]: t for t in results if isinstance(t, dict) and "name" in t}
+          except Exception as e:
+              msg = (
+                  f"Docker Hub API のレスポンス解析に失敗しました ({e})。"
+                  f"確認をスキップして続行します。"
+              )
+              print(f"::warning title=falco-no-driver tag preflight skipped::{msg}")
+              with open(summary_file, "a", encoding="utf-8") as s:
+                  s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version} (skipped)\n\n")
+                  s.write(f"{msg}\n")
+              sys.exit(0)
+
+          semver_re = re.compile(r"^\d+\.\d+\.\d+$")
+          numeric_tags = sorted(
+              (name for name in tag_map if semver_re.match(name)),
+              key=lambda v: [int(p) for p in v.split(".")],
+          )
+
+          if falco_version in tag_map:
+              tag = tag_map[falco_version]
+              last_pushed = tag.get("tag_last_pushed") or tag.get("last_updated") or "unknown"
+              print(f"preflight OK: falcosecurity/falco-no-driver:{falco_version} exists (tag_last_pushed={last_pushed})")
+              with open(summary_file, "a", encoding="utf-8") as s:
+                  s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version}\n\n")
+                  s.write(f"- Docker Hub にタグが実在することを確認しました。\n")
+                  s.write(f"- 最終 push (`tag_last_pushed`): `{last_pushed}`\n\n")
+              sys.exit(0)
+          else:
+              available = ", ".join(numeric_tags) if numeric_tags else "(取得できたページ内に数値タグが見つかりませんでした)"
+              msg = (
+                  f"falcosecurity/falco-no-driver:{falco_version} は Docker Hub に存在しません "
+                  f"(manifest unknown になります)。利用可能な数値タグ: {available}"
+              )
+              print(f"::error title=falco-no-driver tag not found::{msg}")
+              with open(summary_file, "a", encoding="utf-8") as s:
+                  s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version} (NOT FOUND)\n\n")
+                  s.write(f"- タグが存在しません。利用可能な数値タグ: {available}\n\n")
+              sys.exit(1)
+          PYEOF
+
+      - name: Start Falco (live mode)
+        id: start_falco
+        # required_engine_version との不整合が実際に何を起こすかを
+        # このワークフローで確認したいので、起動失敗そのものでジョブ全体を
+        # 落とさない。後続ステップは falco が起動していなくても実行され、
+        # 「検知されなかった」という結果自体が観測データになる。
+        continue-on-error: true
+        uses: fiord/falco-actions/start@360d62c72985b790bff96abde043b14ae053efe5 # fork-fixed: fiord/falco-actions, fixes start/action.yaml:70 cicd-rules mount-path bug (see https://github.com/fiord/falco-actions/commit/360d62c72985b790bff96abde043b14ae053efe5)
+        with:
+          mode: live
+          falco-version: "0.39.2"
+          verbose: true
+
+      - name: "Capture Falco startup logs (required_engine_version check, T1)"
+        # falco-actions 同梱の CI/CD ルール (rules/falco_cicd_rules.yaml) は
+        # `required_engine_version: 0.43.0` を宣言している。一方 falco-actions が
+        # 使える falco-no-driver イメージは 0.39.2 が事実上の上限 (ファイル冒頭の
+        # コメント参照)。つまり「falco-actions は自身の同梱 CI/CD ルールが要求する
+        # エンジンバージョンを満たすイメージを pull できない可能性が高い」という
+        # 仮説が立つ。この仮説を検証するため、falco コンテナ起動直後のログから
+        # required_engine_version / engine version 関連の記述の有無を拾い、
+        # ロード成功・拒否・警告のみのいずれだったかの手がかりを job summary と
+        # telemetry に残す (docs/RESULTS-TEMPLATE.md T1 の記入欄に対応)。
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG_FILE="/tmp/falco_start_logs.txt"
+          {
+            echo "# required_engine_version check (falco-version=0.39.2, fork-fixed)"
+            echo ""
+          } > "$LOG_FILE"
+
+          if docker ps --filter "name=falco" --filter "status=running" | grep -q falco; then
+            docker logs falco >> "$LOG_FILE" 2>&1 || true
+            HAS_ENGINE_MENTION="no"
+            if grep -qiE "required_engine_version|engine version|rules requiring" "$LOG_FILE"; then
+              HAS_ENGINE_MENTION="yes"
+            fi
+          else
+            echo "(falco container not running; Start Falco step likely failed — see its outcome)" >> "$LOG_FILE"
+            HAS_ENGINE_MENTION="n/a"
+          fi
+
+          {
+            echo ""
+            echo "## required_engine_version 0.43.0 vs falco 0.39.2 (fork-fixed, T1 中核観測)"
+            echo ""
+            echo "falco-actions 同梱の CI/CD ルール (rules/falco_cicd_rules.yaml) は"
+            echo "\`required_engine_version: 0.43.0\` を宣言しているが、falco-no-driver の"
+            echo "公開停止により実際に使えるエンジンは \`0.39.2\` が上限。"
+            echo "「falco-actions は自身の同梱 CI/CD ルールが要求するエンジンバージョンを"
+            echo "満たすイメージを pull できない」という仮説の検証データ。"
+            echo ""
+            case "$HAS_ENGINE_MENTION" in
+              yes)
+                echo "- \`docker logs falco\` に required_engine_version / engine version への言及**あり**。"
+                echo "  ルールがロード拒否または警告付きで扱われた可能性が高い。抜粋:"
+                echo '  ```'
+                grep -iE "required_engine_version|engine version|rules requiring" "$LOG_FILE" | sed 's/^/  /' | head -20
+                echo '  ```'
+                ;;
+              no)
+                echo "- \`docker logs falco\` に required_engine_version / engine version への言及は"
+                echo "  見つからなかった。警告なしでロードされたか、そもそもログに出ない形で"
+                echo "  無視されたかは、このログだけでは切り分けられない。"
+                echo "  telemetry の \`falco_start_logs.txt\` の全文と \`falco_events.json\`"
+                echo "  (cicd_rules 由来のイベントが実際に発火しているか) を突き合わせて判断すること。"
+                ;;
+              *)
+                echo "- falco コンテナが見つからなかった。Start Falco 自体が失敗したため、"
+                echo "  ルールロードの成否そのものを確認できない。"
+                ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Assert (observational): CI/CD rules loaded?"
+        # falcosecurity/falco-actions の start/action.yaml:70 の既知のバグ
+        # (github.action_path の解決先が action.yaml のあるディレクトリ (start/)
+        # を指すため、リポジトリ直下 rules/ への相対パスがずれ、存在しない
+        # マウント元パスが Docker によって暗黙に空ディレクトリへ置き換わり、
+        # CI/CD ルールファイルが一度もロードされない) を、起動ログから実地確認する。
+        # このジョブは fork-fixed 版 (fiord/falco-actions@360d62c7...) を使うため、
+        # 期待される判定は「ロードされた形跡あり」。判定は「/tmp/falco_start_logs.txt
+        # (直前のステップが生成) に cicd_rules.yaml または rules.d への言及が
+        # 現れるか」で行なう。観測が目的のステップなので、期待に反する結果が出ても
+        # ジョブを失敗させない (結果を job summary に記録するだけ)。upstream leg
+        # (live ジョブ) と同じ判定ロジックを使い、job summary を並べて見比べられる
+        # ようにしている。
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG_FILE="/tmp/falco_start_logs.txt"
+
+          CICD_LOADED="unknown"
+          if [ -f "$LOG_FILE" ]; then
+            if grep -qiE "cicd_rules\.yaml" "$LOG_FILE"; then
+              CICD_LOADED="yes"
+            elif grep -qiE "rules\.d" "$LOG_FILE"; then
+              CICD_LOADED="maybe"
+            else
+              CICD_LOADED="no"
+            fi
+          else
+            CICD_LOADED="n/a"
+          fi
+
+          {
+            echo ""
+            echo "## CI/CD ルールはロードされたか (job: ${{ github.job }}, leg: fork-fixed / falco 0.39.2)"
+            echo ""
+            echo "action 参照先: \`fiord/falco-actions/start@360d62c72985b790bff96abde043b14ae053efe5\`"
+            echo "(fork-fixed。start/action.yaml:70 のマウントパスバグ修正版:"
+            echo "https://github.com/fiord/falco-actions/commit/360d62c72985b790bff96abde043b14ae053efe5)。"
+            echo ""
+            case "$CICD_LOADED" in
+              yes)
+                echo "- **判定: ロードされた形跡あり** (\`cicd_rules.yaml\` への言及を起動ログで検出)。"
+                echo "  該当行:"
+                echo '  ```'
+                grep -iE "cicd_rules\.yaml" "$LOG_FILE" | sed 's/^/  /' | head -20
+                echo '  ```'
+                ;;
+              maybe)
+                echo "- **判定: 不明** (\`cicd_rules.yaml\` への直接の言及は無いが \`rules.d\`"
+                echo "  への言及はあった)。該当行:"
+                echo '  ```'
+                grep -iE "rules\.d" "$LOG_FILE" | sed 's/^/  /' | head -20
+                echo '  ```'
+                ;;
+              no)
+                echo "- **判定: ロードされた形跡なし** (\`cicd_rules.yaml\` / \`rules.d\` への"
+                echo "  言及が起動ログに一切見つからなかった)。fork-fixed leg なのに"
+                echo "  ロードされていない場合、修正が効いていない、または別の問題が"
+                echo "  ある可能性が高いため要調査。"
+                ;;
+              *)
+                echo "- 起動ログ (\`falco_start_logs.txt\`) が見つからず判定不能"
+                echo "  (Start Falco 自体が失敗した可能性が高い)。"
+                ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run detection scenarios
+        shell: bash
+        env:
+          # docs/SPEC.md §3: CANARY_ENV のみ GitHub Secrets 経由。
+          # Secret 未設定でも scenarios/lib/common.sh の load_canaries が
+          # フォールバックしてくれる (README 参照)。
+          CANARY_ENV: ${{ secrets.CANARY_ENV }}
+        run: |
+          set -uo pipefail
+          echo "::group::00-seed"
+          bash scenarios/00-seed.sh
+          echo "::endgroup::"
+
+          echo "::group::01-credential-access"
+          bash scenarios/01-credential-access.sh
+          echo "::endgroup::"
+
+          echo "::group::02-exfil"
+          bash scenarios/02-exfil.sh
+          echo "::endgroup::"
+
+          echo "::group::03-npm-postinstall"
+          npm install --no-audit --no-fund ./scenarios/03-npm-postinstall || true
+          echo "::endgroup::"
+
+          echo "::group::04-persistence"
+          bash scenarios/04-persistence.sh
+          echo "::endgroup::"
+
+          echo "::group::05-memfd-exec"
+          bash scenarios/05-memfd-exec.sh
+          echo "::endgroup::"
+
+          echo "::group::06-anti-forensics"
+          bash scenarios/06-anti-forensics.sh
+          echo "::endgroup::"
+
+      - name: Stop Falco (live mode) and build job summary
+        if: always()
+        uses: fiord/falco-actions/stop@360d62c72985b790bff96abde043b14ae053efe5 # fork-fixed: fiord/falco-actions, same commit as start above
+        with:
+          mode: live
+          verbose: true
+
+      - name: Record engine-version matrix outcome in job summary
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "## falco-live matrix note"
+            echo "- \`falco-version\`: \`0.39.2\`"
+            echo "- action source: fork-fixed fiord/falco-actions@360d62c72985b790bff96abde043b14ae053efe5"
+            echo "- required_engine_version of the bundled CI/CD rules: \`0.43.0\`"
+            echo "- falcosecurity/falco-no-driver の実際の上限 (Docker Hub, メンテナンス終了): \`0.39.2\`"
+            echo "- \`Start Falco\` step outcome: \`${{ steps.start_falco.outcome }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect telemetry (T2)
+        if: always()
+        run: |
+          mkdir -p telemetry
+          if [ -f "$GITHUB_STEP_SUMMARY" ]; then
+            cp "$GITHUB_STEP_SUMMARY" telemetry/job-summary.md
+          fi
+          # falco-actions の stop action (live mode) はこのファイルを
+          # アーティファクトとしてアップロードしない。手元に残っていれば
+          # 自分たちで回収する ("可能なら" 収集する、docs/SPEC.md §6)。
+          if [ -f /tmp/falco_events.json ]; then
+            cp /tmp/falco_events.json telemetry/falco_events.json
+          fi
+          # required_engine_version 検証用 (T1 中核観測)。上の "Capture Falco
+          # startup logs" ステップが生成する。
+          if [ -f /tmp/falco_start_logs.txt ]; then
+            cp /tmp/falco_start_logs.txt telemetry/falco_start_logs.txt
+          fi
+          # scenarios/lib/common.sh が書く実行ログ。仕様必須ではないが、
+          # 検知結果の突き合わせに有用なため追加で回収する。
+          if [ -n "${RUNNER_TEMP:-}" ] && [ -f "${RUNNER_TEMP}/cicd-runtime-testbed-log.jsonl" ]; then
+            cp "${RUNNER_TEMP}/cicd-runtime-testbed-log.jsonl" telemetry/testbed-log.jsonl
+          fi
+
+      - name: Upload telemetry-falco-live-forked-0.39.2
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-falco-live-forked-0.39.2
           path: telemetry/
           if-no-files-found: warn
           retention-days: 1
