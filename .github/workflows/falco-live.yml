@@ -218,21 +218,77 @@ jobs:
         run: |
           set -uo pipefail
           LOG_FILE="/tmp/falco_start_logs.txt"
+          MARKER_STATUS_FILE="/tmp/falco_startup_marker_status.txt"
+          STARTUP_TIMEOUT=60
+          POLL_INTERVAL=1
+          MARKER_REGEX="Enabled event sources|Opening 'syscall' source"
+
           {
-            echo "# required_engine_version check (falco-version=${{ matrix.falco-version }})"
+            echo "# falco startup log capture (engine requirement check, falco-version=${{ matrix.falco-version }})"
             echo ""
           } > "$LOG_FILE"
 
-          if docker ps --filter "name=falco" --filter "status=running" | grep -q falco; then
-            docker logs falco >> "$LOG_FILE" 2>&1 || true
+          STARTUP_MARKER_FOUND="no"
+          CONTAINER_DISAPPEARED="no"
+          HAVE_LOGS="no"
+          LAST_LOGS=""
+          ELAPSED=0
+
+          if docker ps -a --filter "name=falco" | grep -q falco; then
+            # 起動完了 (Falco がイベントソースを開き終える) を示すマーカーが現れる
+            # まで docker logs をポーリングする。ここで一度だけ docker logs を
+            # 叩くと、ルール読み込みの結末 (成功して起動完了したのか、途中で
+            # 拒否/クラッシュしたのか) が記録される前にログを取ってしまうため。
+            while [ "$ELAPSED" -lt "$STARTUP_TIMEOUT" ]; do
+              if CURRENT_LOGS="$(docker logs falco 2>&1)"; then
+                LAST_LOGS="$CURRENT_LOGS"
+                HAVE_LOGS="yes"
+                if printf '%s\n' "$CURRENT_LOGS" | grep -qE "$MARKER_REGEX"; then
+                  STARTUP_MARKER_FOUND="yes"
+                  break
+                fi
+              else
+                # docker logs 自体が失敗した = コンテナが消えた可能性が高い
+                # (docker run --rm のため Falco が異常終了するとコンテナごと
+                # 消える)。それまでに取得できていた最後の内容 (LAST_LOGS) は
+                # 上書きしない。
+                if [ "$HAVE_LOGS" = "yes" ]; then
+                  CONTAINER_DISAPPEARED="yes"
+                fi
+                break
+              fi
+              sleep "$POLL_INTERVAL"
+              ELAPSED=$((ELAPSED + POLL_INTERVAL))
+            done
+
+            if [ "$HAVE_LOGS" = "yes" ]; then
+              printf '%s\n' "$LAST_LOGS" >> "$LOG_FILE"
+            else
+              echo "(docker logs falco failed on every poll attempt; no log content could be captured)" >> "$LOG_FILE"
+            fi
+
+            {
+              echo ""
+              if [ "$STARTUP_MARKER_FOUND" = "yes" ]; then
+                echo "[poll] startup completion marker detected after ~${ELAPSED}s (matched: ${MARKER_REGEX})."
+              elif [ "$CONTAINER_DISAPPEARED" = "yes" ]; then
+                echo "[poll] falco container disappeared during polling after ~${ELAPSED}s (docker run --rm; likely crashed). Captured the last successful 'docker logs' output above (not overwritten by the failed poll)."
+              else
+                echo "[poll] startup completion marker NOT observed within ${STARTUP_TIMEOUT}s timeout. Rule-loading outcome could not be confirmed from this log alone; captured logs may be incomplete."
+              fi
+            } >> "$LOG_FILE"
+
             HAS_ENGINE_MENTION="no"
             if grep -qiE "required_engine_version|engine version|rules requiring" "$LOG_FILE"; then
               HAS_ENGINE_MENTION="yes"
             fi
           else
-            echo "(falco container not running; Start Falco step likely failed — see its outcome)" >> "$LOG_FILE"
+            echo "(falco container not found; Start Falco step likely failed — see its outcome)" >> "$LOG_FILE"
             HAS_ENGINE_MENTION="n/a"
+            STARTUP_MARKER_FOUND="n/a"
           fi
+
+          printf '%s' "$STARTUP_MARKER_FOUND" > "$MARKER_STATUS_FILE"
 
           {
             echo ""
@@ -282,6 +338,8 @@ jobs:
         run: |
           set -uo pipefail
           LOG_FILE="/tmp/falco_start_logs.txt"
+          MARKER_STATUS_FILE="/tmp/falco_startup_marker_status.txt"
+          ERROR_REGEX="required_engine_version|engine version|Runtime error|Invalid|cannot be loaded"
 
           CICD_LOADED="unknown"
           if [ -f "$LOG_FILE" ]; then
@@ -296,6 +354,25 @@ jobs:
             CICD_LOADED="n/a"
           fi
 
+          ERROR_FOUND="no"
+          if [ -f "$LOG_FILE" ] && grep -qiE "$ERROR_REGEX" "$LOG_FILE"; then
+            ERROR_FOUND="yes"
+          fi
+
+          STARTUP_MARKER="unknown"
+          if [ -f "$MARKER_STATUS_FILE" ]; then
+            STARTUP_MARKER="$(cat "$MARKER_STATUS_FILE")"
+          fi
+
+          # 3値判定: loaded / rejected (エラー語あり) / not_loaded (言及もエラーも無し)
+          if [ "$ERROR_FOUND" = "yes" ]; then
+            VERDICT="rejected"
+          elif [ "$CICD_LOADED" = "yes" ] || [ "$CICD_LOADED" = "maybe" ]; then
+            VERDICT="loaded"
+          else
+            VERDICT="not_loaded"
+          fi
+
           {
             echo ""
             echo "## CI/CD ルールはロードされたか (job: ${{ github.job }}, leg: upstream / falco ${{ matrix.falco-version }})"
@@ -305,29 +382,45 @@ jobs:
             echo ""
             case "$CICD_LOADED" in
               yes)
-                echo "- **判定: ロードされた形跡あり** (\`cicd_rules.yaml\` への言及を起動ログで検出)。"
-                echo "  該当行:"
+                echo "- \`cicd_rules.yaml\` への言及: **あり**。該当行:"
                 echo '  ```'
                 grep -iE "cicd_rules\.yaml" "$LOG_FILE" | sed 's/^/  /' | head -20
                 echo '  ```'
                 ;;
               maybe)
-                echo "- **判定: 不明** (\`cicd_rules.yaml\` への直接の言及は無いが \`rules.d\`"
-                echo "  への言及はあった)。該当行:"
+                echo "- \`cicd_rules.yaml\` への直接の言及は無いが \`rules.d\` への言及はあった"
+                echo "  (不明)。該当行:"
                 echo '  ```'
                 grep -iE "rules\.d" "$LOG_FILE" | sed 's/^/  /' | head -20
                 echo '  ```'
                 ;;
               no)
-                echo "- **判定: ロードされた形跡なし** (\`cicd_rules.yaml\` / \`rules.d\` への"
-                echo "  言及が起動ログに一切見つからなかった)。start/action.yaml:70 のバグにより"
-                echo "  CI/CD ルールが一度もロードされていない可能性が高い。"
+                echo "- \`cicd_rules.yaml\` / \`rules.d\` への言及は起動ログに一切見つからなかった。"
                 ;;
               *)
                 echo "- 起動ログ (\`falco_start_logs.txt\`) が見つからず判定不能"
                 echo "  (Start Falco 自体が失敗した可能性が高い)。"
                 ;;
             esac
+            echo ""
+            echo "- エラー語 (\`required_engine_version\` / \`engine version\` / \`Runtime error\` /"
+            echo "  \`Invalid\` / \`cannot be loaded\`) の有無: **${ERROR_FOUND}**"
+            if [ "$ERROR_FOUND" = "yes" ]; then
+              echo "  該当行:"
+              echo '  ```'
+              grep -iE "$ERROR_REGEX" "$LOG_FILE" | sed 's/^/  /' | head -20
+              echo '  ```'
+            fi
+            echo ""
+            echo "- 起動完了マーカー (\`Enabled event sources\` / \`Opening 'syscall' source\`) 検出: **${STARTUP_MARKER}**"
+            case "$STARTUP_MARKER" in
+              yes) echo "  (Falco は正常に起動しきったと判断できる)" ;;
+              no) echo "  (60秒待っても現れなかった。起動が完了しなかったか、非常に遅延している可能性がある)" ;;
+              n/a) echo "  (falco コンテナ自体が見つからなかった)" ;;
+              *) echo "  (状態不明)" ;;
+            esac
+            echo ""
+            echo "- **総合判定: \`${VERDICT}\`** (\`loaded\` / \`rejected\` / \`not_loaded\` の3値)"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run detection scenarios
@@ -367,6 +460,30 @@ jobs:
           bash scenarios/06-anti-forensics.sh
           echo "::endgroup::"
 
+      - name: "Capture Falco logs before stop (T1)"
+        # Stop Falco の直前にもう一度 docker logs を取得する。起動直後には
+        # まだ現れないエラー (ルール評価時のエラーなど、シナリオ実行中に発生
+        # したもの) を捕捉するため。falco_start_logs.txt とは別ファイルに保存し、
+        # 起動完了マーカー捕捉後にのみ発生し得る事象と比較できるようにする。
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG_FILE="/tmp/falco_stop_logs.txt"
+          {
+            echo "# falco logs immediately before Stop Falco (falco-version=${{ matrix.falco-version }})"
+            echo ""
+          } > "$LOG_FILE"
+
+          if docker ps -a --filter "name=falco" | grep -q falco; then
+            if ! docker logs falco >> "$LOG_FILE" 2>&1; then
+              echo "" >> "$LOG_FILE"
+              echo "(docker logs falco failed just now; container may have disappeared between the check above and this call)" >> "$LOG_FILE"
+            fi
+          else
+            echo "(falco container not found; it may have already been removed — e.g. docker run --rm after a crash — or Start Falco never succeeded)" >> "$LOG_FILE"
+          fi
+
       - name: Stop Falco (live mode) and build job summary
         if: always()
         uses: falcosecurity/falco-actions/stop@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README (upstream)
@@ -391,19 +508,53 @@ jobs:
         if: always()
         run: |
           mkdir -p telemetry
+
+          # 検知イベントの有無を明示する: /tmp/falco_events.json が
+          # 「0件だった」のか「そもそもファイルが無かった」のかを区別できる
+          # ようにする。job summary へのコピー (下) より前に summary へ
+          # 追記しておくことで telemetry/job-summary.md にも反映させる。
+          EVENTS_FILE="/tmp/falco_events.json"
+          if [ -f "$EVENTS_FILE" ]; then
+            EVENTS_SIZE="$(stat -c%s "$EVENTS_FILE" 2>/dev/null || stat -f%z "$EVENTS_FILE" 2>/dev/null || echo unknown)"
+            EVENTS_LINES="$(wc -l < "$EVENTS_FILE" | tr -d ' ')"
+          fi
+          {
+            echo ""
+            echo "## falco_events.json (検知イベント)"
+            echo ""
+            if [ -f "$EVENTS_FILE" ]; then
+              echo "- 存在する: exists=yes, size_bytes=${EVENTS_SIZE}, line_count=${EVENTS_LINES}"
+            else
+              echo "- 存在しない: exists=no (Falco が一度もイベントを書き出さなかった、"
+              echo "  ファイル自体が無かった、または起動していなかった。0件検知とは区別すること)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
           if [ -f "$GITHUB_STEP_SUMMARY" ]; then
             cp "$GITHUB_STEP_SUMMARY" telemetry/job-summary.md
           fi
           # falco-actions の stop action (live mode) はこのファイルを
           # アーティファクトとしてアップロードしない。手元に残っていれば
           # 自分たちで回収する ("可能なら" 収集する、docs/SPEC.md §6)。
-          if [ -f /tmp/falco_events.json ]; then
-            cp /tmp/falco_events.json telemetry/falco_events.json
+          if [ -f "$EVENTS_FILE" ]; then
+            cp "$EVENTS_FILE" telemetry/falco_events.json
+            {
+              echo "exists: yes"
+              echo "size_bytes: ${EVENTS_SIZE}"
+              echo "line_count: ${EVENTS_LINES}"
+            } > telemetry/falco_events_info.txt
+          else
+            echo "exists: no" > telemetry/falco_events_info.txt
           fi
           # required_engine_version 検証用 (T1 中核観測)。上の "Capture Falco
           # startup logs" ステップが生成する。
           if [ -f /tmp/falco_start_logs.txt ]; then
             cp /tmp/falco_start_logs.txt telemetry/falco_start_logs.txt
+          fi
+          # Stop Falco 直前のログ (シナリオ実行中に出たエラー等を捕捉するため、
+          # "Capture Falco logs before stop" ステップが生成する)。
+          if [ -f /tmp/falco_stop_logs.txt ]; then
+            cp /tmp/falco_stop_logs.txt telemetry/falco_stop_logs.txt
           fi
           # scenarios/lib/common.sh が書く実行ログ。仕様必須ではないが、
           # 検知結果の突き合わせに有用なため追加で回収する。
@@ -555,21 +706,77 @@ jobs:
         run: |
           set -uo pipefail
           LOG_FILE="/tmp/falco_start_logs.txt"
+          MARKER_STATUS_FILE="/tmp/falco_startup_marker_status.txt"
+          STARTUP_TIMEOUT=60
+          POLL_INTERVAL=1
+          MARKER_REGEX="Enabled event sources|Opening 'syscall' source"
+
           {
-            echo "# required_engine_version check (falco-version=0.39.2, fork-fixed)"
+            echo "# falco startup log capture (engine requirement check, falco-version=0.39.2, fork-fixed)"
             echo ""
           } > "$LOG_FILE"
 
-          if docker ps --filter "name=falco" --filter "status=running" | grep -q falco; then
-            docker logs falco >> "$LOG_FILE" 2>&1 || true
+          STARTUP_MARKER_FOUND="no"
+          CONTAINER_DISAPPEARED="no"
+          HAVE_LOGS="no"
+          LAST_LOGS=""
+          ELAPSED=0
+
+          if docker ps -a --filter "name=falco" | grep -q falco; then
+            # 起動完了 (Falco がイベントソースを開き終える) を示すマーカーが現れる
+            # まで docker logs をポーリングする。ここで一度だけ docker logs を
+            # 叩くと、ルール読み込みの結末 (成功して起動完了したのか、途中で
+            # 拒否/クラッシュしたのか) が記録される前にログを取ってしまうため。
+            while [ "$ELAPSED" -lt "$STARTUP_TIMEOUT" ]; do
+              if CURRENT_LOGS="$(docker logs falco 2>&1)"; then
+                LAST_LOGS="$CURRENT_LOGS"
+                HAVE_LOGS="yes"
+                if printf '%s\n' "$CURRENT_LOGS" | grep -qE "$MARKER_REGEX"; then
+                  STARTUP_MARKER_FOUND="yes"
+                  break
+                fi
+              else
+                # docker logs 自体が失敗した = コンテナが消えた可能性が高い
+                # (docker run --rm のため Falco が異常終了するとコンテナごと
+                # 消える)。それまでに取得できていた最後の内容 (LAST_LOGS) は
+                # 上書きしない。
+                if [ "$HAVE_LOGS" = "yes" ]; then
+                  CONTAINER_DISAPPEARED="yes"
+                fi
+                break
+              fi
+              sleep "$POLL_INTERVAL"
+              ELAPSED=$((ELAPSED + POLL_INTERVAL))
+            done
+
+            if [ "$HAVE_LOGS" = "yes" ]; then
+              printf '%s\n' "$LAST_LOGS" >> "$LOG_FILE"
+            else
+              echo "(docker logs falco failed on every poll attempt; no log content could be captured)" >> "$LOG_FILE"
+            fi
+
+            {
+              echo ""
+              if [ "$STARTUP_MARKER_FOUND" = "yes" ]; then
+                echo "[poll] startup completion marker detected after ~${ELAPSED}s (matched: ${MARKER_REGEX})."
+              elif [ "$CONTAINER_DISAPPEARED" = "yes" ]; then
+                echo "[poll] falco container disappeared during polling after ~${ELAPSED}s (docker run --rm; likely crashed). Captured the last successful 'docker logs' output above (not overwritten by the failed poll)."
+              else
+                echo "[poll] startup completion marker NOT observed within ${STARTUP_TIMEOUT}s timeout. Rule-loading outcome could not be confirmed from this log alone; captured logs may be incomplete."
+              fi
+            } >> "$LOG_FILE"
+
             HAS_ENGINE_MENTION="no"
             if grep -qiE "required_engine_version|engine version|rules requiring" "$LOG_FILE"; then
               HAS_ENGINE_MENTION="yes"
             fi
           else
-            echo "(falco container not running; Start Falco step likely failed — see its outcome)" >> "$LOG_FILE"
+            echo "(falco container not found; Start Falco step likely failed — see its outcome)" >> "$LOG_FILE"
             HAS_ENGINE_MENTION="n/a"
+            STARTUP_MARKER_FOUND="n/a"
           fi
+
+          printf '%s' "$STARTUP_MARKER_FOUND" > "$MARKER_STATUS_FILE"
 
           {
             echo ""
@@ -621,6 +828,8 @@ jobs:
         run: |
           set -uo pipefail
           LOG_FILE="/tmp/falco_start_logs.txt"
+          MARKER_STATUS_FILE="/tmp/falco_startup_marker_status.txt"
+          ERROR_REGEX="required_engine_version|engine version|Runtime error|Invalid|cannot be loaded"
 
           CICD_LOADED="unknown"
           if [ -f "$LOG_FILE" ]; then
@@ -635,6 +844,25 @@ jobs:
             CICD_LOADED="n/a"
           fi
 
+          ERROR_FOUND="no"
+          if [ -f "$LOG_FILE" ] && grep -qiE "$ERROR_REGEX" "$LOG_FILE"; then
+            ERROR_FOUND="yes"
+          fi
+
+          STARTUP_MARKER="unknown"
+          if [ -f "$MARKER_STATUS_FILE" ]; then
+            STARTUP_MARKER="$(cat "$MARKER_STATUS_FILE")"
+          fi
+
+          # 3値判定: loaded / rejected (エラー語あり) / not_loaded (言及もエラーも無し)
+          if [ "$ERROR_FOUND" = "yes" ]; then
+            VERDICT="rejected"
+          elif [ "$CICD_LOADED" = "yes" ] || [ "$CICD_LOADED" = "maybe" ]; then
+            VERDICT="loaded"
+          else
+            VERDICT="not_loaded"
+          fi
+
           {
             echo ""
             echo "## CI/CD ルールはロードされたか (job: ${{ github.job }}, leg: fork-fixed / falco 0.39.2)"
@@ -645,30 +873,47 @@ jobs:
             echo ""
             case "$CICD_LOADED" in
               yes)
-                echo "- **判定: ロードされた形跡あり** (\`cicd_rules.yaml\` への言及を起動ログで検出)。"
-                echo "  該当行:"
+                echo "- \`cicd_rules.yaml\` への言及: **あり**。該当行:"
                 echo '  ```'
                 grep -iE "cicd_rules\.yaml" "$LOG_FILE" | sed 's/^/  /' | head -20
                 echo '  ```'
                 ;;
               maybe)
-                echo "- **判定: 不明** (\`cicd_rules.yaml\` への直接の言及は無いが \`rules.d\`"
-                echo "  への言及はあった)。該当行:"
+                echo "- \`cicd_rules.yaml\` への直接の言及は無いが \`rules.d\` への言及はあった"
+                echo "  (不明)。該当行:"
                 echo '  ```'
                 grep -iE "rules\.d" "$LOG_FILE" | sed 's/^/  /' | head -20
                 echo '  ```'
                 ;;
               no)
-                echo "- **判定: ロードされた形跡なし** (\`cicd_rules.yaml\` / \`rules.d\` への"
-                echo "  言及が起動ログに一切見つからなかった)。fork-fixed leg なのに"
-                echo "  ロードされていない場合、修正が効いていない、または別の問題が"
-                echo "  ある可能性が高いため要調査。"
+                echo "- \`cicd_rules.yaml\` / \`rules.d\` への言及は起動ログに一切見つからなかった。"
+                echo "  fork-fixed leg なのにロードされていない場合、修正が効いていない、"
+                echo "  または別の問題がある可能性が高いため要調査。"
                 ;;
               *)
                 echo "- 起動ログ (\`falco_start_logs.txt\`) が見つからず判定不能"
                 echo "  (Start Falco 自体が失敗した可能性が高い)。"
                 ;;
             esac
+            echo ""
+            echo "- エラー語 (\`required_engine_version\` / \`engine version\` / \`Runtime error\` /"
+            echo "  \`Invalid\` / \`cannot be loaded\`) の有無: **${ERROR_FOUND}**"
+            if [ "$ERROR_FOUND" = "yes" ]; then
+              echo "  該当行:"
+              echo '  ```'
+              grep -iE "$ERROR_REGEX" "$LOG_FILE" | sed 's/^/  /' | head -20
+              echo '  ```'
+            fi
+            echo ""
+            echo "- 起動完了マーカー (\`Enabled event sources\` / \`Opening 'syscall' source\`) 検出: **${STARTUP_MARKER}**"
+            case "$STARTUP_MARKER" in
+              yes) echo "  (Falco は正常に起動しきったと判断できる)" ;;
+              no) echo "  (60秒待っても現れなかった。起動が完了しなかったか、非常に遅延している可能性がある)" ;;
+              n/a) echo "  (falco コンテナ自体が見つからなかった)" ;;
+              *) echo "  (状態不明)" ;;
+            esac
+            echo ""
+            echo "- **総合判定: \`${VERDICT}\`** (\`loaded\` / \`rejected\` / \`not_loaded\` の3値)"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run detection scenarios
@@ -708,6 +953,30 @@ jobs:
           bash scenarios/06-anti-forensics.sh
           echo "::endgroup::"
 
+      - name: "Capture Falco logs before stop (T1)"
+        # Stop Falco の直前にもう一度 docker logs を取得する。起動直後には
+        # まだ現れないエラー (ルール評価時のエラーなど、シナリオ実行中に発生
+        # したもの) を捕捉するため。falco_start_logs.txt とは別ファイルに保存し、
+        # 起動完了マーカー捕捉後にのみ発生し得る事象と比較できるようにする。
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG_FILE="/tmp/falco_stop_logs.txt"
+          {
+            echo "# falco logs immediately before Stop Falco (falco-version=0.39.2, fork-fixed)"
+            echo ""
+          } > "$LOG_FILE"
+
+          if docker ps -a --filter "name=falco" | grep -q falco; then
+            if ! docker logs falco >> "$LOG_FILE" 2>&1; then
+              echo "" >> "$LOG_FILE"
+              echo "(docker logs falco failed just now; container may have disappeared between the check above and this call)" >> "$LOG_FILE"
+            fi
+          else
+            echo "(falco container not found; it may have already been removed — e.g. docker run --rm after a crash — or Start Falco never succeeded)" >> "$LOG_FILE"
+          fi
+
       - name: Stop Falco (live mode) and build job summary
         if: always()
         uses: fiord/falco-actions/stop@360d62c72985b790bff96abde043b14ae053efe5 # fork-fixed: fiord/falco-actions, same commit as start above
@@ -732,19 +1001,53 @@ jobs:
         if: always()
         run: |
           mkdir -p telemetry
+
+          # 検知イベントの有無を明示する: /tmp/falco_events.json が
+          # 「0件だった」のか「そもそもファイルが無かった」のかを区別できる
+          # ようにする。job summary へのコピー (下) より前に summary へ
+          # 追記しておくことで telemetry/job-summary.md にも反映させる。
+          EVENTS_FILE="/tmp/falco_events.json"
+          if [ -f "$EVENTS_FILE" ]; then
+            EVENTS_SIZE="$(stat -c%s "$EVENTS_FILE" 2>/dev/null || stat -f%z "$EVENTS_FILE" 2>/dev/null || echo unknown)"
+            EVENTS_LINES="$(wc -l < "$EVENTS_FILE" | tr -d ' ')"
+          fi
+          {
+            echo ""
+            echo "## falco_events.json (検知イベント)"
+            echo ""
+            if [ -f "$EVENTS_FILE" ]; then
+              echo "- 存在する: exists=yes, size_bytes=${EVENTS_SIZE}, line_count=${EVENTS_LINES}"
+            else
+              echo "- 存在しない: exists=no (Falco が一度もイベントを書き出さなかった、"
+              echo "  ファイル自体が無かった、または起動していなかった。0件検知とは区別すること)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
           if [ -f "$GITHUB_STEP_SUMMARY" ]; then
             cp "$GITHUB_STEP_SUMMARY" telemetry/job-summary.md
           fi
           # falco-actions の stop action (live mode) はこのファイルを
           # アーティファクトとしてアップロードしない。手元に残っていれば
           # 自分たちで回収する ("可能なら" 収集する、docs/SPEC.md §6)。
-          if [ -f /tmp/falco_events.json ]; then
-            cp /tmp/falco_events.json telemetry/falco_events.json
+          if [ -f "$EVENTS_FILE" ]; then
+            cp "$EVENTS_FILE" telemetry/falco_events.json
+            {
+              echo "exists: yes"
+              echo "size_bytes: ${EVENTS_SIZE}"
+              echo "line_count: ${EVENTS_LINES}"
+            } > telemetry/falco_events_info.txt
+          else
+            echo "exists: no" > telemetry/falco_events_info.txt
           fi
           # required_engine_version 検証用 (T1 中核観測)。上の "Capture Falco
           # startup logs" ステップが生成する。
           if [ -f /tmp/falco_start_logs.txt ]; then
             cp /tmp/falco_start_logs.txt telemetry/falco_start_logs.txt
+          fi
+          # Stop Falco 直前のログ (シナリオ実行中に出たエラー等を捕捉するため、
+          # "Capture Falco logs before stop" ステップが生成する)。
+          if [ -f /tmp/falco_stop_logs.txt ]; then
+            cp /tmp/falco_stop_logs.txt telemetry/falco_stop_logs.txt
           fi
           # scenarios/lib/common.sh が書く実行ログ。仕様必須ではないが、
           # 検知結果の突き合わせに有用なため追加で回収する。
