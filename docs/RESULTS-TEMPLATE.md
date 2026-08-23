@@ -51,9 +51,13 @@
 
 `falco-live.yml` は `live` ジョブ (upstream falcosecurity/falco-actions、
 `falco-version` 0.39.0 / 0.39.2 の matrix) と `live-forked` ジョブ (fork 修正版
-`fiord/falco-actions@360d62c72985b790bff96abde043b14ae053efe5`、
+`fiord/falco-actions@fix/cicd-rules-mount-path`、修正の起点は commit
+`360d62c72985b790bff96abde043b14ae053efe5`、
 https://github.com/fiord/falco-actions/commit/360d62c72985b790bff96abde043b14ae053efe5 、
-`falco-version: 0.39.2` 固定) を同一 run 内で実行する。upstream の
+`falco-version: 0.44.1` 固定) を同一 run 内で実行する。`live-forked` ジョブは
+使用イメージも `falcosecurity/falco-no-driver` から、維持されている
+`falcosecurity/falco` に切り替わっているため、`required_engine_version: 0.43.0`
+を満たす `0.44.1` を指定できる。upstream の
 `start/action.yaml:70` は CI/CD ルール (`cicd-rules`、既定 `true`) のマウント元パスが
 誤っており (`github.action_path` は `start/` を指すのに、実体はリポジトリ直下の
 `rules/` にある)、Docker がマウント元の欠落を空ディレクトリで補うため CI/CD ルールが
@@ -70,7 +74,7 @@ upstream 版と fork 修正版を比較し、バグの影響を定量的に記�
 | --- | --- | --- | --- | --- |
 | upstream / 0.39.0 | `falcosecurity/falco-actions@558a3ce...` | 0.39.0 | | |
 | upstream / 0.39.2 | `falcosecurity/falco-actions@558a3ce...` | 0.39.2 | | |
-| fork-fixed / 0.39.2 | `fiord/falco-actions@360d62c7...` | 0.39.2 | | |
+| fork-fixed / 0.44.1 | `fiord/falco-actions@fix/cicd-rules-mount-path` | 0.44.1 | | |
 
 - 期待される結果: upstream の 2 leg は「ロードされなかった」、fork-fixed leg のみ
   「ロードされた」となるはず。この期待と一致したか:
@@ -87,7 +91,7 @@ upstream 版と fork 修正版を比較し、バグの影響を定量的に記�
 | --- | --- | --- | --- |
 | upstream / 0.39.0 | | | |
 | upstream / 0.39.2 | | | |
-| fork-fixed / 0.39.2 | | | |
+| fork-fixed / 0.44.1 | | | |
 
 - 期待される結果: upstream の 2 leg は CI/CD 特化ルール由来の検知が 0 件、
   fork-fixed leg のみ 1 件以上検知するはず。この期待と一致したか:
@@ -116,9 +120,9 @@ upstream 版と fork 修正版を比較し、バグの影響を定量的に記�
   - `Start Falco` ステップの outcome:
   - required_engine_version (0.43.0) との不整合は実際に問題になったか (はい/いいえ、具体的な事象):
   - 発火したルール:
-- `falco-version: 0.39.2` (fork-fixed, `live-forked` ジョブ、`fiord/falco-actions@360d62c7...`) の結果:
+- `falco-version: 0.44.1` (fork-fixed, `live-forked` ジョブ、`fiord/falco-actions@fix/cicd-rules-mount-path`。維持されている falcosecurity/falco イメージを使うため required_engine_version: 0.43.0 は満たされる) の結果:
   - `Start Falco` ステップの outcome:
-  - required_engine_version (0.43.0) との不整合は実際に問題になったか (はい/いいえ、具体的な事象):
+  - 維持されているイメージの新しい Falco (0.44.1) は現在のランナーのカーネル (6.17) で起動し続けられたか (検証したい3点の1点目。以前 falco-version を古いまま 0.39.2 にしていたときは scap_init に失敗し続けていた、run 32606439283):
   - 発火したルール (CI/CD 特化ルールが upstream leg と異なり実際に発火するはず):
 - シナリオごとの検知有無 (upstream / fork-fixed で差があれば併記すること):
 

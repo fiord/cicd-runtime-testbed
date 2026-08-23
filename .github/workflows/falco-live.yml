@@ -13,17 +13,36 @@
 #   起動が失敗する/警告のみで動く、等)を実地で確認する。fail-fast は無効化し、
 #   片方の falco-version が失敗してももう片方の結果を必ず得られるようにする。
 #
-#   なぜ 0.39.x が上限か: falco-actions の start/analyze action は使用イメージを
-#   `IMAGE="falcosecurity/falco-no-driver"` にハードコードしており (falco-actions
-#   の start/action.yaml, analyze/action.yaml)、このイメージは Docker Hub 上の
-#   数値バージョンタグの最大が `0.39.2` で止まっている (latest の最終 push も
-#   2024-11-21 で、事実上メンテナンスが止まっている)。falco 本体イメージ
-#   (falcosecurity/falco) は 0.44.1 まであるが、falco-actions はそちらを使わない
-#   ためこのテストベッドから利用する手段が無い。したがって `required_engine_version:
-#   0.43.0` を満たす falco-version を matrix に含めることはそもそもできず、
-#   0.39.0 (旧: required_engine_version との不整合を見る側) と 0.39.2
-#   (falco-no-driver で確認できる最新版) の 2 点で比較する。詳細は各 matrix
-#   ジョブの "Preflight" ステップと docs/RESULTS-TEMPLATE.md を参照。
+#   なぜ upstream (`live` ジョブ) は 0.39.x が上限か: falco-actions の
+#   start/analyze action は使用イメージを `IMAGE="falcosecurity/falco-no-driver"`
+#   にハードコードしており (falcosecurity/falco-actions の start/action.yaml,
+#   analyze/action.yaml)、このイメージは Docker Hub 上の数値バージョンタグの
+#   最大が `0.39.2` で止まっている (latest の最終 push も 2024-11-21 で、
+#   事実上メンテナンスが止まっている)。したがって `required_engine_version:
+#   0.43.0` を満たす falco-version を upstream の matrix に含めることは
+#   そもそもできず、0.39.0 (旧: required_engine_version との不整合を見る側) と
+#   0.39.2 (falco-no-driver で確認できる最新版) の 2 点で比較する。
+#
+#   一方 `live-forked` ジョブ (fork 修正版) は、fiord/falco-actions の
+#   fix/cicd-rules-mount-path ブランチ側で使用イメージそのものを
+#   `falcosecurity/falco-no-driver` から、現在も更新が続いている falco 本体
+#   イメージ `falcosecurity/falco` に切り替え済みである。そのため `live-forked`
+#   ジョブは `falco-version: "0.44.1"` (falcosecurity/falco の Docker Hub 上の
+#   実際の最新、2026-06-11 push、Docker Hub API で確認済み) を指定でき、
+#   required_engine_version: 0.43.0 を満たすエンジンで実行できる。
+#
+#   なお、以前この `live-forked` ジョブはイメージが切り替わった後も
+#   `falco-version: "0.39.2"` を渡したままだったため、結局
+#   `falcosecurity/falco:0.39.2` という古い Falco を pull し続けており、
+#   本来検証したかった「新しい Falco がカーネル 6.17 で動くか」を一度も確認
+#   できていなかった (run 32606439283 の実測:
+#   `Status: Downloaded newer image for falcosecurity/falco:0.39.2` /
+#   `Falco container was seen running but is no longer alive after the
+#   recheck.`)。falco-version を実際の最新である 0.44.1 に合わせたのはこの
+#   ためである。
+#
+#   詳細は各 matrix ジョブの "Preflight" ステップと docs/RESULTS-TEMPLATE.md を
+#   参照。
 #
 #   custom-rule-file は指定しない: start action の `cicd-rules` 入力は
 #   デフォルト true であり、live モードでは falco-actions 同梱の CI/CD
@@ -58,13 +77,21 @@
 #   matrix で action の参照先 (upstream / fork) を切り替えることはできない。
 #   そのため upstream 用の `live` ジョブ (matrix: 0.39.0 / 0.39.2、従来どおり)
 #   とは別に、fork 修正版のみを使う `live-forked` ジョブ (falco-version 固定で
-#   0.39.2 の 1 leg) を追加し、次の 3 leg を同一 run 内で並べて比較する:
+#   0.44.1 の 1 leg) を追加し、次の 3 leg を同一 run 内で並べて比較する:
 #
 #     | leg                    | action の参照先                                              | falco-version |
 #     | ----------------------- | ------------------------------------------------------------ | ------------- |
 #     | upstream / 0.39.0       | falcosecurity/falco-actions/...@558a3ceeee9403e1c875ffbeb704c34c93e24752 | 0.39.0        |
 #     | upstream / 0.39.2       | 同上                                                            | 0.39.2        |
-#     | fork-fixed / 0.39.2     | fiord/falco-actions/...@fix/cicd-rules-mount-path (branch)      | 0.39.2        |
+#     | fork-fixed / 0.44.1     | fiord/falco-actions/...@fix/cicd-rules-mount-path (branch)      | 0.44.1        |
+#
+#   --- `live-forked` ジョブが検証したい3点 ---
+#
+#   1. 維持されているイメージ (falcosecurity/falco) の新しい Falco
+#      (0.44.1) なら、現在のランナーのカーネル (6.17) で起動し続けられるか
+#   2. `cicd-rules` のパス修正 (start/action.yaml:70 の
+#      github.action_path のずれの修正) により CI/CD 特化ルールがロードされるか
+#   3. 実際に検知イベントが出るか
 #
 #   --- 検証用の一時的な例外 (docs/SPEC.md §8 / docs/SAFETY.md の「uses: は全て
 #   コミット SHA でピン留めする」方針に対する意図的な例外) ---
@@ -83,7 +110,8 @@
 #   `live-forked` ジョブは `live` ジョブと処理内容 (シナリオ実行・テレメトリ収集・
 #   preflight) がほぼ重複するが、可読性を優先してあえて重複させている。
 #   両ジョブの差分は「action の参照先」「falco-version」「テレメトリアーティファクト名」
-#   の 3 点のみになるようにコピーしてある。両ジョブに「CI/CD ルールがロードされたか」
+#   「preflight の対象イメージ (falcosecurity/falco-no-driver か falcosecurity/falco か)」
+#   の 4 点のみになるようにコピーしてある。両ジョブに「CI/CD ルールがロードされたか」
 #   のアサーション (非失敗、観測目的) を追加し、job summary を見比べればバグの
 #   影響が一目で分かるようにしている。
 #
@@ -728,17 +756,23 @@ jobs:
           retention-days: 1
 
   live-forked:
-    name: "live-forked / fork-fixed falco 0.39.2"
+    name: "live-forked / fork-fixed falco 0.44.1"
     runs-on: ubuntu-latest
     # このジョブは `live` ジョブと処理内容 (シナリオ実行・テレメトリ収集・
     # preflight) がほぼ重複するコピーである。可読性を優先してあえて重複を
-    # 許容している。`live` との差分は次の3点のみ:
+    # 許容している。`live` との差分は次の4点のみ:
     #   1. falco-actions の参照先 (upstream の 558a3ce... ではなく fork の
     #      fix/cicd-rules-mount-path ブランチ = start/action.yaml:70 の
     #      マウントパスバグ修正版。検証用の一時的なブランチ参照であり、
-    #      検証完了後は SHA pin に戻す。詳細はファイル冒頭のコメント参照)
-    #   2. falco-version (matrix ではなく 0.39.2 固定の 1 leg)
-    #   3. テレメトリアーティファクト名 (telemetry-falco-live-forked-0.39.2)
+    #      検証完了後は SHA pin に戻す。詳細はファイル冒頭のコメント参照)。
+    #      このブランチでは使用イメージも falcosecurity/falco-no-driver から
+    #      維持されている falcosecurity/falco に切り替わっている
+    #   2. falco-version (matrix ではなく 0.44.1 固定の 1 leg。
+    #      falcosecurity/falco の Docker Hub 上の実際の最新。ファイル冒頭の
+    #      コメント参照)
+    #   3. テレメトリアーティファクト名 (telemetry-falco-live-forked-0.44.1)
+    #   4. preflight の対象イメージ (falcosecurity/falco-no-driver ではなく
+    #      falcosecurity/falco の実タグを確認する)
     # `uses:` に式は使えないため、この leg を `live` ジョブの matrix に
     # 混ぜることはできず、別ジョブとして実装している (ファイル冒頭コメント参照)。
     permissions:
@@ -752,30 +786,33 @@ jobs:
       - name: Checkout cicd-runtime-testbed
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: "Preflight: falcosecurity/falco-no-driver:0.39.2 タグの実在確認"
-        # falco-actions/start はイメージを falcosecurity/falco-no-driver に
-        # ハードコードしている (falco-actions/start/action.yaml)。このイメージは
-        # 数値タグの最大が 0.39.2 で公開が止まっているため、存在しないタグを
-        # 指定すると action の奥深くで `docker: ... manifest unknown` と
-        # exit 125 になり原因がわかりにくい (今回の障害そのもの)。ここで先に
-        # Docker Hub のタグ API を叩いて実在を確認し、無ければここで明確に
-        # 落とす。ネットワーク障害や rate limit で preflight 自体が失敗した
+      - name: "Preflight: falcosecurity/falco:0.44.1 タグの実在確認"
+        # `live-forked` ジョブは fork 修正版 (fiord/falco-actions@fix/cicd-rules-mount-path)
+        # を使っており、このブランチでは使用イメージが falcosecurity/falco-no-driver
+        # (メンテナンス終了、0.39.2 で公開停止) ではなく、現在も更新が続いている
+        # falco 本体イメージ `falcosecurity/falco` に切り替わっている。したがって
+        # preflight の対象リポジトリも upstream leg (`live` ジョブ、
+        # falcosecurity/falco-no-driver を検査) とは別に、falcosecurity/falco を
+        # 検査する。存在しないタグを指定すると action の奥深くで
+        # `docker: ... manifest unknown` と exit 125 になり原因がわかりにくいため、
+        # ここで先に Docker Hub のタグ API を叩いて実在を確認し、無ければここで
+        # 明確に落とす。ネットワーク障害や rate limit で preflight 自体が失敗した
         # 場合は、テストの可用性を落とさないよう警告のみで続行する。
         shell: bash
         env:
-          FALCO_VERSION: "0.39.2"
+          FALCO_VERSION: "0.44.1"
         run: |
           set -uo pipefail
-          API_URL="https://hub.docker.com/v2/repositories/falcosecurity/falco-no-driver/tags?page_size=100&ordering=last_updated"
+          API_URL="https://hub.docker.com/v2/repositories/falcosecurity/falco/tags?page_size=100&ordering=last_updated"
           RESPONSE_FILE="$(mktemp)"
           HTTP_CODE="$(curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' --max-time 20 "$API_URL" 2>/dev/null)"
           CURL_EXIT=$?
           HTTP_CODE="${HTTP_CODE:-000}"
 
           if [ "$CURL_EXIT" -ne 0 ] || [ "$HTTP_CODE" != "200" ]; then
-            echo "::warning title=falco-no-driver tag preflight skipped::Docker Hub API (${API_URL}) への接続に失敗しました (curl exit=${CURL_EXIT}, HTTP ${HTTP_CODE})。ネットワーク障害または rate limit の可能性があるため、preflight をスキップしてワークフローを続行します。falco-version=${FALCO_VERSION} が実在しない場合、後続のステップが manifest not found で失敗する可能性があります。"
+            echo "::warning title=falco tag preflight skipped::Docker Hub API (${API_URL}) への接続に失敗しました (curl exit=${CURL_EXIT}, HTTP ${HTTP_CODE})。ネットワーク障害または rate limit の可能性があるため、preflight をスキップしてワークフローを続行します。falco-version=${FALCO_VERSION} が実在しない場合、後続のステップが manifest not found で失敗する可能性があります。"
             {
-              echo "### preflight: falcosecurity/falco-no-driver:${FALCO_VERSION} (skipped)"
+              echo "### preflight: falcosecurity/falco:${FALCO_VERSION} (skipped)"
               echo ""
               echo "Docker Hub API への接続に失敗しました (curl exit=${CURL_EXIT}, HTTP ${HTTP_CODE})。"
               echo "ネットワーク障害または rate limit の可能性があるため、確認をスキップして続行しました。"
@@ -802,9 +839,9 @@ jobs:
                   f"Docker Hub API のレスポンス解析に失敗しました ({e})。"
                   f"確認をスキップして続行します。"
               )
-              print(f"::warning title=falco-no-driver tag preflight skipped::{msg}")
+              print(f"::warning title=falco tag preflight skipped::{msg}")
               with open(summary_file, "a", encoding="utf-8") as s:
-                  s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version} (skipped)\n\n")
+                  s.write(f"### preflight: falcosecurity/falco:{falco_version} (skipped)\n\n")
                   s.write(f"{msg}\n")
               sys.exit(0)
 
@@ -817,31 +854,38 @@ jobs:
           if falco_version in tag_map:
               tag = tag_map[falco_version]
               last_pushed = tag.get("tag_last_pushed") or tag.get("last_updated") or "unknown"
-              print(f"preflight OK: falcosecurity/falco-no-driver:{falco_version} exists (tag_last_pushed={last_pushed})")
+              print(f"preflight OK: falcosecurity/falco:{falco_version} exists (tag_last_pushed={last_pushed})")
               with open(summary_file, "a", encoding="utf-8") as s:
-                  s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version}\n\n")
+                  s.write(f"### preflight: falcosecurity/falco:{falco_version}\n\n")
                   s.write(f"- Docker Hub にタグが実在することを確認しました。\n")
                   s.write(f"- 最終 push (`tag_last_pushed`): `{last_pushed}`\n\n")
               sys.exit(0)
           else:
               available = ", ".join(numeric_tags) if numeric_tags else "(取得できたページ内に数値タグが見つかりませんでした)"
               msg = (
-                  f"falcosecurity/falco-no-driver:{falco_version} は Docker Hub に存在しません "
+                  f"falcosecurity/falco:{falco_version} は Docker Hub に存在しません "
                   f"(manifest unknown になります)。利用可能な数値タグ: {available}"
               )
-              print(f"::error title=falco-no-driver tag not found::{msg}")
+              print(f"::error title=falco tag not found::{msg}")
               with open(summary_file, "a", encoding="utf-8") as s:
-                  s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version} (NOT FOUND)\n\n")
+                  s.write(f"### preflight: falcosecurity/falco:{falco_version} (NOT FOUND)\n\n")
                   s.write(f"- タグが存在しません。利用可能な数値タグ: {available}\n\n")
               sys.exit(1)
           PYEOF
 
       - name: Start Falco (live mode)
         id: start_falco
-        # required_engine_version との不整合が実際に何を起こすかを
-        # このワークフローで確認したいので、起動失敗そのものでジョブ全体を
-        # 落とさない。後続ステップは falco が起動していなくても実行され、
-        # 「検知されなかった」という結果自体が観測データになる。
+        # このジョブは falcosecurity/falco:0.44.1 (required_engine_version:
+        # 0.43.0 を満たすエンジン) を使うため required_engine_version 由来の
+        # 拒否は起きない見込みだが、代わりに「維持されているイメージの新しい
+        # Falco が、現在のランナーのカーネル (6.17) で起動し続けられるか」
+        # (検証したい3点の1点目、ファイル冒頭コメント参照) をこのステップと
+        # 後続ステップで確認する。以前 falco-version を古いまま (0.39.2) にして
+        # いたときは falcosecurity/falco:0.39.2 という古い Falco を pull して
+        # しまい、`scap_init` に失敗し続けていた (run 32606439283)。起動失敗
+        # そのものでジョブ全体を落とさないよう、ここでも continue-on-error に
+        # しておく。後続ステップは falco が起動していなくても実行され、
+        # 「起動し続けられなかった」という結果自体が観測データになる。
         continue-on-error: true
         # 検証用の一時的な例外 (docs/SPEC.md §8 / docs/SAFETY.md の「uses: は
         # 全てコミット SHA でピン留めする」方針に対する意図的な例外):
@@ -854,7 +898,7 @@ jobs:
         uses: fiord/falco-actions/start@fix/cicd-rules-mount-path # TEMPORARY EXCEPTION: fork-fixed branch ref (self-managed fork, actively iterating on start/action.yaml:70 cicd-rules mount-path fix); revert to SHA pin once stabilized
         with:
           mode: live
-          falco-version: "0.39.2"
+          falco-version: "0.44.1"
           verbose: true
 
       - name: "Stream Falco logs to file (survive --rm container disappearance)"
@@ -901,14 +945,17 @@ jobs:
 
       - name: "Capture Falco startup logs (required_engine_version check, T1)"
         # falco-actions 同梱の CI/CD ルール (rules/falco_cicd_rules.yaml) は
-        # `required_engine_version: 0.43.0` を宣言している。一方 falco-actions が
-        # 使える falco-no-driver イメージは 0.39.2 が事実上の上限 (ファイル冒頭の
-        # コメント参照)。つまり「falco-actions は自身の同梱 CI/CD ルールが要求する
-        # エンジンバージョンを満たすイメージを pull できない可能性が高い」という
-        # 仮説が立つ。この仮説を検証するため、falco コンテナ起動直後のログから
-        # required_engine_version / engine version 関連の記述の有無を拾い、
-        # ロード成功・拒否・警告のみのいずれだったかの手がかりを job summary と
-        # telemetry に残す (docs/RESULTS-TEMPLATE.md T1 の記入欄に対応)。
+        # `required_engine_version: 0.43.0` を宣言している。この leg
+        # (fork-fixed) は falcosecurity/falco:0.44.1 (required_engine_version:
+        # 0.43.0 を満たすエンジン。ファイル冒頭のコメント参照) を使うため、
+        # upstream leg (`live` ジョブ、falco-no-driver 上限の 0.39.x で
+        # required_engine_version との不整合を見る) とは異なり、ここでの
+        # 主眼は required_engine_version ではなく「維持されているイメージの
+        # 新しい Falco が、現在のランナーのカーネル (6.17) で起動し続けられる
+        # か」(検証したい3点の1点目) にある。falco コンテナ起動直後のログから
+        # required_engine_version / engine version 関連の記述の有無、および
+        # 起動完了マーカーの有無を拾い、job summary と telemetry に残す
+        # (docs/RESULTS-TEMPLATE.md T1 の記入欄に対応)。
         #
         # ポーリングは docker logs を都度叩くのではなく /tmp/falco_stream.log
         # (直前のステップが docker logs -f で継続的に書き続けているファイル) の
@@ -928,7 +975,7 @@ jobs:
           MARKER_REGEX="Enabled event sources|Opening 'syscall' source"
 
           {
-            echo "# falco startup log capture (engine requirement check, falco-version=0.39.2, fork-fixed)"
+            echo "# falco startup log capture (engine requirement check, falco-version=0.44.1, fork-fixed)"
             echo "# primary source: ${STREAM_LOG} (docker logs -f, streamed continuously since"
             echo "# right after Start Falco; content survives the --rm container disappearing)"
             echo ""
@@ -1051,13 +1098,16 @@ jobs:
 
           {
             echo ""
-            echo "## required_engine_version 0.43.0 vs falco 0.39.2 (fork-fixed, T1 中核観測)"
+            echo "## required_engine_version 0.43.0 vs falco 0.44.1 (fork-fixed, T1 中核観測)"
             echo ""
             echo "falco-actions 同梱の CI/CD ルール (rules/falco_cicd_rules.yaml) は"
-            echo "\`required_engine_version: 0.43.0\` を宣言しているが、falco-no-driver の"
-            echo "公開停止により実際に使えるエンジンは \`0.39.2\` が上限。"
-            echo "「falco-actions は自身の同梱 CI/CD ルールが要求するエンジンバージョンを"
-            echo "満たすイメージを pull できない」という仮説の検証データ。"
+            echo "\`required_engine_version: 0.43.0\` を宣言している。upstream leg"
+            echo "(\`live\` ジョブ) は falco-no-driver の公開停止により \`0.39.2\` が上限"
+            echo "だが、この fork-fixed leg は維持されている falcosecurity/falco"
+            echo "イメージ (\`0.44.1\`) を使うため required_engine_version を満たす。"
+            echo "したがってここでの主眼は required_engine_version 由来の拒否/警告の"
+            echo "有無ではなく、この新しいエンジンが現在のランナーのカーネル (6.17) で"
+            echo "起動し続けられるか (検証したい3点の1点目) にある。"
             echo ""
             case "$HAS_ENGINE_MENTION" in
               yes)
@@ -1140,7 +1190,7 @@ jobs:
 
           {
             echo ""
-            echo "## CI/CD ルールはロードされたか (job: ${{ github.job }}, leg: fork-fixed / falco 0.39.2)"
+            echo "## CI/CD ルールはロードされたか (job: ${{ github.job }}, leg: fork-fixed / falco 0.44.1)"
             echo ""
             echo "action 参照先: \`fiord/falco-actions/start@fix/cicd-rules-mount-path\` (branch, 検証用の一時的な例外)"
             echo "(fork-fixed。start/action.yaml:70 のマウントパスバグ修正版。修正の起点:"
@@ -1239,7 +1289,7 @@ jobs:
           set -uo pipefail
           LOG_FILE="/tmp/falco_stop_logs.txt"
           {
-            echo "# falco logs immediately before Stop Falco (falco-version=0.39.2, fork-fixed)"
+            echo "# falco logs immediately before Stop Falco (falco-version=0.44.1, fork-fixed)"
             echo ""
           } > "$LOG_FILE"
 
@@ -1296,10 +1346,10 @@ jobs:
           {
             echo ""
             echo "## falco-live matrix note"
-            echo "- \`falco-version\`: \`0.39.2\`"
-            echo "- action source: fork-fixed fiord/falco-actions@fix/cicd-rules-mount-path (branch ref, temporary verification exception)"
+            echo "- \`falco-version\`: \`0.44.1\`"
+            echo "- action source: fork-fixed fiord/falco-actions@fix/cicd-rules-mount-path (branch ref, temporary verification exception; uses the maintained falcosecurity/falco image, not falco-no-driver)"
             echo "- required_engine_version of the bundled CI/CD rules: \`0.43.0\`"
-            echo "- falcosecurity/falco-no-driver の実際の上限 (Docker Hub, メンテナンス終了): \`0.39.2\`"
+            echo "- falcosecurity/falco の実際の最新 (Docker Hub, 2026-06-11 push): \`0.44.1\`"
             echo "- \`Start Falco\` step outcome: \`${{ steps.start_falco.outcome }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -1372,11 +1422,11 @@ jobs:
             cp "${RUNNER_TEMP}/cicd-runtime-testbed-log.jsonl" telemetry/testbed-log.jsonl
           fi
 
-      - name: Upload telemetry-falco-live-forked-0.39.2
+      - name: Upload telemetry-falco-live-forked-0.44.1
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: telemetry-falco-live-forked-0.39.2
+          name: telemetry-falco-live-forked-0.44.1
           path: telemetry/
           if-no-files-found: warn
           retention-days: 1
