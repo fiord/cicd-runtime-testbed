@@ -248,6 +248,15 @@ N/A (この証跡粒度では観測不能) になる (`CANARY_DNS` は predicate
 対象外)。これも正常であり、⚠️ や乖離としては扱わない
 (docs/SPEC.md §3「観測に必要な証跡粒度」、§7)。上記「参考: 初回実行で得られた結果」を参照。
 
+**falco (`falco-live.yml` / `falco-analyze.yml`) の run を対象に走査した場合**、
+`CANARY_ENV` / `CANARY_FILE` / `CANARY_SCAP` 以外の7個は informational (参考情報)
+になる。判定列には ✅/⚠️ ではなく「参考（このツールには採点可能な仮説が無い）」が
+表示され、⚠️ や乖離・exit code には算入しない（実測欄には「漏れた/漏れなかった」の
+事実は引き続き表示される。docs/SPEC.md §7「採点対象 (scored)／参考情報
+(informational) の区別」、実測結果 (run 32643269616) を参照）。`CANARY_SCAP` は
+falco に対しては scored のままだが、`capture.scap` (raw 粒度の証跡) が走査対象に
+無い場合 (live モード等) は証跡粒度 N/A になる。
+
 `leak-scan.yml` は⚠️ が1つでもあれば非ゼロ終了する (exit 1)。今回の実行は
 成功 (exit 0、すべて仮説どおり) / 失敗 (exit 1、乖離あり) / 走査不成立 (exit 2、上のセクション参照)
 のどれだったか:
@@ -524,6 +533,108 @@ run 32544606013 の対応 (`testbed_canary_http_host` のコメントアウト�
 良い設計である。この制約の下では、`monitor_mode` はリポジトリ全体で1つの
 値しか持てず、ワークフローごとの実行時切り替えは原理的に不可能。
 kill テストを行なうには、コミット値そのものを `false` にするしかない。
+
+---
+
+## 実測結果（run 32643269616, leak-scan.yml）— falco に cicd-sensor 用の期待値を適用していた誤り
+
+このセクションも記入用テンプレートではなく、実際に得られた実測結果の記録。
+leak-scan（run 32643269616）を falco-live-forked の run（32625231129）に対して
+実行した結果の記録であり、`tools/render-matrix.py` の期待値モデルの欠陥
+（本節が追加された対応そのもの）を発見した run である。
+
+- 対象 run: `leak-scan.yml` の run 32643269616。走査対象は falco-live.yml の
+  run 32625231129（`telemetry-falco-live-forked-0.44.1`）。
+- **結果: `CANARY_PATH` / `CANARY_ARGV_SHORT` / `CANARY_DNS` / `CANARY_SCAP` の
+  4件が ⚠️（乖離）と判定され、`leak-scan.yml` が失敗した。**
+
+  | カナリア ID | 期待 | 実測 | 判定（当時） |
+  | --- | --- | --- | --- |
+  | `CANARY_PATH` | 漏れる | 漏れない | ⚠️ |
+  | `CANARY_ARGV_SHORT` | 漏れる | 漏れない | ⚠️ |
+  | `CANARY_DNS` | 漏れる | 漏れない | ⚠️ |
+  | `CANARY_SCAP` | 漏れる | 漏れない | ⚠️ |
+
+- 対象テレメトリ（`telemetry-falco-live-forked-0.44.1`）を実際に展開して確認した
+  事実:
+  - 含まれるファイル: `falco_events.json` / `falco_start_logs.txt` /
+    `falco_stop_logs.txt` / `falco_stream.log` / `falco_docker_events.log` /
+    `falco_events_info.txt` / `job-summary.md` / `testbed-log.jsonl`
+  - **`capture.scap` は含まれない**（live モードは生キャプチャを作らない。
+    analyze モード専用）
+  - 検知イベントは 80 件、**すべて `Source Code Overwrite`**。他のルールは
+    一件も発火していない。
+
+- **この4件はすべて構造的に成立しえないもので、真の発見ではなかった。**
+  - `CANARY_SCAP`: `capture.scap` が live モードには存在しない。証跡粒度
+    `raw` を要求すべきなのに、`detail` で判定対象になってしまっていた
+    （粒度チェックの対象外だったため）。
+  - `CANARY_PATH`: 唯一発火した `Source Code Overwrite` の条件は
+    `/home/runner/work/` 配下への書き込み。`/tmp/${CANARY_PATH}/...` は
+    対象外なので出力に現れようがない。
+  - `CANARY_ARGV_SHORT`: falco の7ルールに curl に一致するものが無く、argv
+    が出力に現れる経路が存在しない。
+  - `CANARY_DNS`: live モードに DNS を扱うルールが無い（DNS 抽出は analyze
+    モードの chisel 機能）。
+
+### 原因: falco に対して cicd-sensor 用の期待値をそのまま採点適用していた
+
+これらのカナリアは cicd-sensor の redaction 挙動を検証するために設計されたもの
+だった。検証している仮説は「12 バイト超の argv 切り詰め」「キーワード依存の
+redaction」「パスは redact されない」といった、cicd-sensor の実装詳細である。
+**falco には redaction 層が存在しない。** falco の出力はルールの `output:`
+テンプレートに書かれた内容がそのまま出るだけなので、「カナリアが現れるか」は
+「どのルールが発火し、そのテンプレートに何が含まれるか」で決まる、cicd-sensor
+とはまったく別の問いである。同じ期待値で採点していたのが誤りだった。
+
+### 対応（この commit で実施）
+
+1. `tools/render-matrix.py` に「採点対象 (scored)」「参考情報
+   (informational)」の区別 (`CANARY_SCORED_FOR` / `is_informational()`) を
+   導入した。`CANARY_ENV` / `CANARY_FILE` 以外の8個は、falco に対しては
+   informational（検出の有無は表示するが ✅/⚠️ を付けず、exit code にも
+   算入しない）として扱うようにした。
+2. `CANARY_SCAP` の証跡粒度要求 (`CANARY_MIN_GRANULARITY`) を「詳細以上」
+   から「生 (`capture.scap` そのもの)」に修正した。以前は証跡粒度チェック
+   の対象外で、`capture.scap` の無い falco live モードに対して誤って
+   ⚠️ になっていた。
+3. `docs/SPEC.md` §3・§7、`README.md`、`docs/TEST-PLAN.md` に、
+   scored/informational の区別とその理由を追記した。
+4. 既存の3つの N/A 機構（ツール種別 / 証跡粒度 / `http_request` サポート）
+   は変更せず、今回の scored/informational とは独立に動作するようにした。
+
+### 検証（実データでの再走テスト）
+
+修正後の `tools/render-matrix.py` を、実物のテレメトリデータ2種類に対して
+実際に走らせて確認した。
+
+- **falco-live のテレメトリ（`capture.scap` なし、検知は `Source Code
+  Overwrite` 80 件のみ）を `telemetry-falco-live-forked-0.44.1/` として
+  構成し走査した結果**: `CANARY_PATH` / `CANARY_ARGV_SHORT` / `CANARY_DNS`
+  は「参考（このツールには採点可能な仮説が無い）」、`CANARY_SCAP` は
+  「N/A（この証跡粒度では観測不能。生キャプチャレベル (capture.scap あり)
+  の証跡が必要）」となり、4件とも ⚠️ ではなくなった。
+  `RESULT: 10 canaries checked (2 scored, 7 informational, 1 N/A (1 N/A
+  granularity)), 0 mismatch(es) -> exit 0`。
+- **cicd-sensor の実テレメトリ（`cicd-sensor-attestation` +
+  `cicd-sensor-report`）を `telemetry-cicd-sensor-monitor/` として構成し
+  走査した結果**: 修正前と同一の判定（`CANARY_ARGV_SHORT` / `CANARY_DNS` /
+  `CANARY_PATH` が scored で ✅、`CANARY_SCAP` が対象外 N/A、
+  `CANARY_URL_PATH` / `CANARY_URL_QUERY` が `http_request` 未対応 N/A）が
+  維持され、回帰が無いことを確認した。
+  `RESULT: 10 canaries checked (7 scored, 0 informational, 3 N/A (1 N/A
+  tool, 2 N/A capability)), 0 mismatch(es) -> exit 0`。
+- 既存の回帰ケース（`scanned_file_count=0` → exit 2、scored なカナリアの
+  乖離 → exit 1）も引き続き通ることを確認した。
+
+### 教訓
+
+**「⚠️ が出た = 発見」ではない。** カナリアはそれぞれ特定のツールの特定の
+実装詳細（この場合は cicd-sensor の redaction ヒューリスティック）を検証する
+ために設計されている。別のツールに同じ期待値を機械的に適用すると、
+そのツールが持たない仮説について「乖離」を報告してしまう。「そのツールに
+対してこのカナリアは採点可能な仮説を持っているか」を、期待値そのもの
+（漏れる/漏れない）とは別に明示的にモデル化する必要があった。
 
 ---
 

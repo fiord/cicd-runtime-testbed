@@ -102,6 +102,21 @@
   `MISSING` として処理は続行していましたが、HTML レポートが一度も
   取得できていませんでした)。`cicd-sensor-attestation` の名前は元々正しく、
   変更していません。
+- **カナリアには「採点対象 (scored)」と「参考情報 (informational)」の区別があります。**
+  実地実行 (run 32643269616。falco-live の run 32625231129 に対する leak-scan) で、
+  `CANARY_PATH` / `CANARY_ARGV_SHORT` / `CANARY_DNS` / `CANARY_SCAP` の4件が ⚠️
+  (乖離) と判定される問題が見つかりましたが、これは真の発見ではありませんでした。
+  これらのカナリアは「cicd-sensor の redaction 挙動 (argv 切り詰め、キーワード依存の
+  redaction、パスの非 redact 等) を検証するために設計されたもの」であり、
+  redaction 層を持たない falco に同じ期待値を適用して採点していたのが誤りでした。
+  falco の出力はルールの `output:` テンプレートに書かれた内容がそのまま出るだけで、
+  「カナリアが現れるか」はどのルールが発火したかで決まる、cicd-sensor とは別の問いです。
+  `tools/render-matrix.py` は、`CANARY_ENV` / `CANARY_FILE` を除く8個のカナリアについて、
+  falco に対しては informational (検出の有無は表示するが ✅/⚠️ を付けず exit code にも
+  算入しない) として扱うようになりました。合わせて `CANARY_SCAP` の証跡粒度要求を
+  「詳細以上」から「生 (`capture.scap` そのもの)」に修正しました (以前はこのチェックの
+  対象外で、`capture.scap` の無い falco live モードに対して誤って ⚠️ になっていました)。
+  詳細は docs/SPEC.md §3・§7 参照。
 
 ---
 

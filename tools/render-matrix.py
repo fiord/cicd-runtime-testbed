@@ -106,6 +106,39 @@ Usage:
   `::warning::` 注釈で「ルールの一部が読み込まれていない可能性がある」
   ことを明示する。この注釈は exit code には影響しない。
 
+  さらに (実地実行 run 32643269616 で判明した問題への対応)、上記3つの
+  N/A 機構とは独立した4つ目の軸として、「採点対象 (scored) / 参考情報
+  (informational)」の区別を導入した。falco-live の run に対して leak-scan
+  を実行したところ、`CANARY_PATH` / `CANARY_ARGV_SHORT` / `CANARY_DNS` /
+  `CANARY_SCAP` の4件が ⚠️ (乖離) と判定されたが、これらは真の発見では
+  なかった。原因は、これらのカナリアが本来「cicd-sensor の redaction
+  挙動 (12 バイト超の argv 切り詰め、キーワード依存の redaction、パスは
+  redact しない等) を検証するために設計されたもの」であるにもかかわらず、
+  falco にも同じ期待値を適用して採点していたことにある。falco には
+  redaction 層が存在せず、出力はルールの `output:` テンプレートに書かれた
+  内容がそのまま出るだけなので、「カナリアが現れるか」は cicd-sensor の
+  redaction 挙動とは無関係に「どのルールが発火し、そのテンプレートに何を
+  含むか」だけで決まる。この違いを表現するため、`CANARY_SCORED_FOR` /
+  `is_informational()` により、カナリアごとに「そのツールに対して採点
+  可能な仮説を持っているか」を判定する。scored なカナリアは従来どおり
+  期待値との一致・乖離を判定し exit code に算入するが、informational な
+  カナリアは検出の有無 (実測列) のみを表示し、✅/⚠️ を付けず exit code
+  にも算入しない。informational と判定された場合、証跡粒度 N/A・
+  http_request サポート N/A のいずれのチェックも行なわず、そのまま参考
+  情報として表示する (それらの N/A 機構は「scored だが観測できない」
+  ケースのためのものであり、そもそも scored でないカナリアには意味を
+  持たないため)。
+
+  合わせて、`CANARY_SCAP` の証跡粒度要求を "detail" 以上から "raw"
+  (`capture.scap` そのもの) に修正した。以前は `CANARY_SCAP` を証跡粒度
+  チェックの対象外にしており (falco 固有 N/A で別途カバーされていると
+  想定していたため)、falco の live テレメトリ (`falco_events.json` のみ、
+  `capture.scap` は無い) を走査した場合、ツール種別 N/A は素通りしたのに
+  証跡粒度は何もチェックされず、`found=false` と `expected=leak` が
+  単純に食い違って ⚠️ になっていた。`CANARY_SCAP` は「falco の
+  capture.scap でのみ漏れる」という期待なので、capture.scap 自体が
+  無い場合は N/A (この証跡粒度では観測不能) にすべきだった。
+
 Python 3 標準ライブラリのみを使用する。外部依存を追加しないこと。
 """
 import json
@@ -162,6 +195,82 @@ CANARY_APPLIES_TO = {
     "CANARY_SCAP": frozenset({TOOL_FALCO}),
 }
 
+# --- 採点対象 (scored) / 参考情報 (informational) の区別 --------------------
+#
+# 実地実行 (run 32643269616。falco-live-forked の run 32625231129 を対象に
+# した leak-scan) で判明した問題への対応。CANARY_PATH / CANARY_ARGV_SHORT /
+# CANARY_DNS / CANARY_SCAP の4件が falco の run に対して ⚠️ (乖離) と
+# 判定されたが、これは真の発見ではなかった。実際に対象テレメトリを展開して
+# 確認したところ、`capture.scap` は含まれず (live モードは生キャプチャを
+# 作らない)、検知イベントは 80 件すべて `Source Code Overwrite` だった。
+#
+# 根本原因: これらのカナリアは本来「cicd-sensor の redaction 挙動
+# (12 バイト超の argv 切り詰め、キーワード依存の redaction、パスは
+# redact しない等) を検証するために設計されたもの」であるにもかかわらず、
+# falco にも同じ期待値を適用して採点していたこと。falco には redaction 層が
+# 存在せず、出力はルールの `output:` テンプレートに書かれた内容がそのまま
+# 出るだけなので、「カナリアが現れるか」は「どのルールが発火し、その
+# テンプレートに何が含まれるか」で決まる、cicd-sensor とはまったく別の
+# 問いになる。同じ期待値で採点するのが誤りだった。
+#
+# この違いを表現するため、CANARY_APPLIES_TO (そもそも意味を持つか) とは
+# 別の軸として、カナリアごとに「そのツールに対して採点可能な仮説を持って
+# いるか」を区別する:
+#   - scored (採点対象): 期待値との一致・乖離を判定し、exit code に算入する
+#   - informational (参考情報): 検出の有無は表示するが、✅/⚠️ を付けず
+#     exit code にも算入しない
+#
+# CANARY_SCORED_FOR は、カナリアごとに「scored として扱うツール」の集合を
+# 表す。CANARY_ENV / CANARY_FILE のみ両方のツールで scored のまま残す。
+# 「環境変数の値を収集するか」「ファイルの中身を読むか」は redaction の
+# 有無に関係なくどちらのツールにも問える共通の問いだからである。
+# CANARY_SCAP は falco 固有 (元々 CANARY_APPLIES_TO で falco のみに
+# 絞られている) なので falco のみ scored (ただし後述のとおり raw 粒度の
+# 証跡が別途必要)。それ以外の7つは cicd-sensor の redaction 挙動の検証が
+# 主目的のため cicd-sensor のみ scored とし、falco に対しては
+# informational (検出の有無は表示するが採点しない) とする。
+CANARY_SCORED_FOR = {
+    "CANARY_ENV": BOTH_TOOLS,
+    "CANARY_FILE": BOTH_TOOLS,
+    "CANARY_PATH": frozenset({TOOL_CICD_SENSOR}),
+    "CANARY_ARGV_SHORT": frozenset({TOOL_CICD_SENSOR}),
+    "CANARY_ARGV_LONG": frozenset({TOOL_CICD_SENSOR}),
+    "CANARY_ARGV_FLAG": frozenset({TOOL_CICD_SENSOR}),
+    "CANARY_URL_QUERY": frozenset({TOOL_CICD_SENSOR}),
+    "CANARY_URL_PATH": frozenset({TOOL_CICD_SENSOR}),
+    "CANARY_DNS": frozenset({TOOL_CICD_SENSOR}),
+    "CANARY_SCAP": frozenset({TOOL_FALCO}),
+}
+
+INFORMATIONAL_VERDICT_LABEL = "参考（このツールには採点可能な仮説が無い）"
+
+
+def is_informational(canary_id, present_tools):
+    """指定したカナリアが、今回走査したテレメトリの種別に対して
+    informational (採点対象外の参考情報) 扱いになるかどうかを判定する。
+
+    scored/informational の区別は、既存の3つの N/A 機構 (ツール種別 /
+    証跡粒度 / http_request サポート) とは独立した、もう1つの軸である。
+    ここで informational と判定された場合、後続のいずれの N/A チェックも
+    行なわず、そのまま参考情報として表示する (N/A チェックはいずれも
+    「scored だが観測できない」ケースのための仕組みであり、そもそも
+    scored でないカナリアに適用する意味がないため)。
+
+    戻り値: True なら informational、False なら scored (通常どおり判定する)。
+    """
+    scored_for = CANARY_SCORED_FOR.get(canary_id, BOTH_TOOLS)
+    if scored_for == BOTH_TOOLS:
+        return False
+    if present_tools is None:
+        # ツール種別が判定不能な場合は、以前と同じ安全側 (scored) に倒す。
+        # informational に倒すと、実は cicd-sensor の run だった場合に
+        # 本来 scored であるべき乖離を静かに見逃す恐れがあるため。
+        return False
+    # 走査対象に含まれるツールのうち、1つでもこのカナリアを scored として
+    # 扱うツールがあれば scored のまま (安全側)。
+    return not (present_tools & scored_for)
+
+
 # --- 証跡粒度による N/A 判定 (docs/SPEC.md §7「対象外（N/A）判定」後半) -------
 #
 # cicd-sensor の standalone モード (Manager なし) で得られる証跡は、
@@ -193,30 +302,39 @@ GRANULARITY_LABEL = {
     "raw": "生キャプチャレベル (capture.scap あり)",
 }
 
-# 「詳細レベル (rank>=2) 以上の証跡が無いと原理的に観測できない」カナリア。
-# docs/SPEC.md §3 の「観測に必要な証跡粒度」列、および今回の実地実行で
+# カナリアごとに、観測に最低限必要な証跡粒度 (GRANULARITY_RANK の値) を
+# 表す。docs/SPEC.md §3 の「観測に必要な証跡粒度」列、および今回の実地実行で
 # 判明した predicate の仕様 (集計のみ・fileAccess 未実装・collect除外・
-# HTTP path/host 未収録) に基づく。`CANARY_DNS` は predicate の domains
-# 配列に載るため意図的にこの集合から除外している (集計レベルでも判定対象)。
-# `CANARY_ENV` / `CANARY_SCAP` も意図的に含めていない
-# (`CANARY_ENV` は「観測できるかどうか」よりは redaction/マスキングの
-# 検証が主目的であり expected=no_leak なので集計レベルでも矛盾しない。
-# `CANARY_SCAP` は既存の CANARY_APPLIES_TO による falco 固有 N/A 判定で
-# 別途カバーされている。挙動変更の影響範囲を最小化するため、この2つは
-# 対象に含めない判断とした)。
-REQUIRES_DETAIL_OR_BETTER = frozenset(
-    {
-        "CANARY_PATH",
-        "CANARY_FILE",
-        "CANARY_ARGV_SHORT",
-        "CANARY_ARGV_LONG",
-        "CANARY_ARGV_FLAG",
-        "CANARY_URL_QUERY",
-        "CANARY_URL_PATH",
-    }
-)
+# HTTP path/host 未収録) に基づく。ここに載っていないカナリア
+# (`CANARY_ENV` / `CANARY_DNS`) は集計レベル (aggregate) でも判定可能なので、
+# 粒度による N/A 判定の対象にしない (`CANARY_DNS` は predicate の domains
+# 配列に載るため。`CANARY_ENV` は「観測できるかどうか」よりは
+# redaction/マスキングの検証が主目的であり expected=no_leak なので
+# 集計レベルでも矛盾しない)。
+#
+# `CANARY_SCAP` は以前この仕組みの対象外だった (falco 固有 N/A
+# `CANARY_APPLIES_TO` で別途カバーされていたため)。しかし実地実行
+# (run 32643269616、falco-live-forked の run 32625231129 を対象にした
+# leak-scan) で、`capture.scap` が存在しない falco live テレメトリ
+# (`falco_events.json` のみ) に対して `CANARY_SCAP` が ⚠️ になるバグが
+# 見つかった。`CANARY_SCAP` の期待は「falco の capture.scap（生 syscall
+# バッファ）でのみ漏れる」であり、capture.scap 自体が走査対象に無い場合は
+# raw 粒度の証跡が無いことになるので、他の「詳細以上」カナリアと同じ
+# 仕組みで、より高い "raw" 粒度を要求するよう修正した
+# (`CANARY_APPLIES_TO` による falco 固有 N/A 判定は維持したまま、
+# それに加えてこの粒度要求を課す。両者は独立に働く)。
+CANARY_MIN_GRANULARITY = {
+    "CANARY_FILE": GRANULARITY_RANK["detail"],
+    "CANARY_PATH": GRANULARITY_RANK["detail"],
+    "CANARY_ARGV_SHORT": GRANULARITY_RANK["detail"],
+    "CANARY_ARGV_LONG": GRANULARITY_RANK["detail"],
+    "CANARY_ARGV_FLAG": GRANULARITY_RANK["detail"],
+    "CANARY_URL_QUERY": GRANULARITY_RANK["detail"],
+    "CANARY_URL_PATH": GRANULARITY_RANK["detail"],
+    "CANARY_SCAP": GRANULARITY_RANK["raw"],
+}
 
-MIN_GRANULARITY_FOR_JUDGEMENT = 2  # "detail" 以上でないと判定しない
+_GRANULARITY_NAME_BY_RANK = {v: k for k, v in GRANULARITY_RANK.items()}
 
 
 # --- 必要なイベント型サポートによる N/A 判定 (実地実行 run 32519409901 で
@@ -519,10 +637,11 @@ def render(report):
     na_count = 0
     granularity_na_count = 0
     capability_na_count = 0
+    informational_count = 0
     rendered_ids = set()
 
     def render_row(canary_id, finding):
-        nonlocal mismatches, na_count, granularity_na_count, capability_na_count
+        nonlocal mismatches, na_count, granularity_na_count, capability_na_count, informational_count
         route = CANARY_ROUTES.get(canary_id, "(unknown route)")
         expected = finding.get("expected", "?")
         found = bool(finding.get("found", False))
@@ -568,6 +687,21 @@ def render(report):
             )
             return
 
+        # 採点対象 (scored) / 参考情報 (informational) の判定 (上記の
+        # ツール種別 N/A とは別の軸。CANARY_SCORED_FOR / is_informational
+        # の定義を参照)。informational と判定されたカナリアは、後続の
+        # 証跡粒度 N/A・http_request サポート N/A のいずれのチェックも
+        # 行なわず、ここで参考情報として表示して終える (それらの N/A は
+        # 「scored だが観測できない」ケースのための仕組みであり、そもそも
+        # scored でないカナリアには意味を持たないため)。
+        if is_informational(canary_id, present_tools):
+            informational_count += 1
+            lines.append(
+                "| `%s` | %s | %s | %s | %s |"
+                % (canary_id, route, expected_label, actual_label, INFORMATIONAL_VERDICT_LABEL)
+            )
+            return
+
         # 必要なイベント型サポートによる N/A 判定 (ツール種別による N/A・
         # 証跡粒度による N/A とは独立、複数が同時に働きうる。判明した理由が
         # 一つあれば十分なので、ここで先に判定して return する。モジュール
@@ -587,17 +721,19 @@ def render(report):
             return
 
         # 証跡粒度による N/A 判定 (ツール種別による N/A とは独立、両方が働く。
-        # モジュール冒頭コメントおよび REQUIRES_DETAIL_OR_BETTER の定義を参照)。
+        # モジュール冒頭コメントおよび CANARY_MIN_GRANULARITY の定義を参照)。
+        required_rank = CANARY_MIN_GRANULARITY.get(canary_id)
         if (
-            canary_id in REQUIRES_DETAIL_OR_BETTER
+            required_rank is not None
             and granularity_rank is not None
-            and granularity_rank < MIN_GRANULARITY_FOR_JUDGEMENT
+            and granularity_rank < required_rank
         ):
             granularity_na_count += 1
+            required_label = GRANULARITY_LABEL[_GRANULARITY_NAME_BY_RANK[required_rank]]
             lines.append(
                 "| `%s` | %s | %s | (観測不能) | "
-                "N/A（この証跡粒度では観測不能。集計レベルの証跡しか無い） |"
-                % (canary_id, route, expected_label)
+                "N/A（この証跡粒度では観測不能。%s の証跡が必要） |"
+                % (canary_id, route, expected_label, required_label)
             )
             return
 
@@ -630,6 +766,15 @@ def render(report):
         "二値判定なので、capture.scap 以外の場所で見つかった場合も表面上は"
         "同じ OK 表示になる。詳細は leak-report.json の `locations` を"
         "確認すること。"
+    )
+    lines.append(
+        "注: 「%s」と表示された行は、このツールに対してはそもそも採点可能な"
+        "仮説を持たないカナリアである。falco には cicd-sensor のような "
+        "redaction 層が存在せず、出力はルールの `output:` テンプレートに"
+        "書かれた内容がそのまま出るだけなので、「カナリアが現れるか」は "
+        "cicd-sensor の redaction 挙動とは無関係に「どのルールが発火し、"
+        "そのテンプレートに何を含むか」だけで決まる。検出の有無は参考として"
+        "表示するが、期待値との一致・不一致は判定しない。" % INFORMATIONAL_VERDICT_LABEL
     )
     lines.append("")
 
@@ -664,6 +809,15 @@ def render(report):
             "バージョンでは観測不能」なことに注意）。"
             % (capability_na_count, http_capability_status)
         )
+    if informational_count:
+        lines.append(
+            "ℹ️ %d 件は今回走査したテレメトリの種別に対して採点可能な仮説を"
+            "持たないため informational（参考情報）としました（⚠️/✅ を付けず、"
+            "exit code にも算入していません）。falco には redaction 層が無く、"
+            "出力はルールの `output:` テンプレート依存であるため、"
+            "cicd-sensor の redaction 挙動を検証するカナリアの期待値を"
+            "そのまま適用できません。" % informational_count
+        )
 
     lines.append("")
     lines.append(render_runner_token_section(report))
@@ -675,6 +829,7 @@ def render(report):
         na_count,
         granularity_na_count,
         capability_na_count,
+        informational_count,
         warnings_count,
     )
 
@@ -841,6 +996,7 @@ def main(argv):
         na_count,
         granularity_na_count,
         capability_na_count,
+        informational_count,
         warnings_count,
     ) = render(report)
 
@@ -872,6 +1028,8 @@ def main(argv):
         )
 
     findings = report.get("findings", [])
+    na_total = na_count + granularity_na_count + capability_na_count
+    scored_count = len(findings) - informational_count - na_total
     na_parts = []
     if na_count:
         na_parts.append("%d N/A tool" % na_count)
@@ -881,8 +1039,17 @@ def main(argv):
         na_parts.append("%d N/A capability" % capability_na_count)
     na_suffix = " (%s)" % ", ".join(na_parts) if na_parts else ""
     print(
-        "RESULT: %d canaries checked%s, %d mismatch(es) -> exit %d"
-        % (len(findings), na_suffix, mismatches, 1 if mismatches else 0)
+        "RESULT: %d canaries checked (%d scored, %d informational, %d N/A%s), "
+        "%d mismatch(es) -> exit %d"
+        % (
+            len(findings),
+            scored_count,
+            informational_count,
+            na_total,
+            na_suffix,
+            mismatches,
+            1 if mismatches else 0,
+        )
     )
 
     return 1 if mismatches else 0

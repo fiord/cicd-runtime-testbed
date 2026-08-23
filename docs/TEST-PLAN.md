@@ -33,22 +33,35 @@ kill は起きない（ベースラインの terminate ルールに触れた場�
 
 ## カナリア表 (docs/SPEC.md §3 準拠)
 
-| ID | 注入経路 | 期待結果 | 適用範囲 | 観測に必要な証跡粒度 | 検証する仮説 |
-| --- | --- | --- | --- | --- | --- |
-| `CANARY_ENV` | 環境変数 (GitHub Secrets 経由) | 漏れない | 両方 | 集計でも判定対象 | GH のログ自動マスキングが効く／センサーは env を収集しない |
-| `CANARY_FILE` | ファイル内容 (`~/.aws/credentials`) | 漏れない | 両方 | 詳細以上 | 両ツールともファイル内容は読まない (パスのみ記録) |
-| `CANARY_PATH` | ファイルパス (`/tmp/CNRY.../marker`) | 漏れる | 両方 | 詳細以上 | cicd-sensor はパスを redact しない |
-| `CANARY_ARGV_SHORT` | プロセス argv (`02-exfil.sh` の `curl --referer "${CANARY_ARGV_SHORT}"`。独立した argv 要素、12 バイト以下・キーワードなし) | 漏れる | 両方 | 詳細以上 | redaction ヒューリスティックのキーワード依存の穴 |
-| `CANARY_ARGV_LONG` | プロセス argv (`02-exfil.sh` の `curl -A "${CANARY_ARGV_LONG}"`。独立した argv 要素、13 バイト以上・キーワードなし) | 漏れない (`<truncated, N bytes>`) | 両方 | 詳細以上 | 12 バイト超の切り詰めが効く |
-| `CANARY_ARGV_FLAG` | プロセス argv (`Authorization: Bearer` ヘッダ) | 漏れない | 両方 | 詳細以上 | フラグ名ベースの redaction が効く |
-| `CANARY_URL_QUERY` | 平文 HTTP のクエリ文字列 | 漏れない | 両方 | 詳細以上 | eBPF 内でクエリが除去される |
-| `CANARY_URL_PATH` | 平文 HTTP のパス | 漏れる | 両方 | 詳細以上 | HTTP path は redact 対象外 |
-| `CANARY_DNS` | DNS クエリのラベル (`*.test.invalid`) | 漏れる | 両方 | 集計でも判定対象 (`domains` 配列に host 単位で載る) | ドメイン名は redact 対象外 |
-| `CANARY_SCAP` | 生の syscall バッファ | falco の `capture.scap` でのみ漏れる | **falco 固有** | 生 (capture.scap そのもの) | snaplen 256 の生キャプチャに素通りで入る |
+| ID | 注入経路 | 期待結果 | 適用範囲 | 採点対象 | 観測に必要な証跡粒度 | 検証する仮説 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `CANARY_ENV` | 環境変数 (GitHub Secrets 経由) | 漏れない | 両方 | 両方 scored | 集計でも判定対象 | GH のログ自動マスキングが効く／センサーは env を収集しない |
+| `CANARY_FILE` | ファイル内容 (`~/.aws/credentials`) | 漏れない | 両方 | 両方 scored | 詳細以上 | 両ツールともファイル内容は読まない (パスのみ記録) |
+| `CANARY_PATH` | ファイルパス (`/tmp/CNRY.../marker`) | 漏れる | 両方 | cicd-sensor: scored／falco: informational | 詳細以上 | cicd-sensor はパスを redact しない |
+| `CANARY_ARGV_SHORT` | プロセス argv (`02-exfil.sh` の `curl --referer "${CANARY_ARGV_SHORT}"`。独立した argv 要素、12 バイト以下・キーワードなし) | 漏れる | 両方 | cicd-sensor: scored／falco: informational | 詳細以上 | redaction ヒューリスティックのキーワード依存の穴 |
+| `CANARY_ARGV_LONG` | プロセス argv (`02-exfil.sh` の `curl -A "${CANARY_ARGV_LONG}"`。独立した argv 要素、13 バイト以上・キーワードなし) | 漏れない (`<truncated, N bytes>`) | 両方 | cicd-sensor: scored／falco: informational | 詳細以上 | 12 バイト超の切り詰めが効く |
+| `CANARY_ARGV_FLAG` | プロセス argv (`Authorization: Bearer` ヘッダ) | 漏れない | 両方 | cicd-sensor: scored／falco: informational | 詳細以上 | フラグ名ベースの redaction が効く |
+| `CANARY_URL_QUERY` | 平文 HTTP のクエリ文字列 | 漏れない | 両方 | cicd-sensor: scored／falco: informational | 詳細以上 | eBPF 内でクエリが除去される |
+| `CANARY_URL_PATH` | 平文 HTTP のパス | 漏れる | 両方 | cicd-sensor: scored／falco: informational | 詳細以上 | HTTP path は redact 対象外 |
+| `CANARY_DNS` | DNS クエリのラベル (`*.test.invalid`) | 漏れる | 両方 | cicd-sensor: scored／falco: informational | 集計でも判定対象 (`domains` 配列に host 単位で載る) | ドメイン名は redact 対象外 |
+| `CANARY_SCAP` | 生の syscall バッファ | falco の `capture.scap` でのみ漏れる | **falco 固有** | falco: scored (raw 粒度必須) | 生 (capture.scap そのもの) | snaplen 256 の生キャプチャに素通りで入る |
 
 「適用範囲」が falco 固有のカナリアを cicd-sensor 単独の run (`sensor-monitor.yml`)
 に対して走査すると、`tools/render-matrix.py` は ⚠️ ではなく N/A (対象外) と表示する
 (docs/SPEC.md §7)。
+
+「採点対象」は「適用範囲」とは別の軸で、「そのツールに対して採点可能な仮説を
+持っているか」を表す (docs/SPEC.md §7「採点対象 (scored)／参考情報 (informational)
+の区別」)。`CANARY_ENV` / `CANARY_FILE` 以外の8個は元々「cicd-sensor の redaction
+挙動の検証」を目的に設計されており、redaction 層を持たない falco にはそもそも
+採点可能な仮説が無い。実地実行 (run 32643269616。falco-live の run 32625231129 に
+対する leak-scan) で、これらのカナリアを falco に対して cicd-sensor 用の期待値で
+採点してしまい、`CANARY_PATH` / `CANARY_ARGV_SHORT` / `CANARY_DNS` / `CANARY_SCAP`
+の4件が⚠️になる問題が見つかったことへの対応。falco に対しては informational
+(検出の有無は表示するが ✅/⚠️ を付けず、exit code にも算入しない) として扱う。
+`CANARY_SCAP` は falco に対して scored のままだが、`capture.scap` (raw 粒度) が
+無い場合は証跡粒度 N/A になる (以前はこの粒度チェックの対象外で、`capture.scap`
+の無い falco live モードに対して誤って ⚠️ になっていた)。
 
 「観測に必要な証跡粒度」が「詳細以上」のカナリアは、cicd-sensor の standalone モードで
 得られる attestation predicate (集計のみ。個別イベントの timestamp / argv /
@@ -139,6 +152,30 @@ DNS 名はリゾルバによって小文字に正規化されるため、以前�
 `CANARY_DNS` の漏洩を見逃す偽陰性が実地実行 (run 32381640678) で発生していた。
 `runner_token_findings` (ランナー由来トークンの二次走査) は対象外で、引き続き
 大文字小文字を区別する (docs/SPEC.md §7)。
+
+## カナリアの採点対象 (scored) ／ 参考情報 (informational) の区別
+
+実地実行 (run 32643269616。falco-live-forked の run 32625231129 を対象にした
+leak-scan) で、`CANARY_PATH` / `CANARY_ARGV_SHORT` / `CANARY_DNS` / `CANARY_SCAP`
+の4件が falco の run に対して ⚠️ (乖離) と判定されて失敗する問題が見つかった。
+対象テレメトリを実際に展開して確認したところ、`capture.scap` は含まれず (live
+モードは生キャプチャを作らない)、検知イベントは 80 件すべて `Source Code
+Overwrite` だった。この4件はすべて構造的に成立しえないもので、真の発見では
+なかった。
+
+原因は、これらのカナリアが本来「cicd-sensor の redaction 挙動を検証するために
+設計されたもの」であるにもかかわらず、redaction 層を持たない falco にも同じ
+期待値を適用して採点していたことにある。falco の出力はルールの `output:`
+テンプレートに書かれた内容がそのまま出るだけなので、「カナリアが現れるか」は
+cicd-sensor の redaction 挙動とは無関係に決まる、まったく別の問いである。
+
+この対応として `tools/render-matrix.py` に「採点対象 (scored)」と「参考情報
+(informational)」の区別を導入した (上記カナリア表の「採点対象」列、
+docs/SPEC.md §7 参照)。合わせて `CANARY_SCAP` の証跡粒度要求を「詳細以上」から
+「生 (`capture.scap` そのもの)」に修正した (以前はこのチェックの対象外だった
+ため、`capture.scap` の無い falco live モードに対して誤って ⚠️ になっていた)。
+既存の3つの N/A 機構 (ツール種別 / 証跡粒度 / `http_request` サポート) は
+維持したまま、この scored/informational の区別とは独立に動く。
 
 ## ワークフローとテレメトリの対応
 
