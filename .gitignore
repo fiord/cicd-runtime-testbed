@@ -13,3 +13,6 @@ package-lock.json
 # エディタ / OS
 .DS_Store
 *.swp
+
+# serena MCP local project metadata
+.serena/

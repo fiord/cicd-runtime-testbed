@@ -73,6 +73,15 @@ on:
 
 permissions: {}
 
+# cicd-sensor のバージョンに関する単一の source of truth。
+# 詳細な理由は sensor-monitor.yml の同じ env ブロックのコメントを参照
+# (`Install cicd-sensorctl` が取得するバイナリと、cicd-sensor-action の
+# `cicd-sensor-version` 入力に渡す agent のバージョンを必ず一致させる)。
+# リリースタグは `releases/<version>` 形式なので、ここにはバージョン部分
+# だけを持ち、`releases/` は download 側で付ける。
+env:
+  CICD_SENSOR_VERSION: "v0.0.45"
+
 jobs:
   enforce:
     name: "enforce (expected to be killed)"
@@ -109,18 +118,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          # NOTE (未検証・要確認): falco-live.yml / sensor-monitor.yml と同じ
-          # 命名規則の推定に基づく。README 参照。
+          # 実機確認済み (docs/REQUIRED-FIXES.md R-1)。詳細な根拠は
+          # sensor-monitor.yml の同名ステップのコメントを参照:
+          #   - タグは `releases/<version>` 形式
+          #   - tar の中身は cicd-sensorctl-linux-amd64 ほか
+          #   - `cicd-sensorctl version` というサブコマンドは存在しない
+          # 修正前は存在しないタグ `v0.0.38` を指していたため、全 run で
+          # ダウンロードに失敗し `Validate .cicd-sensor/rules` は一度も
+          # 実行されていなかった。
           mkdir -p "${RUNNER_TEMP}/cicd-sensorctl"
-          if gh release download v0.0.38 \
+          if gh release download "releases/${CICD_SENSOR_VERSION}" \
               --repo cicd-sensor/cicd-sensor \
               --pattern "cicd-sensor_*_linux_amd64.tar.gz" \
               --dir "${RUNNER_TEMP}/cicd-sensorctl"; then
             tar -xzf "${RUNNER_TEMP}"/cicd-sensorctl/cicd-sensor_*_linux_amd64.tar.gz -C "${RUNNER_TEMP}/cicd-sensorctl"
             sudo install -m 0755 "${RUNNER_TEMP}/cicd-sensorctl/cicd-sensorctl-linux-amd64" /usr/local/bin/cicd-sensorctl
-            cicd-sensorctl version || true
           else
-            echo "::warning::failed to download cicd-sensorctl (see README: install method is unverified). Skipping rule validation."
+            echo "::warning::failed to download cicd-sensorctl from tag releases/${CICD_SENSOR_VERSION} of cicd-sensor/cicd-sensor. Skipping rule validation (see docs/REQUIRED-FIXES.md R-1)."
           fi
 
       - name: Validate .cicd-sensor/rules
@@ -137,9 +151,9 @@ jobs:
         # として評価され、kill が起きなかった)。そのため、ここで実際に
         # 検証が失敗した場合はこのステップ自体でジョブを失敗させ、以降の
         # ワークフロー実行者が気づけるようにする。cicd-sensorctl そのものが
-        # 入手できなかった場合 (README「セットアップ」3節、入手経路が
-        # 未検証のため) は、従来どおり警告のみで続行してよいが、
-        # 「検証をスキップした」ことを job summary に残す。
+        # 入手できなかった場合 (ネットワーク障害・rate limit 等) は、
+        # 従来どおり警告のみで続行してよいが、「検証をスキップした」ことを
+        # job summary に残す。
         run: |
           set -uo pipefail
           if command -v cicd-sensorctl >/dev/null 2>&1; then

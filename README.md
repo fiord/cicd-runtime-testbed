@@ -11,6 +11,10 @@
 **このリポジトリは検証用です。production ワークフローにそのまま組み込むものではありません。**
 詳しい設計契約は [`docs/SPEC.md`](docs/SPEC.md) を、安全上の注意点は [`docs/SAFETY.md`](docs/SAFETY.md) を参照してください。
 
+実測結果に基づく既知の不備と、本来やりたい比較テストを成立させるために必要な修正は
+[`docs/REQUIRED-FIXES.md`](docs/REQUIRED-FIXES.md) にまとめてあります
+(upstream `falcosecurity/falco-actions` 側の修正案を含む)。
+
 ---
 
 ## ⚠️ 重要な警告
@@ -336,28 +340,39 @@ falcosecurity/falco-actions/analyze@PIN_ME_SEE_README
 
 タグがない以上、この SHA は**時間とともに古くなります**。定期的に見直してください。
 
-### 3. `cicd-sensorctl` の入手経路について (未検証)
+### 3. `cicd-sensorctl` の入手経路について (実機確認済み)
 
 `sensor-monitor.yml` / `sensor-enforce.yml` は `cicd-sensorctl rule validate` を実行する前に、
-`cicd-sensor/docs/user-guide/self-hosted-install.md` に記載の命名規則
-(`cicd-sensor_<version>_linux_<arch>.tar.gz` に `cicd-sensorctl-linux-<arch>` が入っている)
-から構成した URL パターンで `gh release download v0.0.38 --repo cicd-sensor/cicd-sensor` を
-実行します。
+`cicd-sensor/cicd-sensor` のリリースから `cicd-sensorctl` を取得します。
 
-**この方法は実際のリリース一覧に対して検証できていません。** `cicd-sensor/cicd-sensor` の
-公開 API を確認したところ `v0.0.38` タグの release が見つからず (404)、この時点では
-リポジトリが private である可能性、まだ該当バージョンの release が無い可能性、
-命名規則が異なる可能性のいずれも排除できていません。実行前に必ず:
+**リリースタグは `v0.0.45` ではなく `releases/v0.0.45` という形式です。** 旧版の
+ワークフローはこれを `gh release download v0.0.38` (= 存在しないタグ。しかも
+v0.0.38 は sensor 本体ではなく action 側のバージョン) と書いていたため、
+**これまでの全 run で `release not found` になり、`Validate .cicd-sensor/rules`
+ステップは一度も実行されていませんでした**。この検証さえ動いていれば、
+run 32544606013 の「無効なルール1本でプロジェクト設定全体が agent に届かない」
+事故は事前に防げていました (docs/REQUIRED-FIXES.md R-1)。
+
+現在は以下を実行します (ローカルで実際に成功することを確認済み):
 
 ```sh
-gh release list --repo cicd-sensor/cicd-sensor
-gh release view v0.0.38 --repo cicd-sensor/cicd-sensor
+gh release download "releases/${CICD_SENSOR_VERSION}" \
+    --repo cicd-sensor/cicd-sensor \
+    --pattern "cicd-sensor_*_linux_amd64.tar.gz"
 ```
 
-などで実際のリリース資産名・バージョンを確認し、ワークフロー内の該当ステップ
-(`Install cicd-sensorctl`) を実際の値に合わせて修正してください。`cicd-sensor/cicd-sensor`
-が private repo の場合は、`GH_TOKEN` を読み取り権限のある PAT に差し替える必要があります
-(`github.token` は実行中のリポジトリにしかアクセスできません)。
+- アセット `cicd-sensor_<version>_linux_amd64.tar.gz` の中身は
+  `cicd-sensorctl-linux-amd64` / `cicd-sensor-manager-linux-amd64` /
+  `cicd-sensor-linux-amd64` の3バイナリです。
+- `cicd-sensorctl version` というサブコマンドは**存在しません**
+  (`unknown command: version`)。存在するのは `rule validate` / `rule bundle` /
+  `token generate` / `report attest` / `report html` / `report stepsummary` です。
+  旧版にあった `cicd-sensorctl version || true` は削除しました。
+- バージョンは各ワークフロー冒頭の `env: CICD_SENSOR_VERSION` が単一の
+  source of truth で、`Install cicd-sensorctl` の download タグと
+  `cicd-sensor-action` の `cicd-sensor-version` 入力の両方に使われます。
+  この2つがずれると、ローカル検証は通るのに agent 側ではバンドル検証が
+  落ちる、という上記の事故が再発します。
 
 このステップが失敗しても後続の `cicd-sensor-action` 自体は動きます (rule validate が
 スキップされ、警告が出るだけです)。
@@ -416,7 +431,7 @@ gh release view v0.0.38 --repo cicd-sensor/cicd-sensor
 
 ## `cicd-sensorctl` のインストールについて
 
-上記「セットアップ」の3を参照してください。未検証の推定です。
+上記「セットアップ」の3を参照してください。
 
 ## ライセンス / 出典
 
