@@ -177,6 +177,103 @@ docs/SPEC.md §7 参照)。合わせて `CANARY_SCAP` の証跡粒度要求を�
 既存の3つの N/A 機構 (ツール種別 / 証跡粒度 / `http_request` サポート) は
 維持したまま、この scored/informational の区別とは独立に動く。
 
+## 公平性: ハーネス自身のノイズの除去 (R-3)
+
+**問題 (実測)**: fork leg (falco 0.44.1) が出したアラート 240 件のうち
+**213 件 (89%)** は、シナリオが起こした事象ではなく
+`scenarios/lib/common.sh` が `${RUNNER_TEMP}/cicd-runtime-testbed-log.jsonl`
+に実行ログを追記したことに対する `"Source Code Overwrite"` だった。
+falco の CI/CD ルールは
+
+```
+open_write and fd.directory startswith "/home/runner/work/"
+```
+
+で発火し、その例外は `proc.exepath` が `Runner.Worker` の場合だけである。
+ハーネスは bash から書くのでこの例外に当たらない。つまり **テスト装置
+自身が測定対象を汚染していた**。
+
+**採った対応**: どちらかのツールに除外ルールを足すのではなく、
+**ハーネス側をワークスペース外に退避させた**。
+`scenarios/lib/common.sh` の既定値を次のように変更した。
+
+| 変数 | 変更前 | 変更後 |
+| --- | --- | --- |
+| `TESTBED_TMPDIR` | `${RUNNER_TEMP:-/tmp}/cicd-runtime-testbed` | `/var/tmp/cicd-runtime-testbed` |
+| `TESTBED_LOG` | `${RUNNER_TEMP:-/tmp}/cicd-runtime-testbed-log.jsonl` | `${TESTBED_TMPDIR}/testbed-log.jsonl` |
+
+**なぜこれが公平か**: この変更はどちらのツールの設定にも触れていない。
+
+- **falco**: ルールファイルは一切変更していない。出荷時の
+  `falco_cicd_rules.yaml` がそのまま適用される。単に、ハーネスが
+  監視対象ディレクトリに書き込むのをやめただけである。
+- **cicd-sensor**: `.cicd-sensor/rules/testbed.yaml` のルールは
+  `path.endsWith("<basename>")` で照合しており、ディレクトリ位置に
+  依存しない。よって発火条件は変更前後で同一である。ベースラインルール
+  についても、対象は `~/.aws/credentials` などの絶対パスであり
+  `$RUNNER_TEMP` には依存しない。
+
+「同じ除外を両ツールに適用する」という代替案 (falco に
+`/home/runner/work/_temp/cicd-runtime-testbed*` の除外ルールを渡す) は
+採らなかった。falco 側だけ出荷時と異なるルールセットで測ることになり、
+かつ cicd-sensor 側には対応する「除外」が存在しない (そもそも発火して
+いない) ため、非対称になるからである。
+
+**この変更の副作用 (結論に影響するので明記)**:
+`scenarios/05-memfd-exec.sh` がドライバ `.py` を `$TESTBED_TMPDIR` に
+書くため、falco はこれを `"Source Code Overwrite"` として検知していた。
+変更後、falco は **05 を一切検知しなくなる**。これは検知能力が落ちた
+のではなく、**もともと 05 の本質 (memfd 経由の fileless 実行) を
+検知していたわけではなく、ドライバスクリプトの作成という副作用を
+偶然拾っていただけ**であることが可視化されたということである。
+結果表では 05 を「両ツールとも未検知」として扱う (R-11 参照)。
+
+## 公平性: ルールセットの母数が違うため検知件数は直接比較できない (R-4)
+
+**測定された非対称性**:
+
+| | falco (`falco_cicd_rules.yaml`) | cicd-sensor (ベースライン + testbed) |
+| --- | --- | --- |
+| CI/CD 向けルール数 | 6 | `rule_count=64` |
+| 実測で発火した種類数 | 1 (`"Source Code Overwrite"`) | 9 |
+
+**この 1 対 9 を「検知能力の差」として提示してはならない。**
+母数が 6 対 64 である以上、これは大部分がルールセットの規模の差である。
+
+**採らなかった選択肢**: cicd-sensor の 64 本のベースラインルールに
+対応する falco ルールを手書きして渡す、という案は採用しなかった。
+それは「両ツールで何が出荷されているか」ではなく「我々が何を書けるか」
+を測ることになり、この testbed の目的 (docs/SPEC.md §1: 出荷時構成での
+比較) から外れる。書き手が falco 側のルールを書く以上、cicd-sensor の
+ルールを写経した falco ルールが cicd-sensor と同じものを検知するのは
+当然で、比較として無意味である。
+
+**採った対応**:
+
+1. `falco-live.yml` の観測用アサート
+   (`Assert (observational): CI/CD rules loaded?`) を拡張し、
+   **falco 標準ルールセット (`/etc/falco/falco_rules.yaml`) が実際に
+   ロードされているか**も記録する。falco の既定 `falco.yaml` の
+   `rules_files:` は `/etc/falco/falco_rules.yaml` /
+   `falco_rules.local.yaml` / `rules.d` を含むため、live モードでも
+   標準ルールはロードされている**はず**である
+   (R-4 本文の「live では cicd_rules.yaml しかロードしていない」という
+   記述はこの点で疑わしい)。これを推測ではなく実測で確定させる。
+   これは falco の構成を変える変更ではなく、**何がロードされたかを
+   記録するだけ**の観測ステップである。
+2. 結果の提示単位を「アラート件数」ではなく
+   **「シナリオごとに、出荷時構成でそのツールが何か気づいたか (Yes/No)」**
+   にする。件数は参考値として併記するに留める。
+
+**結論に明記すること**: 「falco 1 種類 vs cicd-sensor 9 種類」という
+数字は、**そのまま比較できない**。比較できるのは
+「01-credential-access を falco の出荷時 CI/CD ルールは検知しないが
+cicd-sensor の出荷時ルールは検知する」といった、シナリオ単位の
+Yes/No である。これは製品の設計思想の差 (falco の CI/CD ルールは
+「ソースコード改変」「パッケージマネージャからの実行」といった
+CI 固有の少数の観点に絞っており、認証情報アクセスの網羅的な検知は
+対象にしていない) を反映しており、それ自体が結論として意味を持つ。
+
 ## ワークフローとテレメトリの対応
 
 | ワークフロー | 生成する telemetry アーティファクト | 検証目的 |
@@ -191,4 +288,9 @@ docs/SPEC.md §7 参照)。合わせて `CANARY_SCAP` の証跡粒度要求を�
 
 - `CANARY_ENV` シークレットが登録されていること (未登録でも動くが、その項目の検証意義が失われる。README 参照)
 - falco-actions の SHA が `PIN_ME_SEE_README` から実際のコミット SHA に置換されていること (README 参照)
-- `cicd-sensorctl` の入手経路 (README 参照) が実際に機能することを事前に確認していること (未検証の推定のため)
+- `cicd-sensorctl` の入手経路 (README「セットアップ」3節参照) は実機確認済み。
+  リリースタグが `releases/<version>` 形式である点に注意 (docs/REQUIRED-FIXES.md R-1)
+- 各ワークフローの `env: CICD_SENSOR_VERSION` が v0.0.46 以上であること。
+  下げる場合は `.cicd-sensor/rules/testbed.yaml` の `testbed_canary_http_host`
+  も同時に無効化しないと、プロジェクト設定全体が agent に届かなくなる
+  (docs/REQUIRED-FIXES.md R-2)

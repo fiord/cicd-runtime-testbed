@@ -220,6 +220,22 @@ OK: 1 file(s) bundled and validated
 
 ### R-3 【高】falco 側の自己ノイズを除去する
 
+> **状態: 対応済み (静的検証のみ / CI 未実行)。判断が入っているので要レビュー。**
+> 「両ツールに同じ除外を適用する」ではなく、**ハーネス側をワークスペース
+> 外に退避させる**方を選んだ。`scenarios/lib/common.sh` の
+> `TESTBED_TMPDIR` を `/var/tmp/cicd-runtime-testbed`、`TESTBED_LOG` を
+> `${TESTBED_TMPDIR}/testbed-log.jsonl` に変更 (falco-live.yml の回収側も
+> 追随)。どちらのツールの設定にも触れていないため構造的に対称で、
+> falco は出荷時ルールのまま測れる (cicd-sensor 側のルールは
+> `path.endsWith(<basename>)` 照合なのでディレクトリに依存しない)。
+> 理由と副作用は `docs/TEST-PLAN.md`「公平性: ハーネス自身のノイズの除去
+> (R-3)」に記載。
+>
+> **副作用 (要確認)**: falco が 05-memfd-exec で唯一出していたアラートは
+> `$TESTBED_TMPDIR` 配下のドライバ `.py` 作成に対する
+> "Source Code Overwrite" だったため、この変更後 falco は 05 を
+> 一切検知しなくなる。R-11 の扱いに反映済み。
+
 fork leg の 240 件のアラートのうち **213 件 (89%) が
 `${RUNNER_TEMP}/cicd-runtime-testbed-log.jsonl` への書き込み**、つまり
 テストベッド自身のログ出力に対する "Source Code Overwrite" である。
@@ -235,6 +251,16 @@ fork leg の 240 件のアラートのうち **213 件 (89%) が
 除外内容を `docs/TEST-PLAN.md` に明記すること (公平性の担保)。
 
 ### R-4 【高】falco 側に比較可能なルールセットを与える
+
+> **状態: 一部対応 (方針変更あり) / 要レビュー。**
+> 「cicd-sensor 相当の falco カスタムルールを手書きして渡す」案は
+> **採用しなかった**。それは出荷時構成の比較ではなく「我々が何を書けるか」
+> の比較になり、docs/SPEC.md §1 の目的から外れるため。
+> 代わりに (1) `falco-live.yml` の観測アサートを拡張して標準ルールセットが
+> ロードされているかを実測で記録し、(2) 結論の提示単位を「アラート件数」
+> から「シナリオごとの Yes/No」に変え、(3) **「ルールセットの母数
+> (6 対 64) が違うので検知件数の直接比較には意味が無い」ことを
+> `docs/TEST-PLAN.md` に明記した** (本項が代替として要求している対応)。
 
 fork leg でも analyze でも、発火したのは "Source Code Overwrite" ただ 1 種類。
 一方 cicd-sensor は 9 種類のルールが発火している (下表)。

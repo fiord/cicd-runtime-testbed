@@ -742,8 +742,13 @@ jobs:
           fi
           # scenarios/lib/common.sh が書く実行ログ。仕様必須ではないが、
           # 検知結果の突き合わせに有用なため追加で回収する。
-          if [ -n "${RUNNER_TEMP:-}" ] && [ -f "${RUNNER_TEMP}/cicd-runtime-testbed-log.jsonl" ]; then
-            cp "${RUNNER_TEMP}/cicd-runtime-testbed-log.jsonl" telemetry/testbed-log.jsonl
+          # パスは docs/REQUIRED-FIXES.md R-3 でワークスペース外
+          # (/var/tmp/cicd-runtime-testbed) に移した。$RUNNER_TEMP 配下に
+          # 書くと falco の "Source Code Overwrite" ルールが
+          # ハーネス自身の書き込みで毎回発火してしまうため。
+          testbed_log="${TESTBED_LOG:-/var/tmp/cicd-runtime-testbed/testbed-log.jsonl}"
+          if [ -f "${testbed_log}" ]; then
+            cp "${testbed_log}" telemetry/testbed-log.jsonl
           fi
 
       - name: Upload telemetry-falco-live-${{ matrix.falco-version }}
@@ -1418,8 +1423,13 @@ jobs:
           fi
           # scenarios/lib/common.sh が書く実行ログ。仕様必須ではないが、
           # 検知結果の突き合わせに有用なため追加で回収する。
-          if [ -n "${RUNNER_TEMP:-}" ] && [ -f "${RUNNER_TEMP}/cicd-runtime-testbed-log.jsonl" ]; then
-            cp "${RUNNER_TEMP}/cicd-runtime-testbed-log.jsonl" telemetry/testbed-log.jsonl
+          # パスは docs/REQUIRED-FIXES.md R-3 でワークスペース外
+          # (/var/tmp/cicd-runtime-testbed) に移した。$RUNNER_TEMP 配下に
+          # 書くと falco の "Source Code Overwrite" ルールが
+          # ハーネス自身の書き込みで毎回発火してしまうため。
+          testbed_log="${TESTBED_LOG:-/var/tmp/cicd-runtime-testbed/testbed-log.jsonl}"
+          if [ -f "${testbed_log}" ]; then
+            cp "${testbed_log}" telemetry/testbed-log.jsonl
           fi
 
       - name: Upload telemetry-falco-live-forked-0.44.1

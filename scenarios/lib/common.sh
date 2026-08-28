@@ -39,12 +39,38 @@ TESTBED_CANARIES_FILE="${TESTBED_REPO_ROOT}/canaries/canaries.env"
 # 00-seed.sh / 05-memfd-exec.sh / 06-anti-forensics.sh のように、別々の
 # ステップ (別プロセス) として実行されるスクリプト間で同じ一時ファイルを
 # 参照し続けたい場合があるため、乱数を使わない固定パスにしている。
-: "${TESTBED_TMPDIR:=${RUNNER_TEMP:-/tmp}/cicd-runtime-testbed}"
+#
+# なぜ $RUNNER_TEMP ではなく /var/tmp なのか (docs/REQUIRED-FIXES.md R-3):
+#   GitHub-hosted runner の $RUNNER_TEMP は /home/runner/work/_temp に
+#   解決される。falco の CI/CD ルール "Source Code Overwrite" は
+#     open_write and fd.directory startswith "/home/runner/work/"
+#   で発火し、その例外は proc.exepath が Runner.Worker の場合のみである。
+#   ハーネス自身 (bash) が $RUNNER_TEMP 配下に一時ファイルや実行ログを
+#   書くと、この例外に当たらず**テストハーネス自身の書き込みが
+#   毎回アラートになる**。実測では falco-live の全アラート 240 件のうち
+#   213 件がこれで、シナリオが起こした事象を評価できない状態だった。
+#
+#   これは「falco 側のルールを緩める」のではなく**ハーネス側を
+#   ワークスペース外に退避させる**修正である点が重要で、
+#   ツール中立である:
+#     - falco  : ハーネスの自己ノイズが消え、シナリオ由来の
+#                書き込みだけが残る。ルールには一切手を入れていない。
+#     - cicd-sensor: testbed.yaml のルールは path.endsWith(<basename>)
+#                で照合しており、ディレクトリを問わない。よって
+#                発火条件は変わらない。
+#
+#   /var/tmp を選んだ理由: /tmp と違い systemd-tmpfiles の短期削除の
+#   対象になりにくく、GitHub-hosted runner ではジョブ全体を通じて
+#   存続し、かつワークスペース (/home/runner/work) の外にある。
+: "${TESTBED_TMPDIR:=/var/tmp/cicd-runtime-testbed}"
 mkdir -p "${TESTBED_TMPDIR}" 2>/dev/null || true
 export TESTBED_TMPDIR
 
 # --- 実行ログ (JSONL) ----------------------------------------------------
-: "${TESTBED_LOG:=${RUNNER_TEMP:-/tmp}/cicd-runtime-testbed-log.jsonl}"
+# $TESTBED_TMPDIR と同じ理由でワークスペース外に置く (上のコメント参照)。
+# ワークフローがアーティファクトに収集するときは、この既定値ではなく
+# 環境変数 $TESTBED_LOG を参照すること。
+: "${TESTBED_LOG:=${TESTBED_TMPDIR}/testbed-log.jsonl}"
 export TESTBED_LOG
 
 # 現在実行中のステップ名 (note() が参照する)
