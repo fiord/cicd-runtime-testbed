@@ -509,6 +509,37 @@ jobs:
             ERROR_FOUND="yes"
           fi
 
+          # 標準ルールセット (/etc/falco/falco_rules.yaml) がロードされたか
+          # (docs/REQUIRED-FIXES.md R-4 / docs/TEST-PLAN.md「公平性:
+          # ルールセットの母数」)。
+          #
+          # なぜ観測するのか: R-4 の監査本文は「live モードでは
+          # cicd_rules.yaml しかロードしていない」としているが、falco の
+          # 既定 falco.yaml の rules_files: は /etc/falco/falco_rules.yaml /
+          # falco_rules.local.yaml / rules.d を含むため、標準ルールも
+          # ロードされている**はず**である。falco 側の検知件数が
+          # 1 種類しか出ない理由が「標準ルールが無いから」なのか
+          # 「標準ルールはあるがこれらのシナリオに反応しないから」なのかで
+          # 結論がまったく変わるので、推測せず実測で確定させる。
+          #
+          # これは falco の構成を変える変更ではなく、何がロードされたかを
+          # 記録するだけの観測である (両ツールとも出荷時構成のまま測る、
+          # という方針を崩さない)。
+          #
+          # 注意: パターン `falco_rules\.yaml` は `falco_cicd_rules.yaml`
+          # には一致しない (後者は "cicd_rules.yaml" で終わる) ので、
+          # 上の CICD_LOADED 判定と混同しない。
+          STD_RULES="unknown"
+          if [ -f "$LOG_FILE" ]; then
+            if grep -qiE "falco_rules\.yaml" "$LOG_FILE"; then
+              STD_RULES="yes"
+            else
+              STD_RULES="no_mention"
+            fi
+          else
+            STD_RULES="n/a"
+          fi
+
           STARTUP_MARKER="unknown"
           if [ -f "$MARKER_STATUS_FILE" ]; then
             STARTUP_MARKER="$(cat "$MARKER_STATUS_FILE")"
@@ -561,6 +592,29 @@ jobs:
               grep -iE "$ERROR_REGEX" "$LOG_FILE" | sed 's/^/  /' | head -20
               echo '  ```'
             fi
+            echo ""
+            echo "- 標準ルールセット (\`/etc/falco/falco_rules.yaml\`) への言及: **${STD_RULES}**"
+            case "$STD_RULES" in
+              yes)
+                echo "  (falco 既定の \`rules_files:\` どおり標準ルールもロードされている。"
+                echo "  したがって falco 側の発火種類数の少なさは「ルールが無いから」ではなく"
+                echo "  「標準ルールがこれらのシナリオに反応しないから」である。該当行:)"
+                echo '  ```'
+                grep -iE "falco_rules\.yaml" "$LOG_FILE" | sed 's/^/  /' | head -20
+                echo '  ```'
+                ;;
+              no_mention)
+                echo "  (起動ログに言及が無い。falco が読み込んだルールファイルを"
+                echo "  逐一ログ出力しないバージョンの可能性もあるため、"
+                echo "  **「ロードされていない」と断定はできない**。)"
+                ;;
+              *)
+                echo "  (起動ログが無く判定不能。)"
+                ;;
+            esac
+            echo ""
+            echo "  → この観測は docs/TEST-PLAN.md「公平性: ルールセットの母数が違うため"
+            echo "  検知件数は直接比較できない (R-4)」の根拠として使うこと。"
             echo ""
             echo "- 起動完了マーカー (\`Enabled event sources\` / \`Opening 'syscall' source\`) 検出: **${STARTUP_MARKER}**"
             case "$STARTUP_MARKER" in
@@ -1179,6 +1233,37 @@ jobs:
             ERROR_FOUND="yes"
           fi
 
+          # 標準ルールセット (/etc/falco/falco_rules.yaml) がロードされたか
+          # (docs/REQUIRED-FIXES.md R-4 / docs/TEST-PLAN.md「公平性:
+          # ルールセットの母数」)。
+          #
+          # なぜ観測するのか: R-4 の監査本文は「live モードでは
+          # cicd_rules.yaml しかロードしていない」としているが、falco の
+          # 既定 falco.yaml の rules_files: は /etc/falco/falco_rules.yaml /
+          # falco_rules.local.yaml / rules.d を含むため、標準ルールも
+          # ロードされている**はず**である。falco 側の検知件数が
+          # 1 種類しか出ない理由が「標準ルールが無いから」なのか
+          # 「標準ルールはあるがこれらのシナリオに反応しないから」なのかで
+          # 結論がまったく変わるので、推測せず実測で確定させる。
+          #
+          # これは falco の構成を変える変更ではなく、何がロードされたかを
+          # 記録するだけの観測である (両ツールとも出荷時構成のまま測る、
+          # という方針を崩さない)。
+          #
+          # 注意: パターン `falco_rules\.yaml` は `falco_cicd_rules.yaml`
+          # には一致しない (後者は "cicd_rules.yaml" で終わる) ので、
+          # 上の CICD_LOADED 判定と混同しない。
+          STD_RULES="unknown"
+          if [ -f "$LOG_FILE" ]; then
+            if grep -qiE "falco_rules\.yaml" "$LOG_FILE"; then
+              STD_RULES="yes"
+            else
+              STD_RULES="no_mention"
+            fi
+          else
+            STD_RULES="n/a"
+          fi
+
           STARTUP_MARKER="unknown"
           if [ -f "$MARKER_STATUS_FILE" ]; then
             STARTUP_MARKER="$(cat "$MARKER_STATUS_FILE")"
@@ -1234,6 +1319,29 @@ jobs:
               grep -iE "$ERROR_REGEX" "$LOG_FILE" | sed 's/^/  /' | head -20
               echo '  ```'
             fi
+            echo ""
+            echo "- 標準ルールセット (\`/etc/falco/falco_rules.yaml\`) への言及: **${STD_RULES}**"
+            case "$STD_RULES" in
+              yes)
+                echo "  (falco 既定の \`rules_files:\` どおり標準ルールもロードされている。"
+                echo "  したがって falco 側の発火種類数の少なさは「ルールが無いから」ではなく"
+                echo "  「標準ルールがこれらのシナリオに反応しないから」である。該当行:)"
+                echo '  ```'
+                grep -iE "falco_rules\.yaml" "$LOG_FILE" | sed 's/^/  /' | head -20
+                echo '  ```'
+                ;;
+              no_mention)
+                echo "  (起動ログに言及が無い。falco が読み込んだルールファイルを"
+                echo "  逐一ログ出力しないバージョンの可能性もあるため、"
+                echo "  **「ロードされていない」と断定はできない**。)"
+                ;;
+              *)
+                echo "  (起動ログが無く判定不能。)"
+                ;;
+            esac
+            echo ""
+            echo "  → この観測は docs/TEST-PLAN.md「公平性: ルールセットの母数が違うため"
+            echo "  検知件数は直接比較できない (R-4)」の根拠として使うこと。"
             echo ""
             echo "- 起動完了マーカー (\`Enabled event sources\` / \`Opening 'syscall' source\`) 検出: **${STARTUP_MARKER}**"
             case "$STARTUP_MARKER" in
