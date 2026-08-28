@@ -391,14 +391,25 @@ gh release download "releases/${CICD_SENSOR_VERSION}" \
 | `falco-analyze.yml` | falco analyze モードでの検知と生キャプチャ | workflow_dispatch。`upload_raw_capture` (既定 false) で生キャプチャの取り扱いを制御 | `analyze` ジョブは falco-actions/analyze を呼ぶ前に、`falco-version: 0.39.2` (falcosecurity/falco-no-driver の実際の上限) が Docker Hub に実在するかを preflight ステップが確認する。`telemetry-falco-analyze` アーティファクトに job summary・抽出情報 (processes/connections/dns/containers/written-files/hashes) が入る。`upload_raw_capture: true` のときのみ `capture.scap` も含む。同梱ルール (`required_engine_version: 0.43.0`) を 0.39.2 エンジンが実際にロードできたかは job summary の "required_engine_version" セクションを参照 (要手動確認) |
 | `sensor-monitor.yml` | cicd-sensor の検知 (自作ルールでの kill は起きない想定。ただし `monitor_mode` はコミット値 `false` でリポジトリ全体共通、詳細は既知の制約「🚨🚨 最も根本的な事実」参照) | workflow_dispatch (入力なし) | 全シナリオ (00〜07。07 は detect / collect ルール専用) が実行され、`telemetry-cicd-sensor-monitor` に HTML レポートと attestation predicate が入る。collect-telemetry ジョブは取得できたアーティファクトを `telemetry-manifest.txt` と job summary に明記し、1 つも取得できなければジョブを失敗させる |
 | `sensor-enforce.yml` | cicd-sensor の kill 動作の検証。**成功が正常** | workflow_dispatch (入力なし) | `assert` ジョブが **成功** すれば kill が確認できたことを意味する。失敗した場合は kill が起きなかったことを意味し、要調査。**このワークフローが実行する `scenarios/90-killme.sh` はカナリアを注入しない** (`load_canaries` を呼ばない) ため、この run の run_id は `leak-scan.yml` の入力にはできない (対象外として弾かれる)。collect-telemetry ジョブのテレメトリ収集完全性チェックは `sensor-monitor.yml` と同様 |
-| `leak-scan.yml` | 漏洩マトリクスの生成 (T3) | workflow_dispatch。`run_id` に `falco-live.yml` / `falco-analyze.yml` / `sensor-monitor.yml` いずれかの run ID を入力 (`sensor-enforce.yml` の run ID は不可。上記参照) | 対象 run の `telemetry-*` アーティファクトを横断的に走査し、job summary と (常に) ステップログの両方にカナリアごとの 期待 vs 実測 のマトリクスを出す。走査対象に含まれないツール向けのカナリア (`CANARY_SCAP` は falco 固有) は ⚠️ ではなく N/A (対象外) と表示され、判定にも exit code にも影響しない。**証跡の粒度が足りない場合も同様に N/A になる** (例: cicd-sensor の attestation predicate 集計のみで、HTML レポートや falco の詳細テレメトリが無い場合、`CANARY_PATH` 等の「詳細以上」を要求するカナリアは N/A (この証跡粒度では観測不能) と表示される。`CANARY_DNS` は predicate だけでも判定対象)。**終了コードが 2 種類あり、意味が異なる**: exit 1 = 期待と実測の乖離あり (「発見」。仮説と現実が食い違ったことを目立たせるための意図的な失敗で、job summary の ⚠️ 行と `::error::` 注釈にどのカナリアが食い違ったかが出る)、exit 2 = 走査不成立 (「テスト自体が成立していない」。対象 run に `telemetry-*` アーティファクトが無かった、または `sensor-enforce.yml` の run を誤って指定した等で走査対象 0 件/対象外になったケース。カナリアの判定は行なわれない)。どちらもワークフローとしては失敗 (赤) になるが、job summary の内容でどちらかを区別できる |
+| `leak-scan.yml` | 漏洩マトリクスの生成 (T3) | **workflow_run (自動)**: `falco-live.yml` / `falco-analyze.yml` / `sensor-monitor.yml` の完了で自動起動し、その run を対象にする。**workflow_dispatch (手動)**: `run_id` に上記いずれかの run ID を入力 (`sensor-enforce.yml` の run ID は不可。上記参照) | 対象 run の `telemetry-*` アーティファクトを横断的に走査し、job summary と (常に) ステップログの両方にカナリアごとの 期待 vs 実測 のマトリクスを出す。走査対象に含まれないツール向けのカナリア (`CANARY_SCAP` は falco 固有) は ⚠️ ではなく N/A (対象外) と表示され、判定にも exit code にも影響しない。**証跡の粒度が足りない場合も同様に N/A になる** (例: cicd-sensor の attestation predicate 集計のみで、HTML レポートや falco の詳細テレメトリが無い場合、`CANARY_PATH` 等の「詳細以上」を要求するカナリアは N/A (この証跡粒度では観測不能) と表示される。`CANARY_DNS` は predicate だけでも判定対象)。**終了コードが 2 種類あり、意味が異なる**: exit 1 = 期待と実測の乖離あり (「発見」。仮説と現実が食い違ったことを目立たせるための意図的な失敗で、job summary の ⚠️ 行と `::error::` 注釈にどのカナリアが食い違ったかが出る)、exit 2 = 走査不成立 (「テスト自体が成立していない」。対象 run に `telemetry-*` アーティファクトが無かった、または `sensor-enforce.yml` の run を誤って指定した等で走査対象 0 件/対象外になったケース。カナリアの判定は行なわれない)。どちらもワークフローとしては失敗 (赤) になるが、job summary の内容でどちらかを区別できる |
 
 ### 推奨実行順序
 
 1. `sensor-monitor.yml` と `falco-live.yml` / `falco-analyze.yml` を先に実行し、検知結果とテレメトリを集める (T1 前半 / T2)。
 2. `sensor-enforce.yml` を実行し、kill が実際に起きることを確認する (T1 後半)。
-3. 1 で得た run_id (`sensor-monitor.yml` / `falco-live.yml` / `falco-analyze.yml` のいずれか。
-   `sensor-enforce.yml` の run_id は使えない) を使って `leak-scan.yml` を実行し、T3 を確認する。
+3. `leak-scan.yml` が 1 の各ワークフローの完了時に `workflow_run` で**自動起動**し、
+   その run を対象に T3 を確認する (手動実行は不要)。
+   過去の run を測り直したい場合だけ、1 で得た run_id
+   (`sensor-monitor.yml` / `falco-live.yml` / `falco-analyze.yml` のいずれか。
+   `sensor-enforce.yml` の run_id は使えない) を `workflow_dispatch` の
+   `run_id` 入力に渡して手動実行する。
+
+   > ⚠️ `workflow_run` トリガはデフォルトブランチ上のワークフロー定義でしか
+   > 発火しない。ブランチで検証している間は手動起動を使うこと。
+   >
+   > 各検知ワークフローの末尾から `gh workflow run` で起動する方式は採れない。
+   > `GITHUB_TOKEN` で起動した `workflow_dispatch` は GitHub の再帰防止により
+   > **新しい run を作らない** (エラーにもならず黙って何も起きない)。
 
 ---
 

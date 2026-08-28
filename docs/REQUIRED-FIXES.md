@@ -392,6 +392,15 @@ assert ジョブは success を報告した**。
 
 ### R-9 【低】leak-scan のカナリア照合を case-insensitive にする
 
+> **状態: 対応済み (この作業以前から実装済み。ローカルで実証)。**
+> `tools/scan-leaks.sh` は既にカナリア本走査を `grep -aFio`
+> (大文字小文字非依存・固定文字列・バイナリ安全) で行なっており、
+> `leak-report.json` に `"canary_match_mode": "case_insensitive"` を
+> 出力している。念のためローカルで、小文字化された
+> `cnry-dns-donotuse-18ebf5.test.invalid.<サーチドメイン>` に対して
+> 元の大小文字混在のカナリア値がヒットすることを確認した (1 件)。
+> **コード変更は行なっていない。**
+
 DNS カナリアは telemetry 上で **小文字化されて**記録される:
 
 ```
@@ -402,6 +411,26 @@ cnry-dns-donotuse-18ebf5.test.invalid.<runner の Azure 内部サーチドメイ
 `grep -i` 相当にすること。
 
 ### R-10 【低】leak-scan を各検知ワークフローから自動起動する
+
+> **状態: 対応済み (静的検証のみ / CI 未実行)。**
+> `leak-scan.yml` に `workflow_run` トリガを追加し、falco-live /
+> falco-analyze / sensor-monitor の完了で自動起動するようにした。
+> 対象 run_id はワークフローレベルの
+> `env: TARGET_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.run_id }}`
+> に一本化し、以降のステップは `inputs.run_id` を直接参照しない。
+> `conclusion` が cancelled / skipped の run はスキップするが、
+> **failure はスキップしない** (テレメトリのアップロードは
+> `if: always()` なので残っており、むしろ走査価値がある)。
+>
+> 本項が挙げるもう一方の案 (`gh workflow run`) は採れない:
+> **GITHUB_TOKEN で起動した workflow_dispatch は GitHub の再帰防止に
+> より新しい run を作らない** (エラーにもならず黙って何も起きない)。
+> PAT を置くのは docs/SAFETY.md の方針に反するため、workflow_run に
+> した。
+>
+> **制約 (要認識)**: `workflow_run` はデフォルトブランチ上のワークフロー
+> 定義でしか発火しない。ブランチで検証している間は手動起動が必要。
+> README / docs/TEST-PLAN.md にも明記した。
 
 現在 leak-scan は `run_id` を手で渡す `workflow_dispatch` 専用で、
 その結果 **cicd-sensor に対する T3 は 1 commit 前のツールコードでしか

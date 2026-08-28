@@ -16,6 +16,14 @@
                           90-killme.sh はカナリアを注入しないため)
 ```
 
+**3 は既定では自動で走る** (docs/REQUIRED-FIXES.md R-10)。`leak-scan.yml`
+は 1 の 3 ワークフローの完了を `workflow_run` で拾い、その run を対象に
+自動起動する。手で `run_id` を渡す `workflow_dispatch` は、過去の run を
+測り直したいときのために残してある。
+
+> ⚠️ `workflow_run` トリガはデフォルトブランチ上のワークフロー定義でしか
+> 発火しない。ブランチで検証している間は手動起動を使うこと。
+
 `monitor_mode` は `.cicd-sensor/config.yaml` のコミット値で決まり、
 `cicd-sensor-action` がコミット SHA から設定を取得する仕様上
 （`docs/SPEC.md` §5）、ワークフローごとに切り替えることはできない。
@@ -282,7 +290,7 @@ CI 固有の少数の観点に絞っており、認証情報アクセスの網�
 | `falco-analyze.yml` | `telemetry-falco-analyze` | T1 (analyze 検知)、T2 (抽出情報の網羅確認) |
 | `sensor-monitor.yml` | `telemetry-cicd-sensor-monitor` | T1 (検知、kill なし)、T2 |
 | `sensor-enforce.yml` | `telemetry-cicd-sensor-enforce` (+ `assert` ジョブの成否が T1 の kill 判定そのもの) | T1 (kill)。**カナリアを注入しないため T3 (leak-scan.yml) の対象にはできない** |
-| `leak-scan.yml` | `leak-report-<run_id>` | T3 (`falco-live.yml` / `falco-analyze.yml` / `sensor-monitor.yml` いずれかの telemetry を横断走査。`sensor-enforce.yml` は対象外) |
+| `leak-scan.yml` | `leak-report-<run_id>` | T3 (`falco-live.yml` / `falco-analyze.yml` / `sensor-monitor.yml` いずれかの telemetry を横断走査。`sensor-enforce.yml` は対象外)。**3 ワークフローの完了で `workflow_run` により自動起動する** (R-10) |
 
 ## 前提条件
 

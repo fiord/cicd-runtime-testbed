@@ -7,8 +7,27 @@
 #   に出す。
 #
 #   falco-live.yml / falco-analyze.yml / sensor-monitor.yml の
-#   いずれかを先に実行し、その run_id を入力として与える。
+#   いずれかを先に実行し、その run_id を対象にする。
 #   leak-scan.yml 自身はカナリアを注入するシナリオを実行しない。
+#
+#   起動方法は 2 つある (docs/REQUIRED-FIXES.md R-10):
+#     1. workflow_run (自動): 上記 3 ワークフローのいずれかが完了すると
+#        自動的に走る。対象 run_id は github.event.workflow_run.id。
+#        これを入れる前は run_id を手で渡す workflow_dispatch 専用だった
+#        ため、**cicd-sensor に対する T3 は 1 commit 前のツールコードで
+#        しか測定されていない**という状態が生じていた。
+#     2. workflow_dispatch (手動): run_id 入力で任意の過去 run を対象に
+#        できる。過去の run を測り直したいときに使う。
+#
+#   なぜ `gh workflow run` を各ワークフローの末尾に足さなかったか:
+#   GITHUB_TOKEN で起動した workflow_dispatch は GitHub の再帰防止に
+#   より**新しい run を作らない** (エラーにもならず、黙って何も起きない)。
+#   PAT を持ち込めば動くが、そのために書き込み権限のあるトークンを
+#   リポジトリに置くのは docs/SAFETY.md の方針に反する。workflow_run は
+#   GITHUB_TOKEN の制約を受けないため、こちらを採用した。
+#
+#   ⚠️ workflow_run トリガはデフォルトブランチ上のワークフロー定義でしか
+#   発火しない。ブランチで検証している間は workflow_dispatch を使うこと。
 #
 #   ⚠️ sensor-enforce.yml の run_id は対象にできない。
 #   sensor-enforce.yml が実行する scenarios/90-killme.sh は
@@ -39,11 +58,40 @@ on:
         type: string
         required: true
 
+  # docs/REQUIRED-FIXES.md R-10: 検知ワークフローの完了で自動起動する。
+  # ここに列挙するのは各ワークフローファイルの `name:` の値そのもの
+  # (ファイル名ではない)。sensor-enforce はカナリアを注入しないので
+  # 意図的に含めない (含めると必ず失敗する。上のガードステップ参照)。
+  workflow_run:
+    workflows:
+      - "falco-live: detection scenarios (live mode, engine-version matrix + upstream/fork comparison)"
+      - "falco-analyze: detection scenarios (analyze mode, capture.scap)"
+      - "sensor-monitor: cicd-sensor detection scenarios (monitor_mode: false, committed)"
+    types:
+      - completed
+
 permissions: {}
+
+# 走査対象の run_id をここで一本化する。
+#   - workflow_run 起動: github.event.workflow_run.id (完了した検知 run)
+#   - workflow_dispatch 起動: inputs.run_id (手入力)
+# 以降のステップは inputs.run_id を直接参照せず、必ずこの env を使う。
+env:
+  TARGET_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.run_id }}
 
 jobs:
   scan:
-    name: "scan telemetry-* artifacts from run ${{ inputs.run_id }}"
+    name: "scan telemetry-* artifacts of the target run"
+    # workflow_run 起動のとき、検知 run が cancelled / skipped で終わって
+    # いたらテレメトリが揃っていないので走らせない。failure は除外しない:
+    # 各ワークフローの telemetry アップロードは `if: always()` なので、
+    # ジョブが失敗していてもテレメトリは残っており、むしろその run こそ
+    # 走査する価値がある (falco-live は engine-version 不整合で失敗する
+    # ことが想定内)。
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion != 'cancelled' &&
+       github.event.workflow_run.conclusion != 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -55,18 +103,41 @@ jobs:
       - name: Checkout cicd-runtime-testbed
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # どの run を対象にしているかを、ジョブログと job summary の両方に
+      # 残す。workflow_run 起動だとジョブ名から対象 run が分からないため
+      # (job の name: では env コンテキストが使えない)、ここで明示する。
+      - name: Resolve target run
+        run: |
+          set -uo pipefail
+          if [ -z "${TARGET_RUN_ID}" ]; then
+            echo "::error::TARGET_RUN_ID is empty. workflow_dispatch なら run_id 入力を、workflow_run なら github.event.workflow_run.id を確認すること。"
+            exit 1
+          fi
+          {
+            echo "## leak-scan target"
+            echo ""
+            echo "- Trigger: \`${{ github.event_name }}\`"
+            echo "- Target run id: \`${TARGET_RUN_ID}\`"
+            echo "- Target run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${TARGET_RUN_ID}"
+            if [ "${{ github.event_name }}" = "workflow_run" ]; then
+              echo "- Triggering workflow: \`${{ github.event.workflow_run.name }}\`"
+              echo "- Triggering run conclusion: \`${{ github.event.workflow_run.conclusion }}\`"
+            fi
+            echo ""
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Download telemetry-* artifacts from target run
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: "telemetry-*"
           path: downloaded-artifacts
-          run-id: ${{ inputs.run_id }}
+          run-id: ${{ env.TARGET_RUN_ID }}
           github-token: ${{ github.token }}
           merge-multiple: false
 
       - name: List downloaded artifacts
         run: |
-          echo "Downloaded telemetry artifacts from run ${{ inputs.run_id }}:"
+          echo "Downloaded telemetry artifacts from run ${{ env.TARGET_RUN_ID }}:"
           find downloaded-artifacts -maxdepth 2 -mindepth 1 | sort || true
 
       # ダウンロード結果が空だと、後段の scan-leaks.sh /
@@ -78,7 +149,7 @@ jobs:
         run: |
           set -uo pipefail
           if [ -z "$(find downloaded-artifacts -mindepth 1 -type f 2>/dev/null)" ]; then
-            echo "::error::対象 run (${{ inputs.run_id }}) に telemetry-* アーティファクトが見つかりませんでした。run が失敗して成果物を残していないか、run_id が誤っている可能性があります。"
+            echo "::error::対象 run (${{ env.TARGET_RUN_ID }}) に telemetry-* アーティファクトが見つかりませんでした。run が失敗して成果物を残していないか、run_id が誤っている可能性があります。"
             exit 1
           fi
 
@@ -93,7 +164,7 @@ jobs:
           set -uo pipefail
           dirs="$(find downloaded-artifacts -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)"
           if [ "${dirs}" = "telemetry-cicd-sensor-enforce" ]; then
-            echo "::error::対象 run (${{ inputs.run_id }}) は sensor-enforce.yml の run のようです。sensor-enforce.yml が実行する scenarios/90-killme.sh はカナリアを注入しない (load_canaries を呼ばない) ため、leak-scan の対象になりません。falco-live / falco-analyze / sensor-monitor のいずれかの run_id を指定してください。"
+            echo "::error::対象 run (${{ env.TARGET_RUN_ID }}) は sensor-enforce.yml の run のようです。sensor-enforce.yml が実行する scenarios/90-killme.sh はカナリアを注入しない (load_canaries を呼ばない) ため、leak-scan の対象になりません。falco-live / falco-analyze / sensor-monitor のいずれかの run_id を指定してください。"
             exit 1
           fi
 
@@ -106,7 +177,7 @@ jobs:
       # 引数取り扱いは実装側の docs/SPEC.md §7 準拠を前提にしている)。
       - name: Run scan-leaks.sh
         env:
-          SCANNED_RUN_ID: ${{ inputs.run_id }}
+          SCANNED_RUN_ID: ${{ env.TARGET_RUN_ID }}
         run: |
           set -uo pipefail
           bash tools/scan-leaks.sh downloaded-artifacts
@@ -147,7 +218,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: leak-report-${{ inputs.run_id }}
+          name: leak-report-${{ env.TARGET_RUN_ID }}
           path: leak-report.json
           if-no-files-found: warn
           # docs/REQUIRED-FIXES.md R-6: leak-report.json は判定結果の
