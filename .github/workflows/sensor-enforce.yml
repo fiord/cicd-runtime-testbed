@@ -80,7 +80,7 @@ permissions: {}
 # リリースタグは `releases/<version>` 形式なので、ここにはバージョン部分
 # だけを持ち、`releases/` は download 側で付ける。
 env:
-  CICD_SENSOR_VERSION: "v0.0.45"
+  CICD_SENSOR_VERSION: "v0.0.46"
 
 jobs:
   enforce:
@@ -195,6 +195,15 @@ jobs:
 
       - name: Start cicd-sensor (standalone mode)
         uses: cicd-sensor/cicd-sensor-action@6511eb44c91d71b2b93d71193b1bf2cb18352f66 # v0.0.38
+        with:
+          # 明示的に渡すこと。省略すると action 側の既定値 (v0.0.45) が
+          # 使われ、上の `Install cicd-sensorctl` が取得したバージョンと
+          # ずれる。v0.0.45 は `event_type: http_request` を受け付けない
+          # ため (実験で確認済み)、ずれたままだと
+          # testbed_canary_http_host を含むバンドルの検証が agent 側だけで
+          # 失敗し、プロジェクト設定全体がベースラインに落ちる
+          # (run 32544606013 と同じ事故)。
+          cicd-sensor-version: ${{ env.CICD_SENSOR_VERSION }}
 
       - name: Run kill-trigger scenario (90-killme.sh)
         id: killme

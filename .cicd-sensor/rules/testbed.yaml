@@ -209,25 +209,33 @@ rule_sets:
         action: collect
 
       # ----------------------------------------------------------------
-      # testbed_canary_http_host — DISABLED (commented out), not deleted.
+      # testbed_canary_http_host — 有効 (v0.0.46 以上が必須)
       #
-      # なぜコメントアウトしているか:
-      #   このルールの event_type: http_request は、実際にこのテストベッド
-      #   が使う cicd-sensor のリリース (README.md "既知の制約" 参照:
-      #   cicd-sensor-action の入力 cicd-sensor-version の既定値は
-      #   v0.0.45、2026-08-09 時点のタグ) にまだ実装されていない。
-      #   http_request 対応 (commit bdec37f2, 2026-08-11) は現時点で
-      #   cicd-sensor の main ブランチにしか存在せず、v0.0.45 を含む
-      #   どのリリース済みタグにも含まれていない。
+      # 必要バージョン:
+      #   このルールの `event_type: http_request` は cicd-sensor
+      #   **v0.0.46 以上**でのみ受理される。v0.0.45 では
+      #   `unsupported event type "http_request"` で拒否されることを、
+      #   両バージョンの cicd-sensorctl に同一のバンドルを渡して
+      #   ローカルで実験的に確認済み (docs/REQUIRED-FIXES.md R-2)。
+      #   ワークフロー側は .github/workflows/sensor-*.yml の
+      #   `env: CICD_SENSOR_VERSION` (現在 v0.0.46) を
+      #   cicd-sensor-action の `cicd-sensor-version` 入力に渡すことで
+      #   これを保証している。
       #
-      # 実測で判明した最重要の事実 (run 32544606013,
+      #   以前ここには「http_request 対応は cicd-sensor の main ブランチ
+      #   にしか存在せず、どのリリース済みタグにも含まれていない」と
+      #   書かれていたが、これは v0.0.46 のリリースにより**もはや正しく
+      #   ない**ため書き換えた。
+      #
+      # なぜバージョンを下げてはいけないか (実測、run 32544606013,
       # https://github.com/fiord/cicd-runtime-testbed/actions/runs/32544606013,
       # sensor-enforce.yml, 2026-08-22):
-      #   このルールが有効なままだと、単に「このルールだけが静かに
-      #   drop される」のではなく、**プロジェクト設定バンドル全体
-      #   (.cicd-sensor/ 配下の monitor_mode と全カスタムルール) の
-      #   検証が失敗し、agent 側がフォールバックする** ことが実機で
-      #   確認された。実際のジョブログ (Start cicd-sensor ステップ):
+      #   agent 側が未対応のバージョンでこのルールを受け取ると、単に
+      #   「このルールだけが静かに drop される」のではなく、
+      #   **プロジェクト設定バンドル全体 (.cicd-sensor/ 配下の
+      #   monitor_mode と全カスタムルール) の検証が失敗し、agent が
+      #   ベースラインルールにフォールバックする**。実際のジョブログ
+      #   (Start cicd-sensor ステップ):
       #
       #     ==> Loaded .cicd-sensor/config.yaml from repo
       #     OK: 1 file(s) bundled into
@@ -248,53 +256,38 @@ rule_sets:
       #   (action: terminate のはず) が attestation predicate / HTML
       #   レポートの両方で action: detect として記録され、
       #   REACHED_AFTER_KILLME がログに出力された (= プロセスは
-      #   kill されなかった)。つまり **不対応のイベント型を使う
-      #   ルールが1本あるだけで、プロジェクト設定全体
-      #   (monitor_mode を含む) が無効化され、他の正常なカスタム
-      #   ルールの意味まで変わってしまう。** README.md "既知の制約"
-      #   に以前書かれていた「rules_summary.warnings_count が増える
-      #   だけでハードエラーにはならない」という説明は、
-      #   (sensor-monitor.yml 相当の) 別の実行経路での観測であり、
-      #   sensor-enforce.yml のこの実行では成り立たなかった。
+      #   kill されなかった)。**不対応のイベント型を使うルールが1本
+      #   あるだけで、プロジェクト設定全体 (monitor_mode を含む) が
+      #   無効化され、他の正常なカスタムルールの意味まで変わる。**
       #
-      # 有効化してよい条件:
-      #   このテストベッドがピン留めする cicd-sensor-action /
-      #   cicd-sensor-version が、http_request イベント型に対応した
-      #   リリースを指すようになったとき。その時点でこのコメントを
-      #   外すだけで、変更なしに発火するようになる想定
-      #   (canary_observability ruleset の他の2ルールと同じ形)。
-      #   有効化した後は、まず GitHub Actions 上で実際に走らせて
+      # 初回 CI 実行時に必ず確認すること:
+      #   ローカルの `cicd-sensorctl rule validate` は、ローカルに入れた
+      #   cicd-sensorctl のバージョンで検証するため、agent 側との
+      #   バージョンずれを検出できない。有効化後の最初の run では
       #   job summary の rules_summary / ::warning:: 注釈と、
-      #   sensor-enforce.yml の assert ジョブが追加出力する
-      #   testbed_kill_marker の実際の action を確認すること
-      #   (`cicd-sensorctl rule validate` はローカルでは通ってしまい、
-      #   この不整合を検出できない)。
-      #
-      # ruleset 自体 (cicd_runtime_testbed/canary_observability) は
-      # 残す: 兄弟ルール testbed_canary_argv_carrier /
-      # testbed_canary_path_probe は http_request に依存せず、
-      # 引き続き有効。
+      #   sensor-enforce.yml の assert ジョブが出力する
+      #   testbed_kill_marker の実際の action を必ず確認すること。
       # ----------------------------------------------------------------
-      # - rule_id: testbed_canary_http_host
-      #   rule_name: "Testbed: plaintext HTTP request to example.com"
-      #   description: |
-      #     What:
-      #       Matches outgoing plaintext HTTP requests whose Host is
-      #       example.com, the only HTTP endpoint this testbed is allowed
-      #       to contact (docs/SPEC.md 1節).
-      #     Why:
-      #       scenarios/02-exfil.sh sends CANARY_URL_PATH in the request
-      #       path and CANARY_URL_QUERY in the query string. Per the same
-      #       root cause as the other two rules in this ruleset, without a
-      #       matching rule the http_request event carrying
-      #       payload.path / payload.method is never recorded, so neither
-      #       the "path survives" nor the "query string is stripped"
-      #       hypothesis (docs/SPEC.md 3節) can actually be observed from
-      #       the report.
-      #     Notes:
-      #       This is a testbed rule, not a security detection.
-      #       example.com is an IANA reserved domain; matching on it here
-      #       does not reference any real IOC.
-      #   event_type: http_request
-      #   condition: host == "example.com"
-      #   action: collect
+      - rule_id: testbed_canary_http_host
+        rule_name: "Testbed: plaintext HTTP request to example.com"
+        description: |
+          What:
+            Matches outgoing plaintext HTTP requests whose Host is
+            example.com, the only HTTP endpoint this testbed is allowed
+            to contact (docs/SPEC.md 1節).
+          Why:
+            scenarios/02-exfil.sh sends CANARY_URL_PATH in the request
+            path and CANARY_URL_QUERY in the query string. Per the same
+            root cause as the other two rules in this ruleset, without a
+            matching rule the http_request event carrying
+            payload.path / payload.method is never recorded, so neither
+            the "path survives" nor the "query string is stripped"
+            hypothesis (docs/SPEC.md 3節) can actually be observed from
+            the report.
+          Notes:
+            This is a testbed rule, not a security detection.
+            example.com is an IANA reserved domain; matching on it here
+            does not reference any real IOC.
+        event_type: http_request
+        condition: host == "example.com"
+        action: collect

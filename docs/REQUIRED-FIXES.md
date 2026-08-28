@@ -176,6 +176,21 @@ kill に失敗した事故 (run 32388911992 / 32544606013 / 32545681004) は
 
 ### R-2 【高】`cicd-sensor-version` を v0.0.46 に上げ、`testbed_canary_http_host` を再有効化する
 
+> **状態: 対応済み (ローカル実験で検証 / CI 未実行)。**
+> `sensor-monitor.yml` / `sensor-enforce.yml` の `env: CICD_SENSOR_VERSION`
+> を v0.0.46 に上げ、`Start cicd-sensor` に
+> `with: cicd-sensor-version: ${{ env.CICD_SENSOR_VERSION }}` を明示追加
+> (従来は入力を渡しておらず、action 側の既定値 v0.0.45 が使われていた)。
+> `.cicd-sensor/rules/testbed.yaml` の `testbed_canary_http_host` を
+> コメントアウトから復帰させ、「main にしかない」旨の陳腐化した
+> コメントを実測結果に書き換えた。README の同趣旨の記述も修正。
+>
+> ローカル実験 (同一バンドルを両バージョンの `cicd-sensorctl` に投入):
+> v0.0.45 → `unsupported event type "http_request"` / exit 1、
+> v0.0.46 → `OK: 1 file(s) bundled and validated` / exit 0。
+> **未検証: agent が実際に http_request イベントを記録し、
+> CANARY_URL_PATH / CANARY_URL_QUERY が観測できるか。**
+
 `.cicd-sensor/rules/testbed.yaml` の `testbed_canary_http_host`
 (`event_type: http_request`) は「リリース済みタグに未実装」を理由に
 コメントアウトされている。これは v0.0.45 時点では正しかったが、
