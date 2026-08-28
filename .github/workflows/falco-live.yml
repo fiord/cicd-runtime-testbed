@@ -175,16 +175,32 @@ jobs:
               echo ""
               echo "Docker Hub API への接続に失敗しました (curl exit=${CURL_EXIT}, HTTP ${HTTP_CODE})。"
               echo "ネットワーク障害または rate limit の可能性があるため、確認をスキップして続行しました。"
-            } >> "$GITHUB_STEP_SUMMARY"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           python3 - "$FALCO_VERSION" "$RESPONSE_FILE" "$GITHUB_STEP_SUMMARY" <<'PYEOF'
+          import contextlib
           import json
           import re
           import sys
 
           falco_version, response_file, summary_file = sys.argv[1], sys.argv[2], sys.argv[3]
+
+          # docs/REQUIRED-FIXES.md R-5: $GITHUB_STEP_SUMMARY は check-runs API
+          # から取得できないため、判定内容を summary にしか書かないと、
+          # アーティファクト失効後に結果を復元できない。summary への追記と
+          # 同じ内容を stdout にも出し、ジョブログ側にも残す
+          # (shell 側の `| tee -a "$GITHUB_STEP_SUMMARY"` と同じ意図)。
+          @contextlib.contextmanager
+          def open_summary(path):
+              with open(path, "a", encoding="utf-8") as _f:
+                  class _Tee:
+                      @staticmethod
+                      def write(text):
+                          _f.write(text)
+                          sys.stdout.write(text)
+                  yield _Tee
 
           try:
               with open(response_file, encoding="utf-8") as f:
@@ -199,7 +215,7 @@ jobs:
                   f"確認をスキップして続行します。"
               )
               print(f"::warning title=falco-no-driver tag preflight skipped::{msg}")
-              with open(summary_file, "a", encoding="utf-8") as s:
+              with open_summary(summary_file) as s:
                   s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version} (skipped)\n\n")
                   s.write(f"{msg}\n")
               sys.exit(0)
@@ -214,7 +230,7 @@ jobs:
               tag = tag_map[falco_version]
               last_pushed = tag.get("tag_last_pushed") or tag.get("last_updated") or "unknown"
               print(f"preflight OK: falcosecurity/falco-no-driver:{falco_version} exists (tag_last_pushed={last_pushed})")
-              with open(summary_file, "a", encoding="utf-8") as s:
+              with open_summary(summary_file) as s:
                   s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version}\n\n")
                   s.write(f"- Docker Hub にタグが実在することを確認しました。\n")
                   s.write(f"- 最終 push (`tag_last_pushed`): `{last_pushed}`\n\n")
@@ -226,7 +242,7 @@ jobs:
                   f"(manifest unknown になります)。利用可能な数値タグ: {available}"
               )
               print(f"::error title=falco-no-driver tag not found::{msg}")
-              with open(summary_file, "a", encoding="utf-8") as s:
+              with open_summary(summary_file) as s:
                   s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version} (NOT FOUND)\n\n")
                   s.write(f"- タグが存在しません。利用可能な数値タグ: {available}\n\n")
               sys.exit(1)
@@ -470,7 +486,7 @@ jobs:
             echo ""
             echo "## falco コンテナの終了コード (docker events, best-effort)"
             echo "- **${EXIT_CODE_INFO}**"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: "Assert (observational): CI/CD rules loaded?"
         # falcosecurity/falco-actions の start/action.yaml:70 の既知のバグ
@@ -625,7 +641,7 @@ jobs:
             esac
             echo ""
             echo "- **総合判定: \`${VERDICT}\`** (\`loaded\` / \`rejected\` / \`not_loaded\` の3値)"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Run detection scenarios
         shell: bash
@@ -729,7 +745,7 @@ jobs:
             echo "- required_engine_version of the bundled CI/CD rules: \`0.43.0\`"
             echo "- falcosecurity/falco-no-driver の実際の上限 (Docker Hub, メンテナンス終了): \`0.39.2\`"
             echo "- \`Start Falco\` step outcome: \`${{ steps.start_falco.outcome }}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Collect telemetry (T2)
         if: always()
@@ -755,7 +771,7 @@ jobs:
               echo "- 存在しない: exists=no (Falco が一度もイベントを書き出さなかった、"
               echo "  ファイル自体が無かった、または起動していなかった。0件検知とは区別すること)"
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
           if [ -f "$GITHUB_STEP_SUMMARY" ]; then
             cp "$GITHUB_STEP_SUMMARY" telemetry/job-summary.md
@@ -812,7 +828,12 @@ jobs:
           name: telemetry-falco-live-${{ matrix.falco-version }}
           path: telemetry/
           if-no-files-found: warn
-          retention-days: 1
+          # docs/REQUIRED-FIXES.md R-6: 従来は 1 日で、数日で全証跡が
+          # 消えていた。ここに入るのは加工済みテレメトリのみで、
+          # カナリアは全て偽値 (canaries/canaries.env, docs/SAFETY.md)
+          # なので 7 日に延ばす。生の capture.scap の扱いは
+          # falco-analyze.yml 側で別に制御しており、この変更の対象外。
+          retention-days: 7
 
   live-forked:
     name: "live-forked / fork-fixed falco 0.44.1"
@@ -875,16 +896,32 @@ jobs:
               echo ""
               echo "Docker Hub API への接続に失敗しました (curl exit=${CURL_EXIT}, HTTP ${HTTP_CODE})。"
               echo "ネットワーク障害または rate limit の可能性があるため、確認をスキップして続行しました。"
-            } >> "$GITHUB_STEP_SUMMARY"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           python3 - "$FALCO_VERSION" "$RESPONSE_FILE" "$GITHUB_STEP_SUMMARY" <<'PYEOF'
+          import contextlib
           import json
           import re
           import sys
 
           falco_version, response_file, summary_file = sys.argv[1], sys.argv[2], sys.argv[3]
+
+          # docs/REQUIRED-FIXES.md R-5: $GITHUB_STEP_SUMMARY は check-runs API
+          # から取得できないため、判定内容を summary にしか書かないと、
+          # アーティファクト失効後に結果を復元できない。summary への追記と
+          # 同じ内容を stdout にも出し、ジョブログ側にも残す
+          # (shell 側の `| tee -a "$GITHUB_STEP_SUMMARY"` と同じ意図)。
+          @contextlib.contextmanager
+          def open_summary(path):
+              with open(path, "a", encoding="utf-8") as _f:
+                  class _Tee:
+                      @staticmethod
+                      def write(text):
+                          _f.write(text)
+                          sys.stdout.write(text)
+                  yield _Tee
 
           try:
               with open(response_file, encoding="utf-8") as f:
@@ -899,7 +936,7 @@ jobs:
                   f"確認をスキップして続行します。"
               )
               print(f"::warning title=falco tag preflight skipped::{msg}")
-              with open(summary_file, "a", encoding="utf-8") as s:
+              with open_summary(summary_file) as s:
                   s.write(f"### preflight: falcosecurity/falco:{falco_version} (skipped)\n\n")
                   s.write(f"{msg}\n")
               sys.exit(0)
@@ -914,7 +951,7 @@ jobs:
               tag = tag_map[falco_version]
               last_pushed = tag.get("tag_last_pushed") or tag.get("last_updated") or "unknown"
               print(f"preflight OK: falcosecurity/falco:{falco_version} exists (tag_last_pushed={last_pushed})")
-              with open(summary_file, "a", encoding="utf-8") as s:
+              with open_summary(summary_file) as s:
                   s.write(f"### preflight: falcosecurity/falco:{falco_version}\n\n")
                   s.write(f"- Docker Hub にタグが実在することを確認しました。\n")
                   s.write(f"- 最終 push (`tag_last_pushed`): `{last_pushed}`\n\n")
@@ -926,7 +963,7 @@ jobs:
                   f"(manifest unknown になります)。利用可能な数値タグ: {available}"
               )
               print(f"::error title=falco tag not found::{msg}")
-              with open(summary_file, "a", encoding="utf-8") as s:
+              with open_summary(summary_file) as s:
                   s.write(f"### preflight: falcosecurity/falco:{falco_version} (NOT FOUND)\n\n")
                   s.write(f"- タグが存在しません。利用可能な数値タグ: {available}\n\n")
               sys.exit(1)
@@ -1191,7 +1228,7 @@ jobs:
             echo ""
             echo "## falco コンテナの終了コード (docker events, best-effort)"
             echo "- **${EXIT_CODE_INFO}**"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: "Assert (observational): CI/CD rules loaded?"
         # falcosecurity/falco-actions の start/action.yaml:70 の既知のバグ
@@ -1352,7 +1389,7 @@ jobs:
             esac
             echo ""
             echo "- **総合判定: \`${VERDICT}\`** (\`loaded\` / \`rejected\` / \`not_loaded\` の3値)"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Run detection scenarios
         shell: bash
@@ -1464,7 +1501,7 @@ jobs:
             echo "- required_engine_version of the bundled CI/CD rules: \`0.43.0\`"
             echo "- falcosecurity/falco の実際の最新 (Docker Hub, 2026-06-11 push): \`0.44.1\`"
             echo "- \`Start Falco\` step outcome: \`${{ steps.start_falco.outcome }}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Collect telemetry (T2)
         if: always()
@@ -1490,7 +1527,7 @@ jobs:
               echo "- 存在しない: exists=no (Falco が一度もイベントを書き出さなかった、"
               echo "  ファイル自体が無かった、または起動していなかった。0件検知とは区別すること)"
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
           if [ -f "$GITHUB_STEP_SUMMARY" ]; then
             cp "$GITHUB_STEP_SUMMARY" telemetry/job-summary.md
@@ -1547,4 +1584,9 @@ jobs:
           name: telemetry-falco-live-forked-0.44.1
           path: telemetry/
           if-no-files-found: warn
-          retention-days: 1
+          # docs/REQUIRED-FIXES.md R-6: 従来は 1 日で、数日で全証跡が
+          # 消えていた。ここに入るのは加工済みテレメトリのみで、
+          # カナリアは全て偽値 (canaries/canaries.env, docs/SAFETY.md)
+          # なので 7 日に延ばす。生の capture.scap の扱いは
+          # falco-analyze.yml 側で別に制御しており、この変更の対象外。
+          retention-days: 7

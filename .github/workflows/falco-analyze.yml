@@ -44,7 +44,9 @@
 #   このワークフローは、それを埋め合わせるため:
 #     1. workflow_dispatch 入力 `upload_raw_capture` が true のときだけ、
 #        capture.scap を自分たち自身のアーティファクト
-#        (telemetry-falco-analyze, retention-days: 1) に含める。
+#        (telemetry-falco-analyze) に含める。この場合に限り
+#        telemetry-falco-analyze の retention-days は 1 に短縮される
+#        (false のときは 7 日。docs/REQUIRED-FIXES.md R-6)。
 #     2. capture.scap を含む "capture" アーティファクト (falco-actions が
 #        アップロードしたもの) と "hashes" アーティファクトは、telemetry
 #        アーティファクトの作成後に GitHub API で必ず削除する。
@@ -105,7 +107,9 @@ on:
           true にすると capture.scap (生の syscall キャプチャ) を
           telemetry-falco-analyze アーティファクトに含める。
           T3 の「capture.scap から実際に漏れること」を観測するには true が必要。
-          public repo では retention-days: 1 の間、誰でもダウンロードできる
+          public repo では retention-days: 1 の間 (true のときだけ 1 日に
+          短縮される。false のときは 7 日。docs/REQUIRED-FIXES.md R-6)、
+          誰でもダウンロードできる
           状態になる (このリポジトリのカナリアはすべて偽物で、実在する
           トークンは失効済み GITHUB_TOKEN と run 中限定の
           ACTIONS_RUNTIME_TOKEN のみ。詳細はこのファイル冒頭のコメントを
@@ -155,7 +159,8 @@ jobs:
             echo "  このワークフローはアップロード後すぐに GitHub API で削除するが、削除完了"
             echo "  までの数秒〜数十秒は public リポジトリで誰でもダウンロードできる。"
             echo "- \`upload_raw_capture: true\` の場合、capture.scap は"
-            echo "  \`telemetry-falco-analyze\` として \`retention-days: 1\` の間、継続的に"
+            echo "  \`telemetry-falco-analyze\` として \`retention-days: 1\` の間 (この場合のみ"
+            echo "  1 日に短縮される。false のときは 7 日)、継続的に"
             echo "  ダウンロード可能になる。"
             echo "- capture.scap は snaplen 256 の生 syscall キャプチャで、カナリア値"
             echo "  (\`CANARY_SCAP\` など。すべて \`CNRY-\` プレフィックスの偽物でリポジトリに"
@@ -175,7 +180,7 @@ jobs:
             echo "追加した場合、\`contents: write\` / \`id-token: write\` を宣言した場合、"
             echo "\`actions/cache\` を使い始めた場合は、この判断を再評価すること"
             echo "(詳細は docs/SAFETY.md 6節 / このファイル冒頭のコメント)。"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
           exit 0
 
       - name: Checkout cicd-runtime-testbed
@@ -273,16 +278,32 @@ jobs:
               echo ""
               echo "Docker Hub API への接続に失敗しました (curl exit=${CURL_EXIT}, HTTP ${HTTP_CODE})。"
               echo "ネットワーク障害または rate limit の可能性があるため、確認をスキップして続行しました。"
-            } >> "$GITHUB_STEP_SUMMARY"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           python3 - "$FALCO_VERSION" "$RESPONSE_FILE" "$GITHUB_STEP_SUMMARY" <<'PYEOF'
+          import contextlib
           import json
           import re
           import sys
 
           falco_version, response_file, summary_file = sys.argv[1], sys.argv[2], sys.argv[3]
+
+          # docs/REQUIRED-FIXES.md R-5: $GITHUB_STEP_SUMMARY は check-runs API
+          # から取得できないため、判定内容を summary にしか書かないと、
+          # アーティファクト失効後に結果を復元できない。summary への追記と
+          # 同じ内容を stdout にも出し、ジョブログ側にも残す
+          # (shell 側の `| tee -a "$GITHUB_STEP_SUMMARY"` と同じ意図)。
+          @contextlib.contextmanager
+          def open_summary(path):
+              with open(path, "a", encoding="utf-8") as _f:
+                  class _Tee:
+                      @staticmethod
+                      def write(text):
+                          _f.write(text)
+                          sys.stdout.write(text)
+                  yield _Tee
 
           try:
               with open(response_file, encoding="utf-8") as f:
@@ -297,7 +318,7 @@ jobs:
                   f"確認をスキップして続行します。"
               )
               print(f"::warning title=falco-no-driver tag preflight skipped::{msg}")
-              with open(summary_file, "a", encoding="utf-8") as s:
+              with open_summary(summary_file) as s:
                   s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version} (skipped)\n\n")
                   s.write(f"{msg}\n")
               sys.exit(0)
@@ -312,7 +333,7 @@ jobs:
               tag = tag_map[falco_version]
               last_pushed = tag.get("tag_last_pushed") or tag.get("last_updated") or "unknown"
               print(f"preflight OK: falcosecurity/falco-no-driver:{falco_version} exists (tag_last_pushed={last_pushed})")
-              with open(summary_file, "a", encoding="utf-8") as s:
+              with open_summary(summary_file) as s:
                   s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version}\n\n")
                   s.write(f"- Docker Hub にタグが実在することを確認しました。\n")
                   s.write(f"- 最終 push (`tag_last_pushed`): `{last_pushed}`\n\n")
@@ -324,7 +345,7 @@ jobs:
                   f"(manifest unknown になります)。利用可能な数値タグ: {available}"
               )
               print(f"::error title=falco-no-driver tag not found::{msg}")
-              with open(summary_file, "a", encoding="utf-8") as s:
+              with open_summary(summary_file) as s:
                   s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version} (NOT FOUND)\n\n")
                   s.write(f"- タグが存在しません。利用可能な数値タグ: {available}\n\n")
               sys.exit(1)
@@ -399,7 +420,7 @@ jobs:
             echo "**要手動確認**: \`Analyze capture\` ステップの生ログ (verbose 出力) に"
             echo "\`required_engine_version\` / \`engine version\` に関する記述が無いか確認し、"
             echo "docs/RESULTS-TEMPLATE.md の該当欄 (ロード成功 / 拒否 / 警告のみで通過) を埋めること。"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Collect telemetry (T2)
         id: collect_telemetry
@@ -467,17 +488,17 @@ jobs:
               echo "- missing: ${missing_names}"
             fi
             echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
           if [ "${found}" -eq 0 ]; then
             echo "::error::telemetry collection failed: none of the expected extracted telemetry files (${expected_files}) were produced by the Analyze capture step (outcome=${{ steps.analyze.outcome }}). See telemetry-manifest.txt / job summary."
-            echo "❌ **0 / ${total} expected extracted telemetry files collected. Failing this job (docs/SPEC.md §6).**" >> "$GITHUB_STEP_SUMMARY"
+            echo "❌ **0 / ${total} expected extracted telemetry files collected. Failing this job (docs/SPEC.md §6).**" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 1
           elif [ "${found}" -lt "${total}" ]; then
             echo "::warning::telemetry collection partial: missing ${missing_names}(collected ${found}/${total}). See telemetry-manifest.txt in the uploaded telemetry-falco-analyze artifact."
-            echo "⚠️ **${found} / ${total} expected extracted telemetry files collected. Missing: ${missing_names}(see telemetry-manifest.txt).**" >> "$GITHUB_STEP_SUMMARY"
+            echo "⚠️ **${found} / ${total} expected extracted telemetry files collected. Missing: ${missing_names}(see telemetry-manifest.txt).**" | tee -a "$GITHUB_STEP_SUMMARY"
           else
-            echo "✅ **${found} / ${total} expected extracted telemetry files collected.**" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ **${found} / ${total} expected extracted telemetry files collected.**" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload telemetry-falco-analyze
@@ -487,7 +508,11 @@ jobs:
           name: telemetry-falco-analyze
           path: telemetry/
           if-no-files-found: warn
-          retention-days: 1
+          # docs/REQUIRED-FIXES.md R-6: 加工済みテレメトリは 7 日保持する。
+          # ただし upload_raw_capture=true のときは、このアーティファクトに
+          # **生の capture.scap** (シークレットを含みうる。docs/SPEC.md §1-6)
+          # が含まれるため、その場合だけ従来どおり 1 日に戻す。
+          retention-days: ${{ (inputs.upload_raw_capture == true || inputs.upload_raw_capture == 'true') && 1 || 7 }}
 
       - name: Enforce artifact retention (delete raw "capture" / "hashes" uploaded by falco-actions)
         # falco-actions/stop (analyze mode) uploads "capture" (capture.scap)

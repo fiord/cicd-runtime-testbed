@@ -289,6 +289,18 @@ fork leg でも analyze でも、発火したのは "Source Code Overwrite" た�
 
 ### R-5 【高】判定結果を stdout にも出力する
 
+> **状態: 対応済み (静的検証のみ / CI 未実行)。**
+> 5 ワークフローの `{ ... } >> "$GITHUB_STEP_SUMMARY"` 23 箇所と
+> 単発の `echo ... >> "$GITHUB_STEP_SUMMARY"` 9 箇所を
+> `| tee -a "$GITHUB_STEP_SUMMARY"` に変更 (計 32 箇所)。
+> python heredoc で summary に書いている 4 箇所には
+> `open_summary()` (ファイルと stdout の両方に書く contextmanager) を
+> 導入した。
+> 事前に、対象ブロック内で変数代入や `$GITHUB_OUTPUT` / `$GITHUB_ENV`
+> への書き込みが無いことを機械的に確認済み (パイプでサブシェル化される
+> ため、あれば壊れる)。`set -o pipefail` 下でも終了ステータスは
+> 従来のリダイレクト形と同じ (ブロックの終了ステータス) になる。
+
 現状、ほぼ全ての verdict が `$GITHUB_STEP_SUMMARY` にしか書かれていない。
 step summary は **check-runs API から取得できない**ため、
 アーティファクト失効後は検証結果が一切復元できなくなる。
@@ -297,6 +309,18 @@ step summary は **check-runs API から取得できない**ため、
 `echo` でも出す (`tee -a "$GITHUB_STEP_SUMMARY"` にする)。
 
 ### R-6 【中】テレメトリの保持期間を延ばす
+
+> **状態: 対応済み (静的検証のみ / CI 未実行)。**
+> `telemetry-falco-live-*` / `telemetry-falco-live-forked-0.44.1` /
+> `telemetry-cicd-sensor-monitor` / `telemetry-cicd-sensor-enforce` /
+> `leak-report-<run_id>` を `retention-days: 7` に変更。
+> `telemetry-falco-analyze` だけは `upload_raw_capture` が true のとき
+> **生の capture.scap を含む**ため、その場合に限り従来どおり 1 日に
+> 戻す条件式にした:
+> `retention-days: ${{ (inputs.upload_raw_capture == true || inputs.upload_raw_capture == 'true') && 1 || 7 }}`
+> (boolean 入力が boolean で来る場合と文字列で来る場合の両方を受ける)。
+> falco-actions が自前でアップロードする生 `capture` / `hashes` の
+> 即時削除処理は変更していない。
 
 `retention-days: 1` のため、数日で全証跡が消える。
 public repo での secret 露出を避ける設計意図は理解できるが、

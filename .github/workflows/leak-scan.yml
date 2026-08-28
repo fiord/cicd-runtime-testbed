@@ -150,4 +150,8 @@ jobs:
           name: leak-report-${{ inputs.run_id }}
           path: leak-report.json
           if-no-files-found: warn
-          retention-days: 1
+          # docs/REQUIRED-FIXES.md R-6: leak-report.json は判定結果の
+          # 加工済み JSON で、カナリアは全て偽値 (docs/SAFETY.md)。
+          # ランナー由来トークンは「パターン名 + 件数 + ファイル名」
+          # までしか記録しない (tools/scan-leaks.sh)。7 日保持する。
+          retention-days: 7

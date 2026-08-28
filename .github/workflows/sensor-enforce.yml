@@ -162,7 +162,7 @@ jobs:
                 echo "## Validate .cicd-sensor/rules: OK"
                 echo ""
                 echo "\`cicd-sensorctl rule validate .cicd-sensor/rules\` passed."
-              } >> "$GITHUB_STEP_SUMMARY"
+              } | tee -a "$GITHUB_STEP_SUMMARY"
             else
               status=$?
               {
@@ -174,7 +174,7 @@ jobs:
                 echo "ルールがあると、プロジェクト設定全体 (\`monitor_mode\` を含む) が"
                 echo "agent に届かなくなる** (run 32544606013 で実機確認済み。"
                 echo "README.md \"既知の制約\" 参照)。"
-              } >> "$GITHUB_STEP_SUMMARY"
+              } | tee -a "$GITHUB_STEP_SUMMARY"
               echo "::error::cicd-sensorctl rule validate failed (exit ${status}). Check whether a rule uses an event type unsupported by the pinned cicd-sensor release (e.g. http_request). Even a single invalid rule discards the ENTIRE project config bundle at agent startup — not just that one rule — so monitor_mode and every other custom rule silently fail to reach the agent too. See README.md known limitations (run 32544606013)."
               exit "${status}"
             fi
@@ -189,7 +189,7 @@ jobs:
               echo "fetch failure inside the \"Start cicd-sensor\" step below, which"
               echo "silently discards \`monitor_mode\` and all custom rules if it happens"
               echo "(see README.md known limitations, run 32544606013)."
-            } >> "$GITHUB_STEP_SUMMARY"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
             echo "::warning::cicd-sensorctl not available; rule validation skipped (see job summary — this means an invalid rule would not be caught locally)"
           fi
 
@@ -236,7 +236,7 @@ jobs:
             echo "## sensor-enforce: kill-trigger step result"
             echo "- \`killme\` step outcome: \`${{ steps.killme.outcome }}\`"
             echo "- REACHED_AFTER_KILLME observed: \`${{ steps.check_reached.outputs.reached }}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   assert:
     name: "assert (this job succeeding is the expected result)"
@@ -318,11 +318,27 @@ jobs:
         run: |
           set -uo pipefail
           python3 - <<'PYEOF'
+          import contextlib
           import json
           import os
           import re
+          import sys
 
           summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+
+          # docs/REQUIRED-FIXES.md R-5: $GITHUB_STEP_SUMMARY は check-runs API
+          # から取得できないため、判定内容を summary にしか書かないと、
+          # アーティファクト失効後に結果を復元できない。summary への追記と
+          # 同じ内容を stdout にも出し、ジョブログ側にも残す。
+          @contextlib.contextmanager
+          def open_summary(path):
+              with open(path, "a", encoding="utf-8") as _f:
+                  class _Tee:
+                      @staticmethod
+                      def write(text):
+                          _f.write(text)
+                          sys.stdout.write(text)
+                  yield _Tee
           runner_temp = os.environ["RUNNER_TEMP"]
           action = None
           source = None
@@ -372,7 +388,7 @@ jobs:
                   except Exception as exc:
                       print(f"::warning::failed to parse cicd-sensor-report.html: {exc}")
 
-          with open(summary_path, "a", encoding="utf-8") as f:
+          with open_summary(summary_path) as f:
               f.write("## testbed_kill_marker: actual action evaluated by the agent\n\n")
               if action is None:
                   f.write(
@@ -499,17 +515,17 @@ jobs:
               echo "| \`cicd-sensor-attestation\` | ❌ missing (download outcome=\`${attestation_outcome}\`) |"
             fi
             echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
           if [ "${found}" -eq 0 ]; then
             echo "::error::telemetry collection failed: none of the expected artifacts (cicd-sensor-report.html, cicd-sensor-attestation) could be downloaded for this run. See telemetry-manifest.txt / job summary."
-            echo "❌ **0 / ${total} expected artifacts collected. Failing this job (docs/SPEC.md §6).**" >> "$GITHUB_STEP_SUMMARY"
+            echo "❌ **0 / ${total} expected artifacts collected. Failing this job (docs/SPEC.md §6).**" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 1
           elif [ "${found}" -lt "${total}" ]; then
             echo "::warning::telemetry collection partial: missing ${missing_names}(collected ${found}/${total}). See telemetry-manifest.txt in the uploaded telemetry-cicd-sensor-enforce artifact."
-            echo "⚠️ **${found} / ${total} expected artifacts collected. Missing: ${missing_names}(see telemetry-manifest.txt).**" >> "$GITHUB_STEP_SUMMARY"
+            echo "⚠️ **${found} / ${total} expected artifacts collected. Missing: ${missing_names}(see telemetry-manifest.txt).**" | tee -a "$GITHUB_STEP_SUMMARY"
           else
-            echo "✅ **${found} / ${total} expected artifacts collected.**" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ **${found} / ${total} expected artifacts collected.**" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload telemetry-cicd-sensor-enforce
@@ -523,7 +539,12 @@ jobs:
           name: telemetry-cicd-sensor-enforce
           path: telemetry/
           if-no-files-found: warn
-          retention-days: 1
+          # docs/REQUIRED-FIXES.md R-6: 従来は 1 日で、数日で全証跡が
+          # 消えていた。ここに入るのは加工済みテレメトリのみで、
+          # カナリアは全て偽値 (canaries/canaries.env, docs/SAFETY.md)
+          # なので 7 日に延ばす。生の capture.scap の扱いは
+          # falco-analyze.yml 側で別に制御しており、この変更の対象外。
+          retention-days: 7
 
       - name: Enforce artifact retention (delete original cicd-sensor-report.html / cicd-sensor-attestation)
         # if: always() so cleanup still runs even if "Summarize telemetry
