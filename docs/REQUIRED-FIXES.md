@@ -330,6 +330,16 @@ public repo での secret 露出を避ける設計意図は理解できるが、
 
 ### R-7 【中】`assert` ジョブがアーティファクト欠損時も success を返す
 
+> **状態: 対応済み (ローカルで機能テスト済み / CI 未実行)。**
+> GitHub Actions には neutral / inconclusive というジョブ結論が無いため、
+> 「検証できなかった」を **失敗** として扱い、success は
+> 「検証した結果 action=terminate だった」場合だけに限定した。
+> 判定ステップは終了コードで 3 状態を返す:
+> `0 = verified_terminate` / `1 = verified_not_terminate` および `no_hit` /
+> `2 = inconclusive` (report / attestation のどちらも取得できなかった)。
+> 「入力が 1 つも無い (inconclusive)」と「入力はあるがヒットが無い
+> (no_hit)」も区別している。
+
 sensor-enforce の最新 run (33178601723) で実際に起きた:
 
 ```
@@ -348,6 +358,17 @@ assert ジョブは success を報告した**。
 ジョブ結果に反映する。少なくとも success とは区別すること。
 
 ### R-8 【中】monitor_mode reality check の一次ソースを attestation から HTML report に変える
+
+> **状態: 対応済み (ローカルで機能テスト済み / CI 未実行)。**
+> `cicd-sensor-report.html` の `window.REPORT_DATA` を一次ソース、
+> `predicate.json` を補助ソースに入れ替えた (ダウンロードステップの
+> 順序も入れ替え)。report から読めた場合は `result` フィールド
+> (`terminated` 等) も summary に出す。
+>
+> ローカル機能テスト (合成入力): report=terminate かつ
+> attestation=detect のとき report が勝って `verified_terminate` /
+> exit 0、入力ゼロで `inconclusive` / exit 2、attestation のみ
+> (detect) で `verified_not_terminate` / exit 1 を確認。
 
 実測で判明した仕様:
 
