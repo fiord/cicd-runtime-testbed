@@ -82,14 +82,37 @@
 #     含まれない仕様のため、query 側は「除去された」ことの確認になる)
 #     が観測できるようになる想定だった。
 #
-#     ##################################################################
-#     # 現在コメントアウトして無効化中 (run 32544606013、2026-08-22)。 #
-#     # 詳細は下の rule 定義箇所のコメントブロックを参照。             #
-#     ##################################################################
+#     現在は有効 (cicd-sensor v0.0.46 以上が必須。詳細は下の rule 定義
+#     箇所のコメントブロックと docs/REQUIRED-FIXES.md R-2 を参照)。
 #
 #   `domain` イベント (CANARY_DNS) は既に attestation predicate の
 #   `domains` 配列に現れる (集計レベルでも観測できる) ため、専用の
 #   観測用ルールは追加しない。
+#
+# (3つ目の ruleset, cicd_runtime_testbed/uncovered_scenarios):
+#   docs/REQUIRED-FIXES.md R-11 への対応。実測で 05-memfd-exec と
+#   06-anti-forensics は **falco / cicd-sensor のどちらからも検知されて
+#   いない**。この「未検知」には 2 つのまったく違う意味がありうる:
+#     (a) センサーがそのイベントを観測できていない (見えていない)
+#     (b) イベントは観測できているが、出荷時ルールセットに該当ルールが
+#         無いのでアラートにならない
+#   出荷時ルールセットの比較としては (b) も立派な結果だが、(a) と
+#   混同したまま「未カバー」と書くのは不誠実なので、切り分ける。
+#
+#   以下の 2 ルールは、cicd-sensor が該当イベントを**そもそも観測でき
+#   ているか**だけを確かめる観測プローブで、すべて action: collect。
+#   ヒットすれば (b)、ヒットしなければ (a) と判定できる。
+#   検知能力の評価対象ではないので、結果表では「参考情報」として扱い、
+#   検知件数の比較には算入しない (docs/TEST-PLAN.md 参照)。
+#
+#   falco 側の対称な答えは「標準ルールセットがロードされているか」の
+#   観測である (falco-live.yml の Assert (observational) ステップ、
+#   docs/REQUIRED-FIXES.md R-4)。falco の標準ルールセットには
+#   "Fileless execution via memfd_create" (priority CRITICAL) が
+#   **有効な状態で含まれている**ため、falco 側は (b) ではなく
+#   「標準ルールがロードされているなら本来鳴るはず」という別の問いに
+#   なる。両ツールで同じ問いにはならないが、それ自体が
+#   「出荷時構成の違い」として記録すべき事実である。
 
 rule_sets:
   - ruleset_id: cicd_runtime_testbed/kill_test
@@ -290,4 +313,68 @@ rule_sets:
             does not reference any real IOC.
         event_type: http_request
         condition: host == "example.com"
+        action: collect
+
+  # ------------------------------------------------------------------
+  # cicd_runtime_testbed/uncovered_scenarios
+  #
+  # docs/REQUIRED-FIXES.md R-11。05-memfd-exec / 06-anti-forensics が
+  # 「センサーに見えていない」のか「見えているがルールが無い」のかを
+  # 切り分けるためだけの観測プローブ。両方 action: collect で、
+  # ジョブは止めない。検知件数の比較には算入しない (参考情報)。
+  #
+  # ここで使っている CEL フィールド名は、cicd-sensorctl v0.0.46 に
+  # 実際にバンドルを投げて受理されることを確認したもの:
+  #   - process_exec: `is_memfd` (bare。`process.is_memfd` は**拒否される**)
+  #   - file_remove:  `path` (`is_write` / `from_path` は**拒否される**)
+  # ------------------------------------------------------------------
+  - ruleset_id: cicd_runtime_testbed/uncovered_scenarios
+
+    rules:
+      - rule_id: testbed_probe_memfd_exec
+        rule_name: "Testbed probe: fileless exec via memfd"
+        description: |
+          What:
+            Matches any process_exec whose image came from an anonymous
+            memory file (memfd), i.e. fileless execution.
+          Why:
+            scenarios/05-memfd-exec.sh performs exactly this
+            (os.memfd_create + execv("/proc/self/fd/N")), and neither
+            tool alerted on it in the measured runs. This probe answers
+            one specific question: does the cicd-sensor agent SEE the
+            memfd exec at all? A hit means the event is observable and
+            the shipped ruleset simply has no rule for it; no hit means
+            the agent does not surface this event.
+          Notes:
+            This is a testbed observation probe, not a security
+            detection, and not part of the detection-count comparison.
+            The falco side of the same question is whether the standard
+            falco ruleset (which does contain an enabled
+            "Fileless execution via memfd_create" rule) was loaded —
+            see falco-live.yml's observational assert.
+        event_type: process_exec
+        condition: is_memfd
+        action: collect
+
+      - rule_id: testbed_probe_evidence_removal
+        rule_name: "Testbed probe: removal of the 05 driver script"
+        description: |
+          What:
+            Matches removal of the driver script that
+            scenarios/05-memfd-exec.sh leaves on disk and
+            scenarios/06-anti-forensics.sh deletes.
+          Why:
+            Same question as above, for the anti-forensics scenario:
+            does the agent see the file_remove at all? Matching only
+            this one specific basename keeps the probe from turning into
+            a broad "any deletion" rule, which would add noise to every
+            other scenario.
+          Notes:
+            This is a testbed observation probe, not a security
+            detection, and not part of the detection-count comparison.
+            The path is matched by basename (endsWith), so it is
+            unaffected by moving $TESTBED_TMPDIR out of the workspace
+            (docs/REQUIRED-FIXES.md R-3).
+        event_type: file_remove
+        condition: path.endsWith("/05-memfd-driver.py")
         action: collect

@@ -48,6 +48,18 @@ T1/T2/T3 のいずれも、falco 側の数字は「検知性能が低い」で�
 
 ### F-1 【最優先 / PR を出すべき】CI/CD ルールのマウントパスが実ファイル位置と一致していない
 
+> **状態: fork で修正済み (実機/CI で確認済み) / upstream には未報告。**
+> commit `360d62c` (`fix(start): correct default CI/CD rules mount path`) で
+> `${{github.action_path}}/rules/...` を `${{github.action_path}}/../rules/...`
+> に修正した。本リポジトリの `live-forked` leg でのみ
+> `/etc/falco/rules.d/cicd_rules.yaml | schema validation: ok` が出ることを
+> CI 実機で確認済み。
+>
+> ただし **upstream への PR・issue は一切出しておらず、ブランチ
+> (`fix/cicd-rules-mount-path`) 自体も push していない**。draft の PR 文面は
+> fork 側の `PR_BODY.md` に用意済み。4節「F-1 を upstream に PR」は
+> 依然として最優先で未着手のまま。
+
 `start/action.yaml` (upstream `main`, 2026-08-28 時点):
 
 ```yaml
@@ -84,6 +96,21 @@ Loading rules from:
 
 ### F-2 【必須】Falco イメージが `falcosecurity/falco-no-driver` にハードコードされている
 
+> **状態: fork で修正済み (静的検証 + ローカル `docker run` 確認 / action 経由・
+> CI 未実行)。**
+> commit `0e4a9e9` (`fix(start,analyze): use maintained falcosecurity/falco image`)
+> で `start`/`analyze` 双方に `falco-image` 入力 (string, 既定
+> `falcosecurity/falco`) を追加し、ハードコードされていた `IMAGE=` 行を
+> 差し替えた。あわせて commit `bdd62a7` (`fix(start): verify Falco container
+> stays alive, not just started once`) で起動チェックを強化した: 旧チェックは
+> `docker ps` で `running` を一度見た時点でループを抜けて成功扱いにするため、
+> その直後に Falco がクラッシュしても検知できなかった。修正後は `running`
+> 確認後さらに `sleep 3` して再チェックし、生きていなければログを出して
+> 失敗させる。README.md も更新済み (commit `ba52d6d`)。
+> `falcosecurity/falco:0.44.1` が既存の起動コマンドをそのまま受け付けることは
+> ローカルの `docker run` で確認済みだが、`start`/`analyze` action 経由での
+> 実行・CI での確認はまだ行っていない。
+
 `falco-no-driver` の Docker Hub 数値タグは 0.39.2 で止まっており、
 新しい engine を選べない。fork では `falco-image` 入力を追加し、既定を
 `falcosecurity/falco` に変更した。
@@ -91,6 +118,25 @@ Loading rules from:
 **修正:** イメージ名を入力化する (fork の実装をそのまま PR 可能)。
 
 ### F-3 【重要】ルールが 1 本もロードされなくても起動が成功扱いになる
+
+> **状態: 対応済みだが、最初の実装に欠陥があり是正した (是正版は CI 未実行)。**
+> 最初の実装 (commit `775e814`, `fix(start): fail the step when requested
+> rules failed to load`) は、起動ログ全体に対して `docker logs falco | grep -c
+> "schema validation: ok"` の件数を数え、0 件のときだけ失敗させるものだった。
+> しかしこのチェックは実質無意味だった: Falco は組込みの
+> `/etc/falco/falco_rules.yaml` と 3 つの設定ファイルに対して常に自身で
+> `schema validation: ok` を出すため、件数が 0 になることはない。
+>
+> `falcosecurity/falco:0.44.1` を Docker で (1) 正常な CI/CD ルールマウントと
+> (2) F-1 の空ディレクトリ失敗モードの両方で実行して確認した: 失敗モードでは
+> `/etc/falco/rules.d/cicd_rules.yaml` の行が消えるだけで、
+> `/etc/falco/falco_rules.yaml | schema validation: ok` は残る。つまり旧
+> チェックは F-1 のような失敗を検知できない。
+>
+> 是正: 全件カウントではなく、実際に要求したマウント先
+> (`/etc/falco/rules.d/cicd_rules.yaml` および/または
+> `/etc/falco/rules.d/custom_rules.yaml`) を個別に確認する方式に変更した。
+> **この是正版は action 経由での実行検証・CI での確認ともにまだ行っていない。**
 
 F-1 の直接の帰結として、**「センサーは動いているが何も検知できない」状態が
 成功として報告される**。CI のランタイムセキュリティとしては最悪の失敗モードで、
@@ -102,6 +148,20 @@ F-1 の直接の帰結として、**「センサーは動いているが何も�
 ジョブを失敗させる (もしくは `::error::` を出す)。
 
 ### F-4 【任意】analyze モードに `cicd-rules` 相当の自動ロード経路が無い
+
+> **状態: fork で実装済み (静的検証のみ / CI 未実行)。本リポジトリはまだ未反映。**
+> commit `bc91ce3` (`feat(analyze): add cicd-rules input matching start's`) で
+> `analyze/action.yaml` に `cicd-rules` boolean 入力 (既定 true) を追加し、
+> `start` と同じ要領で
+> `${{github.action_path}}/../rules/falco_cicd_rules.yaml` をマウントする
+> ようにした。
+>
+> ただし本リポジトリの `.github/workflows/falco-analyze.yml` は現時点でも
+> 旧来の回避策のまま (`falcosecurity/falco-actions` を `_falco-actions-src`
+> に checkout し、`custom-rule-file` で `rules/falco_cicd_rules.yaml` を
+> 明示的に渡している)。これは fork ではなく upstream
+> (`falcosecurity/falco-actions/analyze@558a3ce...`) を参照しているためで、
+> **F-4 は実装済みだが本リポジトリではまだ利用されていない**。
 
 `analyze` action には `cicd-rules` 入力が無いため、本リポジトリは
 falco-actions 自体を checkout して `rules/falco_cicd_rules.yaml` を
@@ -439,6 +499,52 @@ cnry-dns-donotuse-18ebf5.test.invalid.<runner の Azure 内部サーチドメイ
 「最新コードで全ツールを測った」状態を常に保つ。
 
 ### R-11 【要判断】どちらのツールも検知していないシナリオの扱い
+
+> **状態: 対応済み (静的検証 + ローカル `cicd-sensorctl` 検証のみ / CI 未実行)。**
+> **2 シナリオとも残す。落とさない。** ただし検知件数の比較からは除外し、
+> 結果表では「両ツールの出荷時ルールセットでは未検知」と明示する。
+>
+> 判断の根拠: この「未検知」には 2 つのまったく違う意味がありうる。
+>   1. センサーがそのイベントを**観測できていない** (見えていない)
+>   2. イベントは観測できているが、**出荷時ルールセットに該当ルールが無い**
+>      のでアラートにならない
+> 出荷時構成の比較としては 2. も立派な結果だが、1. と混同したまま
+> 「未カバー」と書くのは不誠実なので、切り分けの手段を仕込んだ。
+>
+> **cicd-sensor 側**: `.cicd-sensor/rules/testbed.yaml` に新しい ruleset
+> `cicd_runtime_testbed/uncovered_scenarios` を追加し、`action: collect`
+> の観測プローブを 2 本置いた。
+>   - `testbed_probe_memfd_exec` — `event_type: process_exec` /
+>     `condition: is_memfd` (05-memfd-exec の fileless exec を観測)
+>   - `testbed_probe_evidence_removal` — `event_type: file_remove` /
+>     `condition: path.endsWith("/05-memfd-driver.py")` (06-anti-forensics
+>     の証拠削除を観測)
+> ヒットすれば 2.、ヒットしなければ 1. と判定できる。
+> どちらも `collect` なのでジョブは止めない。
+> CEL のフィールド名はローカルの cicd-sensorctl v0.0.46 に実際に
+> バンドルを投げて受理されることを確認した (`is_memfd` は **bare**。
+> `process.is_memfd` / `file_remove` の `is_write` / `from_path` は
+> **いずれも拒否される**)。
+>
+> **falco 側**: 対称な観測を独自ルールで書くことはしない (R-4 と同じ
+> 理由: 手書きルールを足すと「出荷時に何が鳴るか」ではなく
+> 「我々が何を書けるか」の測定になる)。falco の標準ルールセットには
+> **"Fileless execution via memfd_create" (priority CRITICAL) が有効な
+> 状態で最初から含まれている**ため、falco 側の問いは
+> 「標準ルールセットがロードされているか」に還元される。これは R-4 で
+> 追加した falco-live.yml の observational assert (`STD_RULES`) が
+> そのまま答えになる。
+>
+> **両ツールで同じ問いにならない**点は注意が必要で、これ自体を
+> 「出荷時構成の違い」として `docs/TEST-PLAN.md` に記録した。
+> R-3 の副作用 (`$TESTBED_TMPDIR` をワークスペース外へ移したことで
+> falco は 05 で何も検知しなくなる) もそこに併記してある。
+>
+> なお「シナリオが弱すぎるのか」という問いについては、**弱くはない**と
+> 判断した。05 は `os.memfd_create` + `os.set_inheritable` +
+> `execv("/proc/self/fd/N")` という、fileless 実行の教科書どおりの形で
+> あり、falco の標準ルールが名指しで狙っている挙動そのものである。
+> 検知されないのはシナリオの問題ではなく構成の問題である可能性が高い。
 
 **05-memfd-exec** と **06-anti-forensics** は、実測で
 **falco / cicd-sensor のどちらからも検知されていない**。

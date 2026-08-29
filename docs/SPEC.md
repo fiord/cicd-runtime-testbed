@@ -285,13 +285,26 @@ falco live モードのテレメトリ（`falco_events.json` 等）は「詳細�
 
 - `memfd_create` 経由で実行する。`python3` で `memfd_create` → 書き込み → `/proc/self/fd/N` を exec
 - 実行する中身は `echo` 相当の無害なシェルスクリプト
-- 期待: cicd-sensor の `process_exec.is_memfd = true` が立つ。falco 側で相当する情報が取れるか確認
+- 期待: cicd-sensor の `process_exec` イベントで `is_memfd` が立つ。falco 側で相当する情報が取れるか確認
+- **実測（R-11）: 両ツールとも未検知。** 出荷時ルールセットで鳴らないのか、
+  そもそもイベントが見えていないのかを切り分けるため、cicd-sensor 側に
+  観測プローブ `testbed_probe_memfd_exec`（`event_type: process_exec` /
+  `condition: is_memfd`、`action: collect`）を置いた。falco 側は標準ルールセットに
+  `Fileless execution via memfd_create`（CRITICAL）が有効な状態で含まれるため、
+  `falco-live.yml` の observational assert（`STD_RULES`）が対応する観測になる。
+  詳細と公平性の判断は docs/TEST-PLAN.md「どちらのツールも検知していない
+  2 シナリオの扱い (R-11)」を参照。**このシナリオは検知件数の比較から除外する。**
 
 ### `06-anti-forensics.sh` — 証跡削除
 
 - `00-seed.sh` が作った偽クレデンシャルを削除する
 - `05` で実行したバイナリを削除する（falco の SHA256 計算が
   `File does not exist anymore` になることの確認）
+- **実測（R-11）: 両ツールとも未検知。** cicd-sensor 側に観測プローブ
+  `testbed_probe_evidence_removal`（`event_type: file_remove` /
+  `condition: path.endsWith("/05-memfd-driver.py")`、`action: collect`）を置いて
+  切り分ける。**このシナリオも検知件数の比較から除外する。**
+  詳細は docs/TEST-PLAN.md の同節を参照。
 
 ### `07-rule-markers.sh` — detect / collect アクションの発火
 
@@ -461,6 +474,17 @@ CEL の制約に注意:
 | `testbed_canary_argv_carrier` | `process_exec` | `process.exec_path.endsWith("/curl")` | `collect` |
 | `testbed_canary_path_probe` | `file_open` | `is_write && path.endsWith("/canary-path-probe.marker")` | `collect` |
 | `testbed_canary_http_host` | `http_request` | `host == "example.com"` | `collect` |
+| `testbed_probe_memfd_exec` | `process_exec` | `is_memfd`（**bare**。`process.is_memfd` は拒否される） | `collect` |
+| `testbed_probe_evidence_removal` | `file_remove` | `path.endsWith("/05-memfd-driver.py")` | `collect` |
+
+下 2 本（`cicd_runtime_testbed/uncovered_scenarios` ruleset）は
+docs/REQUIRED-FIXES.md R-11 への対応で、`05-memfd-exec` / `06-anti-forensics` が
+「センサーに見えていない」のか「見えているが出荷時ルールに無いだけ」なのかを
+切り分けるためだけの観測プローブである。**検知能力の評価対象ではなく、
+検知件数の比較には算入しない**（docs/TEST-PLAN.md 参照）。
+CEL のフィールド名はリリース版 `cicd-sensorctl` v0.0.46 に実際にバンドルを
+渡して受理されることを確認したもの（`file_remove` の `is_write` / `from_path`、
+`network` の `host` / `remote_ip` はいずれも拒否される）。
 
 `90-killme.sh` は `cicd-sensor-killme.marker` に書き込むだけでよい。
 `cicd-sensor-detect.marker` / `cicd-sensor-collect.marker` は
@@ -817,11 +841,23 @@ predicate（集計レベル）しか無い状況では原理的に観測でき�
 
 #### 対象外（N/A）判定：センサーの機能サポートによるカナリアの絞り込み
 
+> **【2026-08 追記 / docs/REQUIRED-FIXES.md R-2】この N/A 判定の前提は解消した。**
+> `http_request` は **`releases/v0.0.46` で正式に利用可能**になり、ワークフローの
+> `env: CICD_SENSOR_VERSION` を `v0.0.46` に固定した上で
+> `testbed_canary_http_host` を有効化済み。手元の `cicd-sensorctl` に同一の
+> バンドルを渡す実験で、v0.0.45 は `unsupported event type "http_request"` で
+> 拒否、v0.0.46 は `OK` になることを確認した（したがって下の
+> 「`cicd-sensorctl rule validate` では検出できない」という記述も誤りで、
+> **リリース版の ctl を使えばローカルで検出できる**）。
+> 以下の記述は、この判定ロジックが**なぜ実装されているか**の記録として残す。
+> `CICD_SENSOR_VERSION` を v0.0.46 未満に下げた場合はこの判定が再び必要になる
+> ため、`sensor_capabilities` による N/A 判定自体は削除していない。
+
 上記 2 つとは独立した、**3 つ目の N/A 判定**。実地実行（run 32519409901）で判明した
 次の事実に対応する。
 
 - **平文 HTTP を捕捉する `http_request` イベントは、cicd-sensor の
-  リリース済みバージョンにまだ存在しない。** 実装は 2026-08-11
+  リリース済みバージョンにまだ存在しない**（※上記追記のとおり v0.0.46 で解消）。実装は 2026-08-11
   （cicd-sensor の commit `bdec37f2`, PR #139）で、`releases/v0.0.45`（2026-08-09）にも
   含まれず、main にしかない。テストベッドがピン留めしている
   `cicd-sensor-action` v0.0.38（2026-06-13）はもちろん未対応。
@@ -941,6 +977,9 @@ predicate（集計レベル）しか無い状況では原理的に観測でき�
 
 `leak-scan.yml` は、カナリアを実際に注入するワークフロー（`falco-live.yml` /
 `falco-analyze.yml` / `sensor-monitor.yml`）の run_id のみを対象にできる。
+この 3 つは `workflow_run` トリガの `workflows:` にも列挙されており、完了時に
+自動的に leak-scan が起動する（§8、docs/REQUIRED-FIXES.md R-10）。
+`sensor-enforce.yml` は意図的に列挙していない。
 `sensor-enforce.yml` はカナリアを注入しない（`90-killme.sh` は `load_canaries` を
 呼ばない。§4）ため対象外であり、`leak-scan.yml` はダウンロード直後にこれを検出して
 早期にジョブを失敗させる（§8）。
@@ -951,8 +990,11 @@ predicate（集計レベル）しか無い状況では原理的に観測でき�
 
 全ワークフロー共通:
 
-- トリガーは `workflow_dispatch` のみ。**`push` / `pull_request` では起動しない**
-  （public repo で不用意に走らないため）
+- トリガーは `workflow_dispatch`。**`push` / `pull_request` では起動しない**
+  （public repo で不用意に走らないため）。
+  **例外**: `leak-scan.yml` のみ `workflow_run`（`types: [completed]`）も持ち、
+  カナリアを注入する 3 ワークフローの完了で自動起動する（docs/REQUIRED-FIXES.md R-10）。
+  `push` / `pull_request` を追加しない方針は変えていない
 - `permissions:` は各ワークフローで明示的に最小化する
 - `runs-on` は §8 の表に従う
 - すべての `uses:` は**コミット SHA でピン留め**し、行末コメントにバージョンを書く。
@@ -971,11 +1013,17 @@ predicate（集計レベル）しか無い状況では原理的に観測でき�
 | `falco-analyze.yml` | `ubuntu-latest` | falco analyze モードでの検知と生キャプチャ | `custom-rule-file` に CI/CD ルールを**明示的に渡す**（渡さないと効かないため）。`falco-version` は `0.39.2`（falcosecurity/falco-no-driver の実際の上限。理由は上記と同じ）。`analyze` ジョブは falco-actions/analyze を呼ぶ前に同様の preflight ステップでタグの実在を確認する。`upload_raw_capture` 入力で scap のアップロードを制御（既定 `false`）。**ジョブを停止するガードは置かない**（§1-6）。public リポジトリで実行された場合は、`capture.scap` に何が入りうるかを `::warning::` と job summary で告知する情報提供ステップのみを置く |
 | `sensor-monitor.yml` | `ubuntu-24.04` | cicd-sensor の検知（自作ルールでの kill は起きない想定） | `monitor_mode` はコミット値で `false`（§5。config.yaml はコミット SHA から取得されるため、`monitor_mode` はワークフローごとに切り替えられずリポジトリ全体で共通。§5「sensor-monitor.yml への影響」参照）。全シナリオを実行 |
 | `sensor-enforce.yml` | `ubuntu-24.04` | cicd-sensor の kill 動作 | `monitor_mode` はコミット値で `false`（上記と同一の値。§5）。§5 の 2 ジョブ構成。`90-killme.sh` は `load_canaries` を呼ばずカナリアを注入しないため、**この run の run_id は `leak-scan.yml` の対象にできない**（§4、§7） |
-| `leak-scan.yml` | `ubuntu-latest` | 漏洩マトリクスの生成 | 入力で対象 run_id を受け取り、その run のアーティファクトを DL して走査。ダウンロード結果が空、または `telemetry-cicd-sensor-enforce` のみだった場合はジョブを早期に落とすガードを持つ（§7） |
+| `leak-scan.yml` | `ubuntu-latest` | 漏洩マトリクスの生成 | 対象 run のアーティファクトを DL して走査。起動方法は 2 つ: (1) `workflow_run` で `falco-live` / `falco-analyze` / `sensor-monitor` の完了時に自動起動（対象は `github.event.workflow_run.id`）、(2) `workflow_dispatch` で run_id を手入力（過去 run の測り直し用）。両者はワークフローレベルの `env: TARGET_RUN_ID` に一本化する。`conclusion` が cancelled / skipped の run はスキップするが **failure はスキップしない**（テレメトリのアップロードは `if: always()` のため残っており走査価値がある）。ダウンロード結果が空、または `telemetry-cicd-sensor-enforce` のみだった場合はジョブを早期に落とすガードを持つ（§7）。**`gh workflow run` による自動起動は採れない**: GITHUB_TOKEN で起動した `workflow_dispatch` は GitHub の再帰防止により新しい run を作らない（docs/REQUIRED-FIXES.md R-10） |
 
 ### falco-actions / cicd-sensor-action のバージョン
 
-- `cicd-sensor-action`: README にある `6511eb44c91d71b2b93d71193b1bf2cb18352f66`（v0.0.38）を使う
+- `cicd-sensor-action`: README にある `6511eb44c91d71b2b93d71193b1bf2cb18352f66`（v0.0.38）を使う。
+  これは **action 側**のバージョンであり、agent 本体（`cicd-sensor` / `cicd-sensorctl`）の
+  バージョンとは別物である。agent 本体は各ワークフローの
+  `env: CICD_SENSOR_VERSION`（現在 `v0.0.46`）を単一の情報源とし、
+  `cicd-sensor-version` 入力と `gh release download "releases/${CICD_SENSOR_VERSION}"`
+  の両方に同じ値を渡す。**`http_request` を使うルールがあるため v0.0.46 未満に
+  下げてはならない**（docs/REQUIRED-FIXES.md R-1 / R-2）
 - `falco-actions`: このリポジトリにはタグがないため、**実装者は SHA を確定できない**。
   `falcosecurity/falco-actions/start@<PIN_ME>` のようにプレースホルダを置き、
   README に「利用者が SHA を確定して差し替える」旨を明記すること。**推測の SHA を書かない**

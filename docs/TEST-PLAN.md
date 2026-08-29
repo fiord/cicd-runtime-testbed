@@ -121,8 +121,8 @@ HTML レポート (詳細レベルの証跡) であっても、cicd-sensor は�
 | `02-exfil.sh` | DNS 解決失敗、平文 HTTP (クエリ/パス/Authorization ヘッダ/argv カナリア)、HTTPS 対照群 | outbound connection 抽出 (analyze mode)、CI/CD ルールには専用の平文 HTTP ルールはない想定 | `domain` / `http_request` イベント種別のベースライン・カスタムルール、`testbed_canary_argv_carrier` (curl 実行全般、action: collect)、`testbed_canary_http_host` (host==example.com、action: collect) |
 | `03-npm-postinstall/` | npm postinstall からクレデンシュル読み取り + 外部通信 (最重要: プロセス系譜の検知能力比較) | 系譜4世代までを output に含めるが、ルール条件としては使っていない想定 → 汎用ルールでしか引っかからない | `process.ancestors` を使い npm の子孫であることを条件に含められる専用ルールで検知できる想定 |
 | `04-persistence.sh` | `~/.bashrc` への追記、無効化された `.disabled` ワークフローファイルの作成 | `Possible Workflow File Overwrite` (`.github/workflows/` への書き込み) | file_open / file_move 系のベースライン・カスタムルール |
-| `05-memfd-exec.sh` | `memfd_create` 経由の fileless 実行 | falco 側で memfd 相当の情報が取れるかを確認 (専用ルールがあるかは未確認) | `process_exec.is_memfd` |
-| `06-anti-forensics.sh` | 00/05 が作った証跡の削除 | `File does not exist anymore` (SHA256 計算失敗) の確認 | `file_remove` |
+| `05-memfd-exec.sh` | `memfd_create` 経由の fileless 実行 | **実測で未検知**。falco 標準ルールセットには `Fileless execution via memfd_create` (CRITICAL) が有効な状態で含まれるため、標準ルールがロードされていれば鳴るはず → R-4 の `STD_RULES` 観測で確定させる | **実測で未検知**。観測プローブ `testbed_probe_memfd_exec` (`event_type: process_exec` / `condition: is_memfd`、action: collect) で「見えていないのか、ルールが無いだけか」を切り分ける |
+| `06-anti-forensics.sh` | 00/05 が作った証跡の削除 | **実測で未検知**。`File does not exist anymore` (SHA256 計算失敗) の確認のみ | **実測で未検知**。観測プローブ `testbed_probe_evidence_removal` (`event_type: file_remove` / `condition: path.endsWith("/05-memfd-driver.py")`、action: collect) で同上の切り分けを行う |
 | `07-rule-markers.sh` | detect / collect マーカーファイルへの書き込み (`sensor-monitor.yml` から実行。レビューで見つかった仕様の穴を塞ぐために追加) | (対象外、cicd-sensor 専用テスト) | `testbed_detect_marker` (action: detect) / `testbed_collect_marker` (action: collect) |
 | `90-killme.sh` | kill 発火専用 (`sensor-enforce.yml` からのみ実行)。**`load_canaries` を呼ばずカナリアを注入しない** | (対象外、cicd-sensor 専用テスト) | `testbed_kill_marker` (action: terminate) |
 
@@ -281,6 +281,62 @@ Yes/No である。これは製品の設計思想の差 (falco の CI/CD ルー�
 「ソースコード改変」「パッケージマネージャからの実行」といった
 CI 固有の少数の観点に絞っており、認証情報アクセスの網羅的な検知は
 対象にしていない) を反映しており、それ自体が結論として意味を持つ。
+
+## どちらのツールも検知していない 2 シナリオの扱い (R-11)
+
+**05-memfd-exec** と **06-anti-forensics** は、実測で
+**falco / cicd-sensor のどちらからも検知されなかった**。
+
+**方針: 2 シナリオとも残す。ただし検知件数の比較からは除外し、
+結果表には「両ツールの出荷時ルールセットでは未検知」と明示する。**
+黙って落とすと「測ったが出なかった」が「測っていない」と区別できなくなる。
+
+**「未検知」の 2 つの意味を切り分ける**:
+
+| | 意味 | 評価上の扱い |
+| --- | --- | --- |
+| (a) | センサーがそのイベントを**観測できていない** | センサーの可視性の限界。ツールの能力差として意味がある |
+| (b) | 観測はできているが**出荷時ルールセットに該当ルールが無い** | ルールセットの網羅範囲の問題。設計思想の差として意味がある |
+
+(a) と (b) を混同したまま「未カバー」と書くのは不誠実なので、
+両ツールにそれぞれ切り分けの手段を用意した。
+
+**cicd-sensor 側**: `.cicd-sensor/rules/testbed.yaml` に ruleset
+`cicd_runtime_testbed/uncovered_scenarios` を追加し、`action: collect`
+の観測プローブを 2 本置いた (`testbed_probe_memfd_exec` /
+`testbed_probe_evidence_removal`)。ヒットすれば (b)、
+ヒットしなければ (a)。どちらも `collect` なのでジョブは止めない。
+
+**falco 側**: 対称な観測を**独自ルールでは書かない**。R-4 と同じ理由で、
+手書きルールを足すと「出荷時に何が鳴るか」ではなく「我々が何を書けるか」
+の測定になる。falco の標準ルールセットには
+**`Fileless execution via memfd_create` (priority CRITICAL) が有効な状態で
+最初から含まれている**ため、falco 側の問いは
+「標準ルールセットがロードされているか」に還元でき、R-4 で追加した
+`falco-live.yml` の observational assert (`STD_RULES`) がそのまま答えになる。
+`STD_RULES=yes` なのに 05 が鳴っていないなら、それは
+「標準ルールがロードされているのに fileless exec を捉えられていない」
+という、それ自体が report する価値のある事実である。
+
+**⚠️ 両ツールで完全に同じ問いにはなっていない**。
+cicd-sensor 側は「イベントが見えるか」を直接プローブしているのに対し、
+falco 側は「該当ルールがロードされているか」を見ているだけで、
+イベントが見えているかどうかは間接的にしか分からない。
+これは公平性の欠陥ではなく**出荷時構成の非対称性そのもの**である
+(falco は標準ルールセットに memfd ルールを持ち、cicd-sensor は持たない)。
+結果を書くときはこの非対称性を明示すること。
+
+**R-3 の副作用との関係**: `$TESTBED_TMPDIR` をワークスペース外へ移した
+結果、falco は 05 でドライバ `.py` の作成すら検知しなくなる。
+これは検知能力の低下ではなく、もともと 05 の本質 (memfd 経由の
+fileless 実行) を捉えていたわけではなく**ハーネスのファイル書き込みを
+拾っていただけ**だったことが可視化されたにすぎない (R-3 の節を参照)。
+
+**シナリオが弱すぎるのではないか、という疑い**: 弱くはないと判断した。
+05 は `os.memfd_create` + `os.set_inheritable` + `execv("/proc/self/fd/N")`
+という fileless 実行の教科書どおりの形であり、falco の標準ルールが
+名指しで狙っている挙動そのものである。検知されないのはシナリオの
+問題ではなく構成の問題である可能性が高い。
 
 ## ワークフローとテレメトリの対応
 
