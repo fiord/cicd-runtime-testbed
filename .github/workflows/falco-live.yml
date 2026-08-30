@@ -570,6 +570,12 @@ jobs:
             VERDICT="not_loaded"
           fi
 
+          # T-C: 後続の "Record leg detection-data outcome" ステップは別
+          # ステップ (別シェル) なので、ここで確定した VERDICT をファイルに
+          # 残しておかないと参照できない。既存の
+          # /tmp/falco_startup_marker_status.txt と同じやり方に合わせる。
+          printf '%s' "$VERDICT" > /tmp/falco_cicd_verdict.txt
+
           {
             echo ""
             echo "## CI/CD ルールはロードされたか (job: ${{ github.job }}, leg: upstream / falco ${{ matrix.falco-version }})"
@@ -680,6 +686,25 @@ jobs:
           bash scenarios/06-anti-forensics.sh
           echo "::endgroup::"
 
+      - name: "Drain window before stopping Falco"
+        # 実測 (run 33311769634, live-forked leg) では "Run detection
+        # scenarios" ステップの所要時間がわずか 1 秒で、直後の
+        # "Capture Falco logs before stop (T1)" ステップが同じ秒に開始して
+        # いた。つまりシナリオ実行の終了から Falco を止めるまでの間に
+        # 一切の待ち時間が無かった。Falco の file_output はバッファリング
+        # されることがあり、eBPF 経由のイベント処理にも遅延がありうるため、
+        # この状態のままでは「0 件検知」という結果がシナリオを本当に
+        # 見逃したのか、単に Falco がイベントを書き出す前に停止されて
+        # しまっただけなのかを切り分けられない。ここで数秒待ってから
+        # 停止することで、"0 件検知" という観測結果に意味を持たせる
+        # (drain 不足による見かけ上のゼロと、本当の未検知を混同しない
+        # ようにする)。
+        if: always()
+        shell: bash
+        run: |
+          echo "waiting 5s for Falco's buffered file_output / eBPF event processing to catch up with the scenarios that just ran, before Falco is stopped (run 33311769634: scenarios finished and Falco was stopped in the same second, with zero drain time)"
+          sleep 5
+
       - name: "Capture Falco logs before stop (T1)"
         # Stop Falco の直前にもう一度 docker logs を取得する。起動直後には
         # まだ現れないエラー (ルール評価時のエラーなど、シナリオ実行中に発生
@@ -747,6 +772,63 @@ jobs:
             echo "- \`Start Falco\` step outcome: \`${{ steps.start_falco.outcome }}\`"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: "Record leg detection-data outcome"
+        # T-C: "Assert (observational): CI/CD rules loaded?" の3値判定
+        # (loaded / rejected / not_loaded、/tmp/falco_cicd_verdict.txt に
+        # 保存済み) と、falco_events.json の有無・行数を突き合わせ、
+        # 「このレグは検知データを一切生成しなかった」ことを job 全体の
+        # green/red から独立して可視化する。run 33311769634 の upstream
+        # 2 leg (falco-version 0.39.0 / 0.39.2) はまさにこの状態
+        # (verdict=not_loaded かつ /tmp/falco_events.json 自体が存在しない、
+        # 標準ルールセットはロードされていたにもかかわらず0件) で、
+        # それでもジョブは green のまま完走していた。green である事実
+        # だけを見ると検知が機能したかのように誤読されかねないため、
+        # ここで明示的に ::warning:: を出す。これらのレグは観測目的
+        # であり、ジョブを失敗させる設計ではないので exit 1 はしない。
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          VERDICT_FILE="/tmp/falco_cicd_verdict.txt"
+          EVENTS_FILE="/tmp/falco_events.json"
+          LEG_LABEL="upstream / falco ${{ matrix.falco-version }}"
+
+          VERDICT="unknown"
+          if [ -f "$VERDICT_FILE" ]; then
+            VERDICT="$(cat "$VERDICT_FILE")"
+          fi
+
+          EVENTS_HAVE_DATA="no"
+          EVENTS_LINE_COUNT=0
+          if [ -f "$EVENTS_FILE" ] && [ -s "$EVENTS_FILE" ]; then
+            EVENTS_LINE_COUNT="$(wc -l < "$EVENTS_FILE" | tr -d ' ')"
+            if [ "$EVENTS_LINE_COUNT" -gt 0 ]; then
+              EVENTS_HAVE_DATA="yes"
+            fi
+          fi
+
+          if [ "$VERDICT" != "loaded" ] && [ "$EVENTS_HAVE_DATA" = "no" ]; then
+            MSG="leg ${LEG_LABEL}: CI/CD rules verdict=${VERDICT} and falco_events.json is absent/empty (line_count=${EVENTS_LINE_COUNT}). This leg produced NO detection data — a green check on this job does NOT mean detection worked here."
+            echo "::warning::${MSG}"
+            {
+              echo ""
+              echo "## このレグは検知データを生成しなかった (T-C, leg: ${LEG_LABEL})"
+              echo ""
+              echo "- CI/CD ルール判定 (verdict): \`${VERDICT}\`"
+              echo "- falco_events.json: exists/line_count=${EVENTS_LINE_COUNT}"
+              echo "- **このジョブが green であっても、このレグでは検知が機能した根拠は無い。**"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo ""
+              echo "## このレグの検知データ有無 (T-C, leg: ${LEG_LABEL})"
+              echo ""
+              echo "- CI/CD ルール判定 (verdict): \`${VERDICT}\`"
+              echo "- falco_events.json: exists/line_count=${EVENTS_LINE_COUNT}"
+              echo "- verdict=loaded またはイベントデータありのいずれかが成立しており、このレグは検知データを残している。"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Collect telemetry (T2)
         if: always()
         run: |
@@ -788,6 +870,122 @@ jobs:
             } > telemetry/falco_events_info.txt
           else
             echo "exists: no" > telemetry/falco_events_info.txt
+          fi
+
+          # docs/REQUIRED-FIXES.md R-3 は「対応済み」と記録されているが、実測
+          # (run 33311769634, live-forked leg) では 8 件中 4 件がなおハーネス
+          # 自身の $GITHUB_ENV / $GITHUB_STEP_SUMMARY 書き込み
+          # (_runner_file_commands/ 配下) に対する "Source Code Overwrite" だった。
+          # scenarios/lib/common.sh の testbed-log.jsonl をワークスペース外に
+          # 退避させたことで 213/240 件の大半は消えたが、ハーネスが GitHub
+          # Actions のランナー自身の仕組み ($GITHUB_ENV / $GITHUB_STEP_SUMMARY)
+          # を経由して書き込むファイルまでは制御できない。ここではその残存
+          # ノイズを黙って除外するのではなく、fd.name が
+          # _runner_file_commands/ を含むかどうかで harness / scenario に
+          # 分類し、両方をそのまま残す。ハーネスが検知されること自体も
+          # ひとつの観測結果であり、それを消してしまう抑制 (suppression) は
+          # 採らない。
+          if [ -f "$EVENTS_FILE" ]; then
+            cat > /tmp/classify_falco_events.py <<'PYEOF'
+          import json
+          import os
+
+          EVENTS_FILE = os.environ.get("FALCO_EVENTS_FILE", "/tmp/falco_events.json")
+          OUT_MD = "telemetry/falco_events_classified.md"
+          OUT_JSON = "telemetry/falco_events_classified.json"
+          SUMMARY_FILE = os.environ.get("GITHUB_STEP_SUMMARY")
+
+
+          def classify(fd_name):
+              return "harness" if "/_runner_file_commands/" in fd_name else "scenario"
+
+
+          total = 0
+          unparseable = 0
+          rule_counts = {}
+          fdname_counts = {}
+
+          with open(EVENTS_FILE, encoding="utf-8") as f:
+              for raw_line in f:
+                  line = raw_line.strip()
+                  if not line:
+                      continue
+                  total += 1
+                  try:
+                      ev = json.loads(line)
+                  except Exception:
+                      unparseable += 1
+                      continue
+                  output_fields = ev.get("output_fields")
+                  fd_name = ""
+                  if isinstance(output_fields, dict):
+                      fd_name = output_fields.get("fd.name") or ""
+                  rule = ev.get("rule", "(rule field missing)")
+                  cls = classify(fd_name)
+                  rule_counts[(rule, cls)] = rule_counts.get((rule, cls), 0) + 1
+                  fdname_counts[(fd_name, cls)] = fdname_counts.get((fd_name, cls), 0) + 1
+
+          scenario = sum(v for (_, c), v in rule_counts.items() if c == "scenario")
+          harness = sum(v for (_, c), v in rule_counts.items() if c == "harness")
+
+          lines = []
+          lines.append(f"total={total}, scenario={scenario}, harness={harness}, unparseable={unparseable}")
+          lines.append("")
+          lines.append("| rule | classification | count |")
+          lines.append("| --- | --- | --- |")
+          for (rule, cls), cnt in sorted(rule_counts.items(), key=lambda kv: -kv[1]):
+              lines.append(f"| {rule} | {cls} | {cnt} |")
+          lines.append("")
+          lines.append("| fd.name | classification | count |")
+          lines.append("| --- | --- | --- |")
+          for (fd, cls), cnt in sorted(fdname_counts.items(), key=lambda kv: -kv[1]):
+              fd_display = fd if fd else "(fd.name missing)"
+              lines.append(f"| {fd_display} | {cls} | {cnt} |")
+
+          body = "\n".join(lines) + "\n"
+          heading = "## falco_events.json の分類 (ハーネス自身のノイズ vs シナリオ起因)\n\n"
+
+          print(heading + body)
+
+          if SUMMARY_FILE:
+              with open(SUMMARY_FILE, "a", encoding="utf-8") as f:
+                  f.write("\n" + heading + body)
+
+          os.makedirs("telemetry", exist_ok=True)
+          with open(OUT_MD, "w", encoding="utf-8") as f:
+              f.write("# falco_events.json classification\n\n")
+              f.write(body)
+
+          with open(OUT_JSON, "w", encoding="utf-8") as f:
+              json.dump(
+                  {
+                      "total": total,
+                      "scenario": scenario,
+                      "harness": harness,
+                      "unparseable": unparseable,
+                      "by_rule": [
+                          {"rule": r, "classification": c, "count": n}
+                          for (r, c), n in sorted(rule_counts.items(), key=lambda kv: -kv[1])
+                      ],
+                      "by_fd_name": [
+                          {"fd_name": fd, "classification": c, "count": n}
+                          for (fd, c), n in sorted(fdname_counts.items(), key=lambda kv: -kv[1])
+                      ],
+                  },
+                  f,
+                  indent=2,
+                  ensure_ascii=False,
+              )
+              f.write("\n")
+          PYEOF
+            python3 /tmp/classify_falco_events.py
+          else
+            {
+              echo ""
+              echo "## falco_events.json の分類 (ハーネス自身のノイズ vs シナリオ起因)"
+              echo ""
+              echo "\`${EVENTS_FILE}\` が存在しないため、分類をスキップした。"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
           fi
           # required_engine_version 検証用 (T1 中核観測)。上の "Capture Falco
           # startup logs" ステップが生成する。
@@ -1315,6 +1513,12 @@ jobs:
             VERDICT="not_loaded"
           fi
 
+          # T-C: 後続の "Record leg detection-data outcome" ステップは別
+          # ステップ (別シェル) なので、ここで確定した VERDICT をファイルに
+          # 残しておかないと参照できない。既存の
+          # /tmp/falco_startup_marker_status.txt と同じやり方に合わせる。
+          printf '%s' "$VERDICT" > /tmp/falco_cicd_verdict.txt
+
           {
             echo ""
             echo "## CI/CD ルールはロードされたか (job: ${{ github.job }}, leg: fork-fixed / falco 0.44.1)"
@@ -1428,6 +1632,25 @@ jobs:
           bash scenarios/06-anti-forensics.sh
           echo "::endgroup::"
 
+      - name: "Drain window before stopping Falco"
+        # 実測 (run 33311769634, live-forked leg) では "Run detection
+        # scenarios" ステップの所要時間がわずか 1 秒で、直後の
+        # "Capture Falco logs before stop (T1)" ステップが同じ秒に開始して
+        # いた。つまりシナリオ実行の終了から Falco を止めるまでの間に
+        # 一切の待ち時間が無かった。Falco の file_output はバッファリング
+        # されることがあり、eBPF 経由のイベント処理にも遅延がありうるため、
+        # この状態のままでは「0 件検知」という結果がシナリオを本当に
+        # 見逃したのか、単に Falco がイベントを書き出す前に停止されて
+        # しまっただけなのかを切り分けられない。ここで数秒待ってから
+        # 停止することで、"0 件検知" という観測結果に意味を持たせる
+        # (drain 不足による見かけ上のゼロと、本当の未検知を混同しない
+        # ようにする)。
+        if: always()
+        shell: bash
+        run: |
+          echo "waiting 5s for Falco's buffered file_output / eBPF event processing to catch up with the scenarios that just ran, before Falco is stopped (run 33311769634: scenarios finished and Falco was stopped in the same second, with zero drain time)"
+          sleep 5
+
       - name: "Capture Falco logs before stop (T1)"
         # Stop Falco の直前にもう一度 docker logs を取得する。起動直後には
         # まだ現れないエラー (ルール評価時のエラーなど、シナリオ実行中に発生
@@ -1503,6 +1726,61 @@ jobs:
             echo "- \`Start Falco\` step outcome: \`${{ steps.start_falco.outcome }}\`"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: "Record leg detection-data outcome"
+        # T-C: "Assert (observational): CI/CD rules loaded?" の3値判定
+        # (loaded / rejected / not_loaded、/tmp/falco_cicd_verdict.txt に
+        # 保存済み) と、falco_events.json の有無・行数を突き合わせ、
+        # 「このレグは検知データを一切生成しなかった」ことを job 全体の
+        # green/red から独立して可視化する。この live-forked leg は
+        # run 33311769634 で verdict=loaded かつ8件検知だったため通常は
+        # 該当しないが、将来 fork 側の修正が壊れて not_loaded に戻った
+        # 場合に同じ理由で見逃されないよう、upstream (live ジョブ) と
+        # 同じチェックをここにも入れておく。これらのレグは観測目的で
+        # あり、ジョブを失敗させる設計ではないので exit 1 はしない。
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          VERDICT_FILE="/tmp/falco_cicd_verdict.txt"
+          EVENTS_FILE="/tmp/falco_events.json"
+          LEG_LABEL="fork-fixed / falco 0.44.1"
+
+          VERDICT="unknown"
+          if [ -f "$VERDICT_FILE" ]; then
+            VERDICT="$(cat "$VERDICT_FILE")"
+          fi
+
+          EVENTS_HAVE_DATA="no"
+          EVENTS_LINE_COUNT=0
+          if [ -f "$EVENTS_FILE" ] && [ -s "$EVENTS_FILE" ]; then
+            EVENTS_LINE_COUNT="$(wc -l < "$EVENTS_FILE" | tr -d ' ')"
+            if [ "$EVENTS_LINE_COUNT" -gt 0 ]; then
+              EVENTS_HAVE_DATA="yes"
+            fi
+          fi
+
+          if [ "$VERDICT" != "loaded" ] && [ "$EVENTS_HAVE_DATA" = "no" ]; then
+            MSG="leg ${LEG_LABEL}: CI/CD rules verdict=${VERDICT} and falco_events.json is absent/empty (line_count=${EVENTS_LINE_COUNT}). This leg produced NO detection data — a green check on this job does NOT mean detection worked here."
+            echo "::warning::${MSG}"
+            {
+              echo ""
+              echo "## このレグは検知データを生成しなかった (T-C, leg: ${LEG_LABEL})"
+              echo ""
+              echo "- CI/CD ルール判定 (verdict): \`${VERDICT}\`"
+              echo "- falco_events.json: exists/line_count=${EVENTS_LINE_COUNT}"
+              echo "- **このジョブが green であっても、このレグでは検知が機能した根拠は無い。**"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo ""
+              echo "## このレグの検知データ有無 (T-C, leg: ${LEG_LABEL})"
+              echo ""
+              echo "- CI/CD ルール判定 (verdict): \`${VERDICT}\`"
+              echo "- falco_events.json: exists/line_count=${EVENTS_LINE_COUNT}"
+              echo "- verdict=loaded またはイベントデータありのいずれかが成立しており、このレグは検知データを残している。"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Collect telemetry (T2)
         if: always()
         run: |
@@ -1544,6 +1822,122 @@ jobs:
             } > telemetry/falco_events_info.txt
           else
             echo "exists: no" > telemetry/falco_events_info.txt
+          fi
+
+          # docs/REQUIRED-FIXES.md R-3 は「対応済み」と記録されているが、実測
+          # (run 33311769634, live-forked leg) では 8 件中 4 件がなおハーネス
+          # 自身の $GITHUB_ENV / $GITHUB_STEP_SUMMARY 書き込み
+          # (_runner_file_commands/ 配下) に対する "Source Code Overwrite" だった。
+          # scenarios/lib/common.sh の testbed-log.jsonl をワークスペース外に
+          # 退避させたことで 213/240 件の大半は消えたが、ハーネスが GitHub
+          # Actions のランナー自身の仕組み ($GITHUB_ENV / $GITHUB_STEP_SUMMARY)
+          # を経由して書き込むファイルまでは制御できない。ここではその残存
+          # ノイズを黙って除外するのではなく、fd.name が
+          # _runner_file_commands/ を含むかどうかで harness / scenario に
+          # 分類し、両方をそのまま残す。ハーネスが検知されること自体も
+          # ひとつの観測結果であり、それを消してしまう抑制 (suppression) は
+          # 採らない。
+          if [ -f "$EVENTS_FILE" ]; then
+            cat > /tmp/classify_falco_events.py <<'PYEOF'
+          import json
+          import os
+
+          EVENTS_FILE = os.environ.get("FALCO_EVENTS_FILE", "/tmp/falco_events.json")
+          OUT_MD = "telemetry/falco_events_classified.md"
+          OUT_JSON = "telemetry/falco_events_classified.json"
+          SUMMARY_FILE = os.environ.get("GITHUB_STEP_SUMMARY")
+
+
+          def classify(fd_name):
+              return "harness" if "/_runner_file_commands/" in fd_name else "scenario"
+
+
+          total = 0
+          unparseable = 0
+          rule_counts = {}
+          fdname_counts = {}
+
+          with open(EVENTS_FILE, encoding="utf-8") as f:
+              for raw_line in f:
+                  line = raw_line.strip()
+                  if not line:
+                      continue
+                  total += 1
+                  try:
+                      ev = json.loads(line)
+                  except Exception:
+                      unparseable += 1
+                      continue
+                  output_fields = ev.get("output_fields")
+                  fd_name = ""
+                  if isinstance(output_fields, dict):
+                      fd_name = output_fields.get("fd.name") or ""
+                  rule = ev.get("rule", "(rule field missing)")
+                  cls = classify(fd_name)
+                  rule_counts[(rule, cls)] = rule_counts.get((rule, cls), 0) + 1
+                  fdname_counts[(fd_name, cls)] = fdname_counts.get((fd_name, cls), 0) + 1
+
+          scenario = sum(v for (_, c), v in rule_counts.items() if c == "scenario")
+          harness = sum(v for (_, c), v in rule_counts.items() if c == "harness")
+
+          lines = []
+          lines.append(f"total={total}, scenario={scenario}, harness={harness}, unparseable={unparseable}")
+          lines.append("")
+          lines.append("| rule | classification | count |")
+          lines.append("| --- | --- | --- |")
+          for (rule, cls), cnt in sorted(rule_counts.items(), key=lambda kv: -kv[1]):
+              lines.append(f"| {rule} | {cls} | {cnt} |")
+          lines.append("")
+          lines.append("| fd.name | classification | count |")
+          lines.append("| --- | --- | --- |")
+          for (fd, cls), cnt in sorted(fdname_counts.items(), key=lambda kv: -kv[1]):
+              fd_display = fd if fd else "(fd.name missing)"
+              lines.append(f"| {fd_display} | {cls} | {cnt} |")
+
+          body = "\n".join(lines) + "\n"
+          heading = "## falco_events.json の分類 (ハーネス自身のノイズ vs シナリオ起因)\n\n"
+
+          print(heading + body)
+
+          if SUMMARY_FILE:
+              with open(SUMMARY_FILE, "a", encoding="utf-8") as f:
+                  f.write("\n" + heading + body)
+
+          os.makedirs("telemetry", exist_ok=True)
+          with open(OUT_MD, "w", encoding="utf-8") as f:
+              f.write("# falco_events.json classification\n\n")
+              f.write(body)
+
+          with open(OUT_JSON, "w", encoding="utf-8") as f:
+              json.dump(
+                  {
+                      "total": total,
+                      "scenario": scenario,
+                      "harness": harness,
+                      "unparseable": unparseable,
+                      "by_rule": [
+                          {"rule": r, "classification": c, "count": n}
+                          for (r, c), n in sorted(rule_counts.items(), key=lambda kv: -kv[1])
+                      ],
+                      "by_fd_name": [
+                          {"fd_name": fd, "classification": c, "count": n}
+                          for (fd, c), n in sorted(fdname_counts.items(), key=lambda kv: -kv[1])
+                      ],
+                  },
+                  f,
+                  indent=2,
+                  ensure_ascii=False,
+              )
+              f.write("\n")
+          PYEOF
+            python3 /tmp/classify_falco_events.py
+          else
+            {
+              echo ""
+              echo "## falco_events.json の分類 (ハーネス自身のノイズ vs シナリオ起因)"
+              echo ""
+              echo "\`${EVENTS_FILE}\` が存在しないため、分類をスキップした。"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
           fi
           # required_engine_version 検証用 (T1 中核観測)。上の "Capture Falco
           # startup logs" ステップが生成する。
