@@ -33,15 +33,19 @@ T3 は 2 つの独立した問いに分かれる。
 
 1. **本物の秘密情報を一切使わない。** 全カナリアは `CNRY-` プレフィックスの偽値で、リポジトリにコミットされる。
    例外は `CANARY_ENV` のみで、これは GitHub Secrets に登録するが、値は同様に偽物である。
-2. **外部への実データ送信をしない。** 通信先は次の 2 つだけに限定する。
-   - HTTP: `http://example.com/...`（IANA 予約ドメイン。POST 内容は破棄される）
-   - DNS: `*.test.invalid`（RFC 2606 予約 TLD。**絶対に解決せず**、第三者に到達しない）
+2. **実データを外部送信しない。** シナリオの通信先は次の 2 つだけに限定し、
+   path / query / header に載せる値は偽カナリアだけにする。
+   - HTTP: `http://example.com/...`（IANA 予約ドメイン。現行コードは GET を使う）
+   - DNS: `*.test.invalid`（RFC 2606 予約 TLD。登録済みの第三者 endpoint にはならない）
+   `example.com` のリクエストや DNS resolver が値を記録しない保証はないため、
+   「外部送信がない」とは扱わない。
    攻撃者インフラ、実在の第三者サービス、webhook 収集サービス（webhook.site 等）は使用禁止。
 3. **実在の IOC を踏まない。** cicd-sensor の `ioc.yaml` にある実際の悪性ドメイン・IP は
    テストに使わない。kill テストは §5 の専用カスタムルールで発火させる。
 4. **汎用的な攻撃ツールを作らない。** 各シナリオは「観測されるべき syscall を発生させる最小のコマンド列」であり、
    実際の窃取・権限昇格・回避を行なう機能を持たせない。各スクリプト冒頭に用途を明記したヘッダコメントを置く。
-5. **成果物の保持期間を最小化する。** すべての `upload-artifact` に `retention-days: 1` を明示する。
+5. **成果物の保持期間を内容別に明示する。** 加工済み telemetry は `retention-days: 7`、
+   raw `capture.scap` を含む `telemetry-falco-analyze` は `retention-days: 1` とする。
 6. **危険な成果物を既定でアップロードしない。** falco analyze モードの `capture.scap` は
    §7 の漏洩検証に必要だが、既定では**アップロードしない**。`workflow_dispatch` の
    入力 `upload_raw_capture: true` を明示指定したときのみアップロードする。
@@ -54,18 +58,21 @@ T3 は 2 つの独立した問いに分かれる。
 
    - `capture.scap` に入りうるカナリア値はすべて偽物で、
      `canaries/canaries.env` としてリポジトリにコミット済み。公開されても失うものがない
-   - 実在する認証情報は 2 つだけ。`GITHUB_TOKEN`（宣言権限は `contents: read` のみ＝
-     public リポジトリでは誰でも持つ読み取り権限に過ぎず、ジョブ完了時に失効）と、
+   - 実在する認証情報は 2 つだけ。`GITHUB_TOKEN`（`record` job は
+     `contents: read`、raw artifact を削除する `analyze` job は `actions: write` も持つ。
+     短命だが run 中に漏洩すればこのリポジトリの artifact 削除に使える）と、
      `ACTIONS_RUNTIME_TOKEN`（run 中のみ有効。悪用の本命経路は `actions/cache` への
      汚染だが、このリポジトリは `actions/cache` を使っていないためその経路が存在しない）
    - `id-token: write` を宣言していないため `ACTIONS_ID_TOKEN_REQUEST_TOKEN` は存在しない
-   - 残るリスクは「このテストリポジトリ自身のアーティファクトを他人が上書きできるかも
-     しれない」程度であり、T3 の検証価値のほうが上回る
+   - 残る主な権限リスクは、このテストリポジトリの Actions artifact の削除である。
+     T3 の検証価値と、この短命だが `actions: write` を持つ token の露出リスクを
+     比較して実行する
 
    **この評価は上記の前提に依存する。** 次のいずれかが起きたら再評価すること。
 
    - リポジトリに本物の secret を追加した場合
-   - `contents: write` / `packages: write` / `id-token: write` などを宣言した場合
+   - `contents: write` / `packages: write` / `id-token: write`、または artifact cleanup
+     以外の `actions: write` を宣言した場合
    - `actions/cache` を使い始めた場合
    - self-hosted ランナーで実行する場合（GitHub-hosted の使い捨て VM とはジョブ間の
      分離モデルが異なる）
@@ -175,7 +182,7 @@ falco live モードのテレメトリ（`falco_events.json` 等）は「詳細�
 - `canaries/canaries.env` は**リポジトリにコミットされる**ため、チェックアウトしたソースツリー内に
   これらの値が存在する。スキャナはこのファイル自身とリポジトリのソースを**スキャン対象から除外**すること。
   除外しないと全カナリアが常に「漏洩」と誤判定される。
-- `CANARY_ENV` のみ GitHub Secrets に登録する。README に登録手順を書くこと。
+- `CANARY_ENV` のみ GitHub Secrets に登録する。登録手順は `docs/SETUP.md` に置くこと。
   Secret 未設定でも他のテストが動くよう、未設定時はスキップしてその旨を記録する。
 
 ---
@@ -407,7 +414,7 @@ default_max_alerts_per_rule: 50
   `asyncapi_miasma_dht_bootstrap_domain` / `miasma_systemd_unit_write` /
   `keyv_shaihulud_math_symbol_artifact`。`sensor-monitor.yml` が実行する
   `scenarios/00〜07` は、実在の IOC ドメイン・IP には一切通信せず
-  (通信先は `example.com` と `*.test.invalid` のみ、§1)、
+  (シナリオの通信先は `example.com` と `*.test.invalid` のみ、§1)、
   `docker-upstream.sock` にもアクセスせず、`systemd` 配下に `miasma` を
   含むパスへの書き込みも行なわず、`node_modules/keyv/Math_Symbol.js` の
   読み書きも行なわない。したがって現状のシナリオではこれらのいずれも
@@ -417,7 +424,7 @@ default_max_alerts_per_rule: 50
   `monitor_mode: false` の下では実際にそのジョブが kill される。**
   これは「検知のみで kill しない」ことを目的とする
   `sensor-monitor.yml` に対して残るリスクとして、正直に明記しておく
-  (README.md「既知の制約」も参照)。
+  (`docs/INVESTIGATION.md` と本節も参照)。
 
 ### 前提：cicd-sensor はルールに一致したイベントの詳細しか記録しない（実地実行 run 32510077347 で確認）
 
@@ -537,7 +544,8 @@ CEL のフィールド名はリリース版 `cicd-sensorctl` v0.0.46 に実際�
 ステップレベルの `outcome` をジョブ output 経由で受け渡すこと。
 
 **注意:** kill されなかった場合に `assert` が失敗する設計なので、この 1 本だけは
-「失敗が正常」ではなく「成功が正常」になる。README に明記すること。
+「失敗が正常」ではなく「成功が正常」になる。README の workflow 一覧と
+`docs/SETUP.md` に明記すること。
 
 **原因切り分けの補強 (run 32544606013 への対応):** `assert` ジョブは、上記の
 2 つの output に加えて、`collect-telemetry` が取得するのと同じ
@@ -1010,23 +1018,23 @@ predicate（集計レベル）しか無い状況では原理的に観測でき�
 | ワークフロー | runs-on | 目的 | 特記事項 |
 | --- | --- | --- | --- |
 | `falco-live.yml` | `ubuntu-latest` | falco live モードでの検知、および upstream falco-actions の cicd-rules マウントパスバグと fork 修正版の比較 | **2 ジョブ / 3 leg 構成。** `live` ジョブ: upstream `falcosecurity/falco-actions` を使い、`falco-version` を `0.39.0` と `0.39.2` の matrix にする（使用イメージは `falcosecurity/falco-no-driver` にハードコードされている）。`live-forked` ジョブ: fork 修正版 `fiord/falco-actions@fix/cicd-rules-mount-path`（ブランチ参照。**検証用の一時的な例外** — 上記「全ワークフロー共通」参照。修正の起点は commit 360d62c72985b790bff96abde043b14ae053efe5、https://github.com/fiord/falco-actions/commit/360d62c72985b790bff96abde043b14ae053efe5 ）を使う。この fork ブランチは cicd-rules のマウントパス修正に加え、使用イメージ自体も `falcosecurity/falco-no-driver` から、維持されている `falcosecurity/falco` に切り替えているため、`live-forked` ジョブの `falco-version` は `0.44.1`（falcosecurity/falco の Docker Hub 上の実際の最新）固定の 1 leg にする（`uses:` に式を使えないため、action 参照先を matrix で切り替えられず別ジョブにする必要がある）。upstream の `start/action.yaml:70` は CI/CD ルール（`cicd-rules`、既定 `true`）のマウント元パスが `github.action_path`（`start/` を指す）からの相対パスになっており、実体であるリポジトリ直下の `rules/` を指せず、CI/CD ルールが一度もロードされない（デフォルト動作で検知が 0 件になるバグ）。fork 修正版はこのパスを `../rules/...` に修正済み。両ジョブとも起動ログ（`falco_start_logs.txt`）から `cicd_rules.yaml` / `rules.d` への言及の有無を判定し job summary に記録する（観測目的でジョブは失敗させない）。**なぜ upstream leg (`live` ジョブ) は 0.39.x が上限か**: falcosecurity/falco-no-driver イメージ（falco-actions がハードコードして使う）は Docker Hub 上の数値タグが `0.39.2` で公開停止しているため、`required_engine_version: 0.43.0` を満たすバージョンはそもそも指定できない。`live-forked` ジョブは維持されている `falcosecurity/falco` イメージを使うため、`required_engine_version: 0.43.0` を満たす `0.44.1` を指定できる。**`live-forked` ジョブが検証したいのは次の3点**: (1) 維持されているイメージの新しい Falco (0.44.1) が現在のランナーのカーネル (6.17) で起動し続けられるか、(2) `cicd-rules` のパス修正により CI/CD 特化ルールがロードされるか、(3) 実際に検知イベントが出るか。各ジョブは falco-actions を呼ぶ前に Docker Hub のタグ API を叩く preflight ステップでタグの実在を確認する（`live` ジョブは `falcosecurity/falco-no-driver`、`live-forked` ジョブは `falcosecurity/falco` を対象にする）。`fail-fast: false`（ただし preflight 自体がタグ不在で失敗した場合はそのジョブを fail-fast させてよい。原因が明確なため）。3 leg はそれぞれ異なるテレメトリアーティファクト名（`telemetry-falco-live-0.39.0` / `telemetry-falco-live-0.39.2` / `telemetry-falco-live-forked-0.44.1`）を使う |
-| `falco-analyze.yml` | `ubuntu-latest` | falco analyze モードでの検知と生キャプチャ | `custom-rule-file` に CI/CD ルールを**明示的に渡す**（渡さないと効かないため）。`falco-version` は `0.39.2`（falcosecurity/falco-no-driver の実際の上限。理由は上記と同じ）。`analyze` ジョブは falco-actions/analyze を呼ぶ前に同様の preflight ステップでタグの実在を確認する。`upload_raw_capture` 入力で scap のアップロードを制御（既定 `false`）。**ジョブを停止するガードは置かない**（§1-6）。public リポジトリで実行された場合は、`capture.scap` に何が入りうるかを `::warning::` と job summary で告知する情報提供ステップのみを置く |
+| `falco-analyze.yml` | `ubuntu-latest` | falco analyze モードでの検知と生キャプチャ | `custom-rule-file` に CI/CD ルールを**明示的に渡す**（渡さないと効かないため）。`falco-version` は `0.39.2`（falcosecurity/falco-no-driver の実際の上限。理由は上記と同じ）。`analyze` job は falco-actions/analyze を呼ぶ前に同様の preflight ステップでタグの実在を確認する。`upload_raw_capture` 入力で scap の再アップロードを制御（既定 `false`）。**ジョブを停止するガードは置かない**（§1-6）。`record` job は `contents: read`、raw artifact を削除する `analyze` job は `contents: read, actions: write` を持つ。public リポジトリで実行された場合は、`capture.scap` に何が入りうるかを `::warning::` と job summary で告知する情報提供ステップのみを置く |
 | `sensor-monitor.yml` | `ubuntu-24.04` | cicd-sensor の検知（自作ルールでの kill は起きない想定） | `monitor_mode` はコミット値で `false`（§5。config.yaml はコミット SHA から取得されるため、`monitor_mode` はワークフローごとに切り替えられずリポジトリ全体で共通。§5「sensor-monitor.yml への影響」参照）。全シナリオを実行 |
 | `sensor-enforce.yml` | `ubuntu-24.04` | cicd-sensor の kill 動作 | `monitor_mode` はコミット値で `false`（上記と同一の値。§5）。§5 の 2 ジョブ構成。`90-killme.sh` は `load_canaries` を呼ばずカナリアを注入しないため、**この run の run_id は `leak-scan.yml` の対象にできない**（§4、§7） |
 | `leak-scan.yml` | `ubuntu-latest` | 漏洩マトリクスの生成 | 対象 run のアーティファクトを DL して走査。起動方法は 2 つ: (1) `workflow_run` で `falco-live` / `falco-analyze` / `sensor-monitor` の完了時に自動起動（対象は `github.event.workflow_run.id`）、(2) `workflow_dispatch` で run_id を手入力（過去 run の測り直し用）。両者はワークフローレベルの `env: TARGET_RUN_ID` に一本化する。`conclusion` が cancelled / skipped の run はスキップするが **failure はスキップしない**（テレメトリのアップロードは `if: always()` のため残っており走査価値がある）。ダウンロード結果が空、または `telemetry-cicd-sensor-enforce` のみだった場合はジョブを早期に落とすガードを持つ（§7）。**`gh workflow run` による自動起動は採れない**: GITHUB_TOKEN で起動した `workflow_dispatch` は GitHub の再帰防止により新しい run を作らない（docs/REQUIRED-FIXES.md R-10） |
 
 ### falco-actions / cicd-sensor-action のバージョン
 
-- `cicd-sensor-action`: README にある `6511eb44c91d71b2b93d71193b1bf2cb18352f66`（v0.0.38）を使う。
+- `cicd-sensor-action`: workflow にある `6511eb44c91d71b2b93d71193b1bf2cb18352f66`（v0.0.38）を使う。
   これは **action 側**のバージョンであり、agent 本体（`cicd-sensor` / `cicd-sensorctl`）の
   バージョンとは別物である。agent 本体は各ワークフローの
   `env: CICD_SENSOR_VERSION`（現在 `v0.0.46`）を単一の情報源とし、
   `cicd-sensor-version` 入力と `gh release download "releases/${CICD_SENSOR_VERSION}"`
   の両方に同じ値を渡す。**`http_request` を使うルールがあるため v0.0.46 未満に
   下げてはならない**（docs/REQUIRED-FIXES.md R-1 / R-2）
-- `falco-actions`: このリポジトリにはタグがないため、**実装者は SHA を確定できない**。
-  `falcosecurity/falco-actions/start@<PIN_ME>` のようにプレースホルダを置き、
-  README に「利用者が SHA を確定して差し替える」旨を明記すること。**推測の SHA を書かない**
+- `falco-actions`: upstream は `558a3ceeee9403e1c875ffbeb704c34c93e24752` に pin する。
+  タグがないため更新時は実在する commit SHA を確認して置換する。推測の SHA や
+  プレースホルダを実行可能な workflow に残さない。
 - `live-forked` ジョブが使う fork (`fiord/falco-actions`) のみ、検証用の一時的な
   例外としてブランチ参照 (`fix/cicd-rules-mount-path`) を使ってよい。検証完了後は
   SHA pin に戻すこと（上記「全ワークフロー共通」参照）
@@ -1038,13 +1046,10 @@ predicate（集計レベル）しか無い状況では原理的に観測でき�
 ### `README.md`
 
 - このリポジトリが何であるか（検証用であり、production に入れるものではない）
-- `upload_raw_capture` を有効にすると生キャプチャが誰でもダウンロード可能になる旨と、
-  **それでも public repo で実行してよいと判断した根拠**（§1-6）、および
-  **再評価が必要な条件**
-- セットアップ手順（`CANARY_ENV` シークレットの登録、falco-actions の SHA 確定、
-  `cicd-sensorctl` の入手経路が未検証である旨）
-- 各ワークフローの実行方法と、期待される結果
-- `sensor-enforce.yml` だけは「成功が正常」である旨
+- 各 workflow の簡潔な目的、成功判定の注意、保持期間、および詳細文書へのリンク。
+  200行以内に収める。
+- セットアップは `docs/SETUP.md`、実コードと run の実測は
+  `docs/INVESTIGATION.md`、公開・raw capture の判断は `docs/SAFETY.md` に置く。
 
 ### `TEST-PLAN.md`
 
@@ -1066,7 +1071,7 @@ predicate（集計レベル）しか無い状況では原理的に観測でき�
 ## 10. 実装時の禁止事項
 
 - 推測でファイルパス・フィールド名・アクション SHA を書かない。
-  不明な場合はプレースホルダにして README に明記する
+  不明な場合は workflow を有効化せず、確認方法を `docs/SETUP.md` に記録する
 - `cicd-sensor` / `falco-actions` の**元リポジトリを一切変更しない**（読み取りのみ）
 - 実在のマルウェア・IOC・攻撃者インフラを参照しない
 - `curl | sh` 形式のインストールを書かない

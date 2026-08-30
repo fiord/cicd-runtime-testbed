@@ -31,7 +31,7 @@
 `action: terminate` を持つ `testbed_kill_marker` は `sensor-enforce.yml`
 専用の `90-killme.sh` でしか発火しないため、通常はこのワークフローで
 kill は起きない（ベースラインの terminate ルールに触れた場合を除く。
-詳細は `docs/SPEC.md` §5 / `README.md` 既知の制約を参照）。
+詳細は `docs/SPEC.md` §5 / `docs/INVESTIGATION.md` を参照）。
 
 1 のワークフローは互いに独立しているため並行実行して構わない。2 は
 1 とは独立した検証 (kill 動作のみ) であり、どの順序でもよいが、
@@ -342,7 +342,7 @@ fileless 実行) を捉えていたわけではなく**ハーネスのファイ�
 
 | ワークフロー | 生成する telemetry アーティファクト | 検証目的 |
 | --- | --- | --- |
-| `falco-live.yml` | `telemetry-falco-live-0.39.0`, `telemetry-falco-live-0.39.2` | T1 (live 検知)、engine-version 不整合の実害確認 (falcosecurity/falco-no-driver の公開停止により `0.39.2` が事実上の上限。`0.43.0` は指定できない) |
+| `falco-live.yml` | `telemetry-falco-live-0.39.0`, `telemetry-falco-live-0.39.2`, `telemetry-falco-live-forked-0.44.1` | T1 (live 検知)、upstream/fork 比較。upstream は `0.39.2` が上限で、fork は `0.44.1` を使う。job の緑だけで検知成功と判定しない |
 | `falco-analyze.yml` | `telemetry-falco-analyze` | T1 (analyze 検知)、T2 (抽出情報の網羅確認) |
 | `sensor-monitor.yml` | `telemetry-cicd-sensor-monitor` | T1 (検知、kill なし)、T2 |
 | `sensor-enforce.yml` | `telemetry-cicd-sensor-enforce` (+ `assert` ジョブの成否が T1 の kill 判定そのもの) | T1 (kill)。**カナリアを注入しないため T3 (leak-scan.yml) の対象にはできない** |
@@ -350,9 +350,9 @@ fileless 実行) を捉えていたわけではなく**ハーネスのファイ�
 
 ## 前提条件
 
-- `CANARY_ENV` シークレットが登録されていること (未登録でも動くが、その項目の検証意義が失われる。README 参照)
-- falco-actions の SHA が `PIN_ME_SEE_README` から実際のコミット SHA に置換されていること (README 参照)
-- `cicd-sensorctl` の入手経路 (README「セットアップ」3節参照) は実機確認済み。
+- `CANARY_ENV` シークレットが登録されていること (未登録でも動くが、その項目の検証意義が失われる。`docs/SETUP.md` 参照)
+- upstream falco-actions が commit `558a3ceeee9403e1c875ffbeb704c34c93e24752` に pin されていること。fork leg の branch 参照は意図的な一時例外である (`docs/SETUP.md` 参照)
+- `cicd-sensorctl` の入手経路は実機確認済み。
   リリースタグが `releases/<version>` 形式である点に注意 (docs/REQUIRED-FIXES.md R-1)
 - 各ワークフローの `env: CICD_SENSOR_VERSION` が v0.0.46 以上であること。
   下げる場合は `.cicd-sensor/rules/testbed.yaml` の `testbed_canary_http_host`

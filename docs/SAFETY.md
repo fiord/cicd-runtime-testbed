@@ -25,16 +25,18 @@ falco-actions と cicd-sensor がそれをどこまで検知・記録・遮断�
 「テストだから」を理由に本物の低権限トークンを使うことも避けること
 (低権限であっても、それが本物である以上、この設計の前提が崩れる)。
 
-## 2. 外部への実データ送信をしない
+## 2. 実データを外部送信しない
 
-**やること**: 通信先は `http://example.com/...` (IANA 予約ドメイン) と
-`*.test.invalid` (RFC 2606 予約 TLD、名前解決させない) の2つだけに限定する。
+**やること**: シナリオの通信先は `http://example.com/...` (IANA 予約ドメイン) と
+`*.test.invalid` (RFC 2606 予約 TLD) の2つだけに限定し、URL / header / DNS label
+には偽カナリアだけを載せる。
 
-**理由**: `example.com` への POST は IANA が「実験用に予約し、内容を保存しない」
-ことを保証しているドメインであり、送信内容が第三者に渡ることはない。
-`.test.invalid` は RFC 2606 で「絶対に解決してはいけない」と定められた予約 TLD で、
-DNS クエリのラベルにカナリア値を含めても、その名前解決が実際に外部の権威サーバーに
-届くことはない (仮に届いたとしても `.invalid` は誰にも登録できない)。
+**理由**: 現行の `02-exfil.sh` は `example.com` へ **GET** を発行し、URL query /
+path に偽カナリアを載せる。したがって「外部送信しない」ではなく、
+**実在の secret を送らない**ことが正しい安全条件である。`example.com` は実験用の
+予約ドメインだが、リクエスト path / query がサーバーや中継ログに残らない保証として
+扱ってはならない。`.test.invalid` は RFC 2606 の予約 TLD であり登録済みの第三者
+endpoint にはならないが、DNS resolver が query を観測する可能性まで否定しない。
 webhook.site のような「送った内容を見せてくれる」サービスは、運営者に実データを
 渡してしまう時点でこのリポジトリの安全設計と矛盾するため使わない。攻撃者インフラは
 論外として、実在する第三者サービス全般をテストの通信先にしないという原則が背景にある。
@@ -43,10 +45,12 @@ webhook.site のような「送った内容を見せてくれる」サービス�
 変えないこと。特に「もう少しリアルにしたいから」という理由で実在のドメインや
 社内 webhook サービスに向けないこと。
 
-**補足 (preflight の Docker Hub API 呼び出しについて)**: `falco-live.yml` /
-`falco-analyze.yml` は、falco-actions の action を呼ぶ前に
-`https://hub.docker.com/v2/repositories/falcosecurity/falco-no-driver/tags`
-を叩く preflight ステップを持つ。これは検知シナリオが送信する「テスト対象の
+**補足 (workflow 自身の外部通信について)**: `falco-live.yml` /
+`falco-analyze.yml` は、falco-actions の action を呼ぶ前に Docker Hub tag API
+を叩く preflight ステップを持つ。`live-forked` は `falcosecurity/falco`、
+upstream / analyze は `falcosecurity/falco-no-driver` を確認する。また、
+cicd-sensor の release download と artifact 回収・削除には GitHub API を使う。
+これは検知シナリオが送信する「テスト対象の
 通信」ではなく、ワークフロー自身が使う Docker イメージのタグが実在するかを
 確認する**インフラ確認**であり、上記の「通信先は `example.com` /
 `*.test.invalid` に限定する」という制約の対象外として扱う。カナリア値・
@@ -88,19 +92,21 @@ GitHub 側やネットワーク監視側で不要なアラートや調査コス�
 拡張しないこと。目的は特定の syscall / イベントを発生させることであって、
 実際に何かを盗む・壊す・回避する必要はない。
 
-## 5. 成果物の保持期間を最小化する
+## 5. 成果物の保持期間と公開範囲を管理する
 
-**やること**: すべての `upload-artifact` に `retention-days: 1` を明示する。
+**現行実装**: 加工済み telemetry は `retention-days: 7`。ただし
+`falco-analyze.yml` で `upload_raw_capture: true` のとき、raw `capture.scap` を
+含む `telemetry-falco-analyze` だけは `retention-days: 1` である。
 
 **理由**: このリポジトリのアーティファクトには、程度の差はあれ「漏洩したカナリア値」
 や「実行環境の詳細」が含まれうる。保持期間が長いほど、意図しない第三者が
-古いアーティファクトを見つけてダウンロードできる時間が長くなる。1日という短い
-保持期間にすることで、実験直後に結果を確認する用途には十分でありながら、
-露出時間を最小化できる。
+古いアーティファクトを見つけてダウンロードできる時間が長くなる。一方で実測の
+比較には数日間の保持が必要なため、偽カナリアだけを含む加工済み telemetry は7日、
+raw capture は1日という現行の分離を採る。
 
 **fork する人が守ること**: 新しいワークフローやジョブを追加する際も
-`retention-days: 1` を必ず明示すること (省略するとリポジトリ設定の既定値、
-多くの場合もっと長い日数が使われてしまう)。falco-actions / cicd-sensor-action
+用途と内容に応じた `retention-days` を必ず明示すること。raw capture または
+本物の情報を含み得る成果物を7日保持してはならない。falco-actions / cicd-sensor-action
 のように、自分たちで retention-days を指定できないアクションを使う場合は、
 `falco-analyze.yml` / `sensor-monitor.yml` / `sensor-enforce.yml` が行なっているように、
 必要な情報だけを自分たちのアーティファクトにコピーしたうえで元のアーティファクトを
@@ -133,15 +139,17 @@ stop action (analyze モード) は `capture.scap` を無条件にアップロ�
 - `capture.scap` に入りうるカナリア値はすべて偽物で、リポジトリにコミット済み。
   公開されても失うものがない。
 - このワークフローが実際に持つ本物の認証情報は次の2つだけである。
-  - `GITHUB_TOKEN`: 宣言している権限は `contents: read` のみ。public repo では
-    誰でも読み取れる情報に対する権限に過ぎず、ジョブ完了時に失効する。
+  - `GITHUB_TOKEN`: `record` job は `contents: read` のみだが、`analyze` job は
+    falco-actions が作った `capture` / `hashes` artifact を削除するため
+    `actions: write` も持つ。ジョブ完了時に失効するが、run 中に漏洩すれば
+    このリポジトリの Actions artifact を削除できる権限として扱う。
   - `ACTIONS_RUNTIME_TOKEN`: run 中のみ有効な内部トークン。悪用の本命経路は
     `actions/cache` への汚染だが、このリポジトリは `actions/cache` を
     使っていないため、その経路自体が存在しない。
 - `id-token: write` を宣言していないため `ACTIONS_ID_TOKEN_REQUEST_TOKEN` は存在しない。
-- 残るリスクは「このテストリポジトリ自身のアーティファクトを他人が上書きできるかも
-  しれない」程度であり、T3 (`capture.scap` から実際に何が漏れるかを観測する) の
-  検証価値のほうが上回る。
+- 残る主な権限リスクは、このテストリポジトリの Actions artifact の削除である。
+  T3 (`capture.scap` から実際に何が漏れるかを観測する) の価値と、この短命だが
+  `actions: write` を持つ token の露出リスクを比較して実行を判断する。
 
 このワークフローは「`capture.scap` から実際に漏れること」を観測するのが目的であり、
 漏洩を再現する作りになっている。上記の根拠により、その観測を public repo で行なってよい。
@@ -152,16 +160,18 @@ public repo で実行すると、`Notice: raw capture exposure on a public repos
 他の4本 (`falco-live.yml` / `sensor-monitor.yml` / `sensor-enforce.yml` /
 `leak-scan.yml`) は生キャプチャを扱わないため、public でも実行してよい。
 
-**この評価は、このリポジトリに本物の secret が無く、権限宣言が `contents: read`
-のみであることに依存している。** 次のいずれかが起きたら再評価すること。
+**この評価は、このリポジトリに本物の secret が無く、write 権限が raw artifact
+削除に必要な `actions: write` に限られることに依存している。** 次のいずれかが
+起きたら再評価すること。
 
 - リポジトリに本物の secret を追加した場合
-- `contents: write` や `id-token: write` を宣言した場合
+- `contents: write`、`id-token: write`、または artifact cleanup 以外の
+  `actions: write` を宣言した場合
 - `actions/cache` を使い始めた場合
 
 **fork する人が守ること**: `upload_raw_capture: true` を既定値に変更しないこと。
-上記の評価の前提 (本物の secret が無い、権限が `contents: read` のみ、
-`actions/cache` を使っていない) を fork 先で変えるなら、public repo での
+上記の評価の前提 (本物の secret が無い、`actions: write` は raw artifact cleanup
+に限定する、`actions/cache` を使っていない) を fork 先で変えるなら、public repo での
 実行可否を自分で再評価すること。
 
 ---
@@ -169,13 +179,13 @@ public repo で実行すると、`Notice: raw capture exposure on a public repos
 ## まとめ: fork / 流用する人へのチェックリスト
 
 - [ ] 本物の秘密情報・API キー・トークンをどのファイルにも書き込んでいないか
-- [ ] 通信先を `example.com` / `*.test.invalid` 以外に変えていないか
+- [ ] シナリオの通信先を `example.com` / `*.test.invalid` 以外に変えていないか。URL / header / DNS label が偽カナリアだけか
 - [ ] 実在の IOC (悪性ドメイン・IP・ハッシュ) をシナリオやルールに混ぜていないか
 - [ ] シナリオを実際に有害な攻撃コードへ拡張していないか
-- [ ] 新しいアーティファクトに `retention-days: 1` を付け忘れていないか
+- [ ] 新しいアーティファクトに内容に応じた `retention-days`（通常7日、raw capture は1日）を明示したか
 - [ ] `upload_raw_capture` を既定で有効にしていないか
 - [ ] `falco-analyze.yml` を public repo で走らせる前提 (本物の secret が無い、
-      権限宣言が `contents: read` のみ、`actions/cache` を使っていない) を
+      `actions: write` は raw artifact cleanup に限定される、`actions/cache` を使っていない) を
       fork 先で崩していないか。崩した場合は public repo での実行可否を再評価したか
 - [ ] トリガーを `push` / `pull_request` に変えていないか (`workflow_dispatch` のみを維持する)
 - [ ] fork のブランチ参照 (`falco-live.yml` の `live-forked` ジョブが使う

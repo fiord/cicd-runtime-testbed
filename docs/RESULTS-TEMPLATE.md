@@ -7,7 +7,7 @@
 - 実行日:
 - 実行者:
 - 対象コミット (SHA):
-- 使用した falco-actions の SHA (README 手順で確定したもの):
+- 使用した falco-actions の SHA（workflow と `docs/SETUP.md` で確認したもの）:
 - `cicd-sensorctl` 入手経路の検証結果 (成功 / 失敗、失敗時の対処):
 
 ---
@@ -453,8 +453,8 @@ rule validate: bundle failed validation
 カスタムルールや `monitor_mode` の意味まで変わってしまう。** ローカルの
 `cicd-sensorctl rule validate` (HEAD からビルドしたもの) はこの不整合を
 検出できない (むしろ通ってしまう) ため、実際に GitHub Actions 上で走らせて
-job summary / ジョブログを確認するまで気づけない。README.md「既知の制約」
-を参照。
+job summary / ジョブログを確認するまで気づけない。`docs/INVESTIGATION.md` の
+実装上の制約を参照。
 
 ---
 
@@ -521,8 +521,8 @@ run 32544606013 の対応 (`testbed_canary_http_host` のコメントアウト�
 3. `sensor-enforce.yml` の `assert` ジョブの診断メッセージに、
    「`monitor_mode` はコミット値で決まり、実行時の書き換えは効かない」
    旨を追記した。
-4. `docs/SPEC.md` §5 を全面的に書き換え、`README.md` 既知の制約に
-   この挙動 (セキュリティ上は良い設計であることも含め) を追記した。
+4. `docs/SPEC.md` §5 と `docs/INVESTIGATION.md` に、この挙動
+   (セキュリティ上は良い設計であることも含む) を記録した。
 
 ### 教訓
 
@@ -598,7 +598,7 @@ redaction」「パスは redact されない」といった、cicd-sensor の実
    から「生 (`capture.scap` そのもの)」に修正した。以前は証跡粒度チェック
    の対象外で、`capture.scap` の無い falco live モードに対して誤って
    ⚠️ になっていた。
-3. `docs/SPEC.md` §3・§7、`README.md`、`docs/TEST-PLAN.md` に、
+3. `docs/SPEC.md` §3・§7、`docs/INVESTIGATION.md`、`docs/TEST-PLAN.md` に、
    scored/informational の区別とその理由を追記した。
 4. 既存の3つの N/A 機構（ツール種別 / 証跡粒度 / `http_request` サポート）
    は変更せず、今回の scored/informational とは独立に動作するようにした。

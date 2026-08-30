@@ -106,7 +106,7 @@ Loading rules from:
 > `docker ps` で `running` を一度見た時点でループを抜けて成功扱いにするため、
 > その直後に Falco がクラッシュしても検知できなかった。修正後は `running`
 > 確認後さらに `sleep 3` して再チェックし、生きていなければログを出して
-> 失敗させる。README.md も更新済み (commit `ba52d6d`)。
+> 失敗させる。現行の実測と制約は `docs/INVESTIGATION.md` に集約する。
 > `falcosecurity/falco:0.44.1` が既存の起動コマンドをそのまま受け付けることは
 > ローカルの `docker run` で確認済みだが、`start`/`analyze` action 経由での
 > 実行・CI での確認はまだ行っていない。
@@ -187,7 +187,8 @@ falco-actions 自体を checkout して `rules/falco_cicd_rules.yaml` を
 > `releases/${CICD_SENSOR_VERSION}` に修正し、ワークフローレベルの
 > `env: CICD_SENSOR_VERSION` を単一の source of truth として導入、
 > 存在しない `cicd-sensorctl version` の呼び出しを削除した。
-> README「セットアップ」3節の「未検証」記述も実測結果で置き換えた。
+> セットアップ情報は `docs/SETUP.md` に置き、実測結果は
+> `docs/INVESTIGATION.md` に記録する。
 > なお本文は `falco-live.yml` にも同じ install ブロックがあるとしているが、
 > 実際には `falco-live.yml` に `cicd-sensorctl` の install は**存在しない**
 > (grep で確認)。対象は 2 ワークフローである。
@@ -243,7 +244,8 @@ kill に失敗した事故 (run 32388911992 / 32544606013 / 32545681004) は
 > (従来は入力を渡しておらず、action 側の既定値 v0.0.45 が使われていた)。
 > `.cicd-sensor/rules/testbed.yaml` の `testbed_canary_http_host` を
 > コメントアウトから復帰させ、「main にしかない」旨の陳腐化した
-> コメントを実測結果に書き換えた。README の同趣旨の記述も修正。
+> コメントを実測結果に書き換えた。実測の要約は
+> `docs/INVESTIGATION.md` に置く。
 >
 > ローカル実験 (同一バンドルを両バージョンの `cicd-sensorctl` に投入):
 > v0.0.45 → `unsupported event type "http_request"` / exit 1、
@@ -274,7 +276,7 @@ OK: 1 file(s) bundled and validated
 「観測する場所が存在しない」ため T3 で恒久的に N/A になっている。
 このルールが復活すれば **10 カナリア中 9 件が判定可能**になる。
 
-> 併せて、README / testbed.yaml のコメントにある
+> 併せて、当時の README / testbed.yaml のコメントにあった
 > 「http_request 対応は main ブランチにしか存在しない」という記述は
 > v0.0.46 のリリースにより古くなっているので更新すること。
 
@@ -382,7 +384,7 @@ step summary は **check-runs API から取得できない**ため、
 > falco-actions が自前でアップロードする生 `capture` / `hashes` の
 > 即時削除処理は変更していない。
 
-`retention-days: 1` のため、数日で全証跡が消える。
+変更前は `retention-days: 1` のため、数日で全証跡が消えていた。
 public repo での secret 露出を避ける設計意図は理解できるが、
 **カナリアは全て偽値であり、`capture.scap` を削除する運用も既にある**ため、
 `telemetry-*` (加工済み) の保持期間だけは 7〜30 日に延ばして良い。
@@ -490,7 +492,7 @@ cnry-dns-donotuse-18ebf5.test.invalid.<runner の Azure 内部サーチドメイ
 >
 > **制約 (要認識)**: `workflow_run` はデフォルトブランチ上のワークフロー
 > 定義でしか発火しない。ブランチで検証している間は手動起動が必要。
-> README / docs/TEST-PLAN.md にも明記した。
+> `docs/SETUP.md` / `docs/TEST-PLAN.md` にも明記した。
 
 現在 leak-scan は `run_id` を手で渡す `workflow_dispatch` 専用で、
 その結果 **cicd-sensor に対する T3 は 1 commit 前のツールコードでしか
