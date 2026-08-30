@@ -149,25 +149,17 @@ F-1 の直接の帰結として、**「センサーは動いているが何も�
 
 ### F-4 【任意】analyze モードに `cicd-rules` 相当の自動ロード経路が無い
 
-> **状態: fork で実装済み (静的検証のみ / CI 未実行)。本リポジトリはまだ未反映。**
+> **状態: fork と本リポジトリの workflow に実装済み (CI 未実行)。**
 > commit `bc91ce3` (`feat(analyze): add cicd-rules input matching start's`) で
 > `analyze/action.yaml` に `cicd-rules` boolean 入力 (既定 true) を追加し、
 > `start` と同じ要領で
 > `${{github.action_path}}/../rules/falco_cicd_rules.yaml` をマウントする
 > ようにした。
 >
-> ただし本リポジトリの `.github/workflows/falco-analyze.yml` は現時点でも
-> 旧来の回避策のまま (`falcosecurity/falco-actions` を `_falco-actions-src`
-> に checkout し、`custom-rule-file` で `rules/falco_cicd_rules.yaml` を
-> 明示的に渡している)。これは fork ではなく upstream
-> (`falcosecurity/falco-actions/analyze@558a3ce...`) を参照しているためで、
-> **F-4 は実装済みだが本リポジトリではまだ利用されていない**。
-
-`analyze` action には `cicd-rules` 入力が無いため、本リポジトリは
-falco-actions 自体を checkout して `rules/falco_cicd_rules.yaml` を
-`custom-rule-file` に渡すという回避策を取っている
-(`.github/workflows/falco-analyze.yml`)。live と analyze で
-入力インターフェースを揃えるべき。
+> `.github/workflows/falco-analyze.yml` も fork の `start` / `stop` /
+> `analyze` を参照し、`cicd-rules: true` を渡す。旧来の外部 checkout と
+> `custom-rule-file` 回避策は削除した。fork の replay 成功と
+> `Loading rules from:` に同梱ルールが現れることは、次回 run で確認する。
 
 ### (参考) `required_engine_version` は問題ではなかった
 
@@ -381,8 +373,9 @@ step summary は **check-runs API から取得できない**ため、
 > 戻す条件式にした:
 > `retention-days: ${{ (inputs.upload_raw_capture == true || inputs.upload_raw_capture == 'true') && 1 || 7 }}`
 > (boolean 入力が boolean で来る場合と文字列で来る場合の両方を受ける)。
-> falco-actions が自前でアップロードする生 `capture` / `hashes` の
-> 即時削除処理は変更していない。
+> fork stop action に `capture-retention-days` / `hashes-retention-days`
+> 入力を加え、workflow は両方を 1 日に設定した。使用後の即時削除処理も
+> 維持する。
 
 変更前は `retention-days: 1` のため、数日で全証跡が消えていた。
 public repo での secret 露出を避ける設計意図は理解できるが、

@@ -12,38 +12,19 @@
 
 ---
 
-## 調査結果: falco-actions が使えるイメージバージョンの上限 (falco-no-driver 公開停止)
+## 調査結果: upstream の古いイメージと fork の replay
 
-これはバグではなく、falco-actions に関する重要な調査結果である。以下を必ず記入すること。
+upstream の live action は `falcosecurity/falco-no-driver` を使うため、数値タグは
+`0.39.2` で止まる。一方、fork の start / analyze action は維持されている
+`falcosecurity/falco:0.44.1` を使い、analyze でも `cicd-rules: true` により
+同梱ルールを自動ロードする。以下を必ず記入すること。
 
-- **確認事実**: falco-actions の `start` / `analyze` action は使用イメージを
-  `IMAGE="falcosecurity/falco-no-driver"` にハードコードしている
-  (`falco-actions/start/action.yaml`, `analyze/action.yaml`)。このイメージは
-  Docker Hub 上の数値バージョンタグの最大が `0.39.2` で止まっている
-  (`latest` の最終 push も 2024-11-21 で、事実上メンテナンスが止まっている)。
-  falco 本体イメージ (`falcosecurity/falco`) は `0.44.1` まであり `latest` の
-  push も新しいが、falco-actions はそちらを使わないため、このテストベッドから
-  利用する手段はない。**したがって falco-actions が使える Falco のバージョンは
-  実質 `0.39.2` が上限である。**
-- 一方、falco-actions 同梱の CI/CD ルール (`rules/falco_cicd_rules.yaml`) は
-  先頭で `required_engine_version: 0.43.0` を要求している。
-- **仮説**: 上記2点から、「falco-actions は、自身の同梱 CI/CD ルールが
-  要求するエンジンバージョンを満たすイメージを pull できない可能性が高い」
-  という仮説が立つ。
-- **今回の実行で得られた実測 (ここが T1 の中核的な観測結果)**:
-  - `falco-live.yml` (`falco-version: 0.39.0` および `0.39.2`) で、
-    `required_engine_version: 0.43.0` のルールを実際にロードできたか /
-    拒否されたか / 警告のみで通ったか (job summary の
-    "required_engine_version" セクション、`falco_start_logs.txt` を参照):
-    - `0.39.0`:
-    - `0.39.2`:
-  - `falco-analyze.yml` (`falco-version: 0.39.2`) で、同じルールファイルを
-    `custom-rule-file` として明示的に渡した場合の結果 (`Analyze capture`
-    ステップの outcome、job summary の "required_engine_version" セクション、
-    `verbose: true` の生ログを目視確認した結果):
-    - ロード成功 / 拒否 (falco が起動時に fatal error で落ちた) /
-      警告のみで通過 (該当するものに丸をつけ、具体的なログ抜粋を記入):
-  - 上記の仮説は 成立した / 成立しなかった (具体的な事象を記述):
+- `falco-live.yml` の upstream 0.39.0 / 0.39.2: CI/CD ルールが未ロードである
+  根拠と、標準ルールを含む検知有無。
+- `falco-live.yml` の fork 0.44.1: 同梱 CI/CD ルールのロード、検知件数、起動警告・
+  クラッシュ有無。
+- `falco-analyze.yml` の fork 0.44.1: `Analyze capture` の outcome、
+  `Loading rules from:` に同梱ルールが出るか、抽出テレメトリと検知件数。
 
 ---
 
@@ -139,10 +120,11 @@ upstream 版と fork 修正版を比較し、バグの影響を定量的に記�
 ### falco-analyze.yml
 
 - run URL:
-- preflight ステップ (Docker Hub タグ `0.39.2` 実在確認) の結果:
+- action 参照先: `fiord/falco-actions@fix/cicd-rules-mount-path`
+- preflight ステップ (`falcosecurity/falco:0.44.1` タグ実在確認) の結果:
 - `upload_raw_capture`: true / false
-- `Analyze capture` ステップの outcome (`continue-on-error: true` のため、失敗しても後続は実行される):
-- required_engine_version 0.43.0 のルールを 0.39.2 エンジンが実際にロードできたか (上の調査結果セクション参照):
+- `Analyze capture` ステップの outcome (failure 時も cleanup 後に job を失敗させる):
+- `cicd-rules: true` の同梱ルールを実際にロードできたか (`Loading rules from:` の根拠):
 - 発火したルール:
 - シナリオごとの検知有無 (falco-live.yml と同じ形式で記入):
 

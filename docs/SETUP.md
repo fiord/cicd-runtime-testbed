@@ -17,8 +17,9 @@
   `558a3ceeee9403e1c875ffbeb704c34c93e24752` に pin されている。
 - cicd-sensor action は commit
   `6511eb44c91d71b2b93d71193b1bf2cb18352f66` (`v0.0.38`) に pin されている。
-- `live-forked` の `fiord/falco-actions@fix/cicd-rules-mount-path` だけは、
-  調査中の意図的な branch 参照である。結果が安定したら commit SHA に戻す。
+- `live-forked` と `falco-analyze.yml` の fork actions は
+  `fiord/falco-actions@fix/cicd-rules-mount-path` を参照する。調査中の
+  意図的な branch 参照である。結果が安定したら commit SHA に戻す。
 
 参照先を更新する場合は、参照する action の実ファイルと Docker image の対応を
 確認してから、commit SHA と調査記録を同時に更新する。

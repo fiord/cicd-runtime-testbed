@@ -47,8 +47,9 @@ webhook.site のような「送った内容を見せてくれる」サービス�
 
 **補足 (workflow 自身の外部通信について)**: `falco-live.yml` /
 `falco-analyze.yml` は、falco-actions の action を呼ぶ前に Docker Hub tag API
-を叩く preflight ステップを持つ。`live-forked` は `falcosecurity/falco`、
-upstream / analyze は `falcosecurity/falco-no-driver` を確認する。また、
+を叩く preflight ステップを持つ。`live-forked` と analyze fork は
+`falcosecurity/falco`、upstream live は `falcosecurity/falco-no-driver` を
+確認する。また、
 cicd-sensor の release download と artifact 回収・削除には GitHub API を使う。
 これは検知シナリオが送信する「テスト対象の
 通信」ではなく、ワークフロー自身が使う Docker イメージのタグが実在するかを
@@ -125,12 +126,12 @@ public repo でこれを常時公開すると、意図しない情報漏洩の�
 既定でオフにし、明示的に有効化した場合だけ生成することで、「見たいときに見られるが、
 うっかり誰でも見られる状態を常態化させない」という設計にしている。
 
-**ただし完全な「既定でアップロードしない」は達成できていない**: `falco-actions` の
-stop action (analyze モード) は `capture.scap` を無条件にアップロードし、
-これを抑止する入力は存在しない。元リポジトリは変更しない方針のため、
-`falco-analyze.yml` は「アップロード直後に GitHub API で削除する」方式で緩和している。
+**ただし完全な「既定でアップロードしない」は達成できていない**: fork の
+stop action (analyze モード) は `capture.scap` を無条件にアップロードする。
+fork で `capture-retention-days` / `hashes-retention-days` 入力を追加し、
+この workflow はともに 1 日を渡す。それでも capture のアップロード自体を抑止する
+入力はないため、`falco-analyze.yml` は使用直後に GitHub API で削除する。
 削除が完了するまでの数秒〜数十秒は、public repo では誰でもダウンロードできる。
-この時間差は元アクションの実装に起因するもので、ワークフロー側では解消できない。
 
 **`falco-analyze.yml` は public repo で実行してよく、ジョブを停止するガードは
 存在しない**。以前のバージョンには「public かつ `upload_raw_capture: true` なら
@@ -188,7 +189,8 @@ public repo で実行すると、`Notice: raw capture exposure on a public repos
       `actions: write` は raw artifact cleanup に限定される、`actions/cache` を使っていない) を
       fork 先で崩していないか。崩した場合は public repo での実行可否を再評価したか
 - [ ] トリガーを `push` / `pull_request` に変えていないか (`workflow_dispatch` のみを維持する)
-- [ ] fork のブランチ参照 (`falco-live.yml` の `live-forked` ジョブが使う
-      `fiord/falco-actions/start` / `stop@fix/cicd-rules-mount-path`) が、
+- [ ] fork のブランチ参照 (`falco-live.yml` の `live-forked` と
+      `falco-analyze.yml` が使う
+      `fiord/falco-actions/*@fix/cicd-rules-mount-path`) が、
       検証用の一時例外のまま残っていないか。検証が完了していれば
       コミット SHA pin に戻っているべき (docs/SPEC.md §8 参照)
