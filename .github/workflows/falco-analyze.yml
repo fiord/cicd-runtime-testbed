@@ -5,36 +5,12 @@
 #   sysdig capture (capture.scap) に記録し、falco の replay エンジンで
 #   後から解析した際に何が検知・抽出されるかを確認する。
 #
-#   analyze action の `custom-rule-file` は明示的に渡さない限り
-#   falco-actions 同梱の CI/CD ルールセットを一切ロードしない
-#   (start action の live モードだけが `cicd-rules: true` で自動ロードする
-#   ため、analyze action には対応する自動ロード機構が存在しない)。
-#   このワークフローは falcosecurity/falco-actions リポジトリ本体
-#   (rules/falco_cicd_rules.yaml) を pin 済み ref でチェックアウトし、
-#   その場所を custom-rule-file に明示的に渡す。live モードと同じ
-#   ルールセットで比較できるようにするため。
-#
-#   なぜ falco-version が 0.39.2 か: analyze action は使用イメージを
-#   `IMAGE="falcosecurity/falco-no-driver"` にハードコードしている
-#   (falco-actions/analyze/action.yaml)。このイメージは Docker Hub 上の
-#   数値バージョンタグの最大が `0.39.2` で止まっている (latest の最終 push も
-#   2024-11-21 で、事実上メンテナンスが止まっている)。falco 本体イメージ
-#   (falcosecurity/falco) は 0.44.1 まであるが、falco-actions はそちらを
-#   使わないためこのテストベッドから利用する手段が無い。以前は
-#   `falco-version: "0.43.0"` を指定していたが、これは
-#   `required_engine_version: 0.43.0` (falco_cicd_rules.yaml のルールエンジン
-#   バージョン宣言、Falco のリリースバージョンとは別系統) を Falco の
-#   リリース番号と取り違えた仕様策定時の誤りであり、実在しないタグを指定して
-#   `manifest unknown` (exit 125) で失敗していた。
-#
-#   さらに重要な点: `0.39.2` に直しても、`custom-rule-file` で渡す
-#   falco_cicd_rules.yaml 自体が `required_engine_version: 0.43.0` を宣言して
-#   いるため、falco エンジン 0.39.2 がこのルールファイルをロード時に拒否する
-#   (または警告のみで通す) 可能性がある。つまり「falco-actions は、自身の
-#   同梱 CI/CD ルールが要求するエンジンバージョンを満たすイメージを pull
-#   できない可能性が高い」という仮説が成り立つ。"Analyze capture" ステップに
-#   `continue-on-error: true` を付けて実際の成否を観測し、job summary と
-#   docs/RESULTS-TEMPLATE.md に記録する (下記ステップ参照)。
+#   fork の analyze action は `cicd-rules: true`（既定値）で、同梱の
+#   CI/CD ルールを自動ロードできる。upstream の旧実装に必要だった
+#   repository checkout と custom-rule-file の回避策は使わない。
+#   fork は維持されている `falcosecurity/falco:0.44.1` を使用するため、
+#   現行 GitHub-hosted runner のカーネルで replay が動作するか、かつ
+#   ルールが実際にロードされたかを検証できる。
 #
 # 安全性 (docs/SPEC.md §1-6):
 #   falco-actions の stop action (analyze モード) は capture.scap を
@@ -187,7 +163,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Start Falco (analyze mode / sysdig capture)
-        uses: falcosecurity/falco-actions/start@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README
+        uses: fiord/falco-actions/start@fix/cicd-rules-mount-path # TEMPORARY: test the fork; pin to a commit SHA after validation
         with:
           mode: analyze
           verbose: true
@@ -228,10 +204,14 @@ jobs:
 
       - name: Stop Falco (analyze mode) — uploads capture.scap + hashes
         if: always()
-        uses: falcosecurity/falco-actions/stop@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README
+        uses: fiord/falco-actions/stop@fix/cicd-rules-mount-path # TEMPORARY: test the fork; pin to a commit SHA after validation
         with:
           mode: analyze
           verbose: true
+          # The fork explicitly bounds the temporary raw artifacts. They are
+          # still deleted by the analyze job after it consumes them.
+          capture-retention-days: 1
+          hashes-retention-days: 1
 
   analyze:
     name: "analyze (falco replay)"
@@ -245,36 +225,28 @@ jobs:
       # アーティファクトを削除するため (write は read を包含する)。
       actions: write
     steps:
-      - name: Checkout falco-actions (for its bundled CI/CD rule file)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: falcosecurity/falco-actions
-          ref: 558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: must match the same commit used for the uses: pins above, see README
-          path: _falco-actions-src
-
-      - name: "Preflight: falcosecurity/falco-no-driver:0.39.2 タグの実在確認"
-        # analyze action もイメージを falcosecurity/falco-no-driver に
-        # ハードコードしている (falco-actions/analyze/action.yaml)。存在しない
-        # タグを指定すると action の奥深くで `docker: ... manifest unknown` と
-        # exit 125 になり原因がわかりにくい (今回報告された障害そのもの)。
+      - name: "Preflight: falcosecurity/falco:0.44.1 タグの実在確認"
+        # fork の analyze action は維持されている falcosecurity/falco を使う。
+        # 存在しないタグを指定すると action の奥深くで manifest unknown と
+        # exit 125 になり原因がわかりにくいため、先に確認する。
         # ここで先に Docker Hub のタグ API を叩いて実在を確認し、無ければ
         # ここで明確に落とす。ネットワーク障害や rate limit で preflight 自体が
         # 失敗した場合は、テストの可用性を落とさないよう警告のみで続行する。
         shell: bash
         env:
-          FALCO_VERSION: "0.39.2"
+          FALCO_VERSION: "0.44.1"
         run: |
           set -uo pipefail
-          API_URL="https://hub.docker.com/v2/repositories/falcosecurity/falco-no-driver/tags?page_size=100&ordering=last_updated"
+          API_URL="https://hub.docker.com/v2/repositories/falcosecurity/falco/tags?page_size=100&ordering=last_updated"
           RESPONSE_FILE="$(mktemp)"
           HTTP_CODE="$(curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' --max-time 20 "$API_URL" 2>/dev/null)"
           CURL_EXIT=$?
           HTTP_CODE="${HTTP_CODE:-000}"
 
           if [ "$CURL_EXIT" -ne 0 ] || [ "$HTTP_CODE" != "200" ]; then
-            echo "::warning title=falco-no-driver tag preflight skipped::Docker Hub API (${API_URL}) への接続に失敗しました (curl exit=${CURL_EXIT}, HTTP ${HTTP_CODE})。ネットワーク障害または rate limit の可能性があるため、preflight をスキップしてワークフローを続行します。falco-version=${FALCO_VERSION} が実在しない場合、後続のステップが manifest not found で失敗する可能性があります。"
+            echo "::warning title=falco tag preflight skipped::Docker Hub API (${API_URL}) への接続に失敗しました (curl exit=${CURL_EXIT}, HTTP ${HTTP_CODE})。ネットワーク障害または rate limit の可能性があるため、preflight をスキップしてワークフローを続行します。falco-version=${FALCO_VERSION} が実在しない場合、後続のステップが manifest not found で失敗する可能性があります。"
             {
-              echo "### preflight: falcosecurity/falco-no-driver:${FALCO_VERSION} (skipped)"
+              echo "### preflight: falcosecurity/falco:${FALCO_VERSION} (skipped)"
               echo ""
               echo "Docker Hub API への接続に失敗しました (curl exit=${CURL_EXIT}, HTTP ${HTTP_CODE})。"
               echo "ネットワーク障害または rate limit の可能性があるため、確認をスキップして続行しました。"
@@ -317,9 +289,9 @@ jobs:
                   f"Docker Hub API のレスポンス解析に失敗しました ({e})。"
                   f"確認をスキップして続行します。"
               )
-              print(f"::warning title=falco-no-driver tag preflight skipped::{msg}")
+              print(f"::warning title=falco tag preflight skipped::{msg}")
               with open_summary(summary_file) as s:
-                  s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version} (skipped)\n\n")
+                  s.write(f"### preflight: falcosecurity/falco:{falco_version} (skipped)\n\n")
                   s.write(f"{msg}\n")
               sys.exit(0)
 
@@ -332,44 +304,37 @@ jobs:
           if falco_version in tag_map:
               tag = tag_map[falco_version]
               last_pushed = tag.get("tag_last_pushed") or tag.get("last_updated") or "unknown"
-              print(f"preflight OK: falcosecurity/falco-no-driver:{falco_version} exists (tag_last_pushed={last_pushed})")
+              print(f"preflight OK: falcosecurity/falco:{falco_version} exists (tag_last_pushed={last_pushed})")
               with open_summary(summary_file) as s:
-                  s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version}\n\n")
+                  s.write(f"### preflight: falcosecurity/falco:{falco_version}\n\n")
                   s.write(f"- Docker Hub にタグが実在することを確認しました。\n")
                   s.write(f"- 最終 push (`tag_last_pushed`): `{last_pushed}`\n\n")
               sys.exit(0)
           else:
               available = ", ".join(numeric_tags) if numeric_tags else "(取得できたページ内に数値タグが見つかりませんでした)"
               msg = (
-                  f"falcosecurity/falco-no-driver:{falco_version} は Docker Hub に存在しません "
+                  f"falcosecurity/falco:{falco_version} は Docker Hub に存在しません "
                   f"(manifest unknown になります)。利用可能な数値タグ: {available}"
               )
-              print(f"::error title=falco-no-driver tag not found::{msg}")
+              print(f"::error title=falco tag not found::{msg}")
               with open_summary(summary_file) as s:
-                  s.write(f"### preflight: falcosecurity/falco-no-driver:{falco_version} (NOT FOUND)\n\n")
+                  s.write(f"### preflight: falcosecurity/falco:{falco_version} (NOT FOUND)\n\n")
                   s.write(f"- タグが存在しません。利用可能な数値タグ: {available}\n\n")
               sys.exit(1)
           PYEOF
 
       - name: Analyze capture
         id: analyze
-        # falco_cicd_rules.yaml (required_engine_version: 0.43.0) を
-        # falco-version: 0.39.2 (falco-no-driver で確認できる最新版) に
-        # 読ませる。0.39.2 < 0.43.0 のため、falco がルールファイルの
-        # ロードを拒否する可能性がある。continue-on-error はその「拒否」の
-        # 実際の挙動 (起動失敗/警告のみで動く等) を観測するためのもので、
-        # ジョブ全体を落とさない (下の "Record required_engine_version
-        # hypothesis outcome" ステップで結果を記録する)。
+        # cleanup と telemetry 回収を続けるため failure を一旦記録する。
+        # 最後に outcome を検査して、失敗した replay を green としない。
         continue-on-error: true
-        uses: falcosecurity/falco-actions/analyze@558a3ceeee9403e1c875ffbeb704c34c93e24752 # UNPINNED: falco-actions has no git tags, see README
+        uses: fiord/falco-actions/analyze@fix/cicd-rules-mount-path # TEMPORARY: test the fork; pin to a commit SHA after validation
         with:
-          falco-version: "0.39.2" # falcosecurity/falco-no-driver の実際の上限 (メンテナンス終了)。ファイル冒頭のコメント参照
-          # 明示的に渡さないと CI/CD 特化ルールが一切ロードされないため必須。
-          # 絶対パスにしているのは、analyze action がこの値を
-          # `docker run -v $CUSTOM_RULE_FILE:/etc/falco/rules.d/custom_rules.yaml`
-          # にそのまま使うため。相対パスを渡すと Docker が名前付きボリューム
-          # として解釈してしまう既知の落とし穴があるため避ける。
-          custom-rule-file: ${{ github.workspace }}/_falco-actions-src/rules/falco_cicd_rules.yaml
+          falco-image: "falcosecurity/falco"
+          falco-version: "0.44.1"
+          # fork の analyze action が追加した入力。action 内の同梱ルールを
+          # 読ませるため、外部 checkout や custom-rule-file は不要。
+          cicd-rules: true
           # T2 (何が取得・閲覧できるか) を確認するため、抽出できる情報は
           # すべて有効化する。
           extract-connections: true
@@ -381,17 +346,9 @@ jobs:
           extract-hashes: true
           verbose: true
 
-      - name: "Record required_engine_version hypothesis outcome (T1 中核観測)"
-        # falco_cicd_rules.yaml (required_engine_version: 0.43.0) を、
-        # falco-actions が実際に使える上限バージョン (falco-version: 0.39.2)
-        # のエンジンに読ませた結果を記録する。「falco-actions は自身の同梱
-        # CI/CD ルールが要求するエンジンバージョンを満たすイメージを pull
-        # できない可能性が高い」という仮説の検証データ。ロード成功/拒否/
-        # 警告のみのいずれだったかは "Analyze capture" ステップの生ログ
-        # (verbose: true) を目視確認する必要がある (falco の起動出力は
-        # ワークフロー側からファイルとして回収できないため)。ここでは
-        # ステップの outcome と、生成された telemetry の有無を手がかりとして
-        # job summary に残す。
+      - name: "Record forked analyze outcome (T1)"
+        # fork・maintained image・自動 CI/CD rule 読込みを使った replay の
+        # outcome と、抽出ファイルの有無を job summary に残す。
         if: always()
         run: |
           set -uo pipefail
@@ -405,21 +362,17 @@ jobs:
           fi
           {
             echo ""
-            echo "## required_engine_version 0.43.0 vs falco 0.39.2 (T1 中核観測)"
+            echo "## forked analyze rule-loading outcome (T1)"
             echo ""
-            echo "- falco-actions 同梱の CI/CD ルール (rules/falco_cicd_rules.yaml) の"
-            echo "  \`required_engine_version\`: \`0.43.0\`"
-            echo "- 実際に使ったエンジン (falco-version): \`0.39.2\`"
-            echo "  (falcosecurity/falco-no-driver で確認できる事実上の上限)"
+            echo "- action: \`fiord/falco-actions@fix/cicd-rules-mount-path\`"
+            echo "- engine: \`falcosecurity/falco:0.44.1\`"
+            echo "- CI/CD rules: \`cicd-rules: true\` (fork action が同梱ルールを自動ロード)"
             echo "- \`Analyze capture\` ステップの outcome: \`${{ steps.analyze.outcome }}\`"
             echo "- 傍証: sysdig capture から抽出された \`/tmp/proc.txt\` の有無: ${PROC_HAS_CONTENT}"
-            echo "  (falco 自体が起動・ルール評価を完了していれば、通常はここが"
-            echo "  空でなくなるはず。空、またはステップ自体が failure の場合は"
-            echo "  required_engine_version による拒否を疑う根拠になる)"
+            echo "  (空、または failure の場合は action の生ログと telemetry manifest を確認する)"
             echo ""
-            echo "**要手動確認**: \`Analyze capture\` ステップの生ログ (verbose 出力) に"
-            echo "\`required_engine_version\` / \`engine version\` に関する記述が無いか確認し、"
-            echo "docs/RESULTS-TEMPLATE.md の該当欄 (ロード成功 / 拒否 / 警告のみで通過) を埋めること。"
+            echo "fork action は、要求した CI/CD rules が Falco の Loading rules from: 出力に"
+            echo "現れない場合に失敗する。成功時も起動ログを telemetry と job log で確認すること。"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Collect telemetry (T2)
@@ -433,16 +386,11 @@ jobs:
           fi
 
           # 期待するテレメトリファイル (extract-* / hashes 入力をすべて true
-          # にしているため、9 ファイルすべてが期待値)。"Analyze capture"
-          # ステップには continue-on-error: true が付いている
-          # (required_engine_version の不整合を実際に観測するため) ため、
-          # analyze action がエンジンのロード拒否等で実質的に失敗しても
-          # ジョブ自体は続行してしまう。その結果 telemetry-falco-analyze の
-          # 中身が job-summary.md だけという「収集不完全なのに成功扱い」の
-          # 成果物が上がりうる (sensor-monitor.yml / sensor-enforce.yml で
-          # 実地確認した不具合と同種のもの)。ここで期待ファイルの取得可否を
-          # telemetry-manifest.txt / job summary に明記し、1つも取得できて
-          # いなければこのジョブを失敗させる (docs/SPEC.md §6)。
+          # にしているため、9 ファイルすべてが期待値)。"Analyze capture" は
+          # cleanup と回収のため continue-on-error: true にしている。期待
+          # ファイルの取得可否を telemetry-manifest.txt / job summary に明記し、
+          # 1つも取得できなければこのジョブを失敗させる。replay の失敗自体も
+          # 最終ステップで必ず失敗として扱う (docs/SPEC.md §6)。
           expected_files="hashes.txt outbound.txt proc.txt files_written.txt dns_extract_json.txt containers.txt udp_extract.txt top_connection.txt topprocs_net.txt"
           total=0
           found=0
@@ -515,10 +463,9 @@ jobs:
           retention-days: ${{ (inputs.upload_raw_capture == true || inputs.upload_raw_capture == 'true') && 1 || 7 }}
 
       - name: Enforce artifact retention (delete raw "capture" / "hashes" uploaded by falco-actions)
-        # falco-actions/stop (analyze mode) uploads "capture" (capture.scap)
-        # and "hashes" unconditionally, with no retention-days override and
-        # no way to suppress the upload from our side (see the workflow
-        # header comment). We already folded the information we want to
+        # The forked stop action uploads "capture" (capture.scap) and "hashes"
+        # with the explicit one-day retention passed above. We already folded
+        # the information we want to
         # keep into telemetry-falco-analyze (retention-days: 1, and only
         # containing capture.scap when upload_raw_capture=true), so the
         # originals are deleted here to minimize retention/exposure
@@ -539,3 +486,11 @@ jobs:
               echo "Artifact '${name}' not found (already absent or upload failed); nothing to delete"
             fi
           done
+
+      - name: Fail if Falco replay did not complete
+        if: always()
+        run: |
+          if [ "${{ steps.analyze.outcome }}" != "success" ]; then
+            echo "::error::Forked Falco analyze failed; telemetry and cleanup ran, but this run must not be reported as a successful detection test."
+            exit 1
+          fi
