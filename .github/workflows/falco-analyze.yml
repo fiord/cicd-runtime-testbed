@@ -358,6 +358,7 @@ jobs:
           else
             PROC_HAS_CONTENT="no (/tmp/proc.txt was not created)"
           fi
+          OUTCOME_FILE="${RUNNER_TEMP}/forked-analyze-outcome.md"
           {
             echo ""
             echo "## forked analyze rule-loading outcome (T1)"
@@ -371,7 +372,10 @@ jobs:
             echo ""
             echo "fork action は、要求した CI/CD rules が Falco の Loading rules from: 出力に"
             echo "現れない場合に失敗する。成功時も起動ログを telemetry と job log で確認すること。"
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # GITHUB_STEP_SUMMARY is step-scoped. Keep an explicit evidence file
+          # for the later telemetry upload instead of attempting to copy a
+          # different step's summary file.
+          } | tee "$OUTCOME_FILE" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Collect telemetry (T2)
         id: collect_telemetry
@@ -379,9 +383,7 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p telemetry
-          if [ -f "$GITHUB_STEP_SUMMARY" ]; then
-            cp "$GITHUB_STEP_SUMMARY" telemetry/job-summary.md
-          fi
+          OUTCOME_FILE="${RUNNER_TEMP}/forked-analyze-outcome.md"
 
           # 期待するテレメトリファイル (extract-* / hashes 入力をすべて true
           # にしているため、9 ファイルすべてが期待値)。"Analyze capture" は
@@ -399,6 +401,14 @@ jobs:
             echo "# analyze job of falco-analyze.yml (run ${{ github.run_id }})"
             echo "# format: <expected-file>: OK | MISSING"
           } > telemetry/telemetry-manifest.txt
+
+          if [ -s "$OUTCOME_FILE" ]; then
+            cp "$OUTCOME_FILE" telemetry/forked-analyze-outcome.md
+            echo "forked-analyze-outcome.md: OK" >> telemetry/telemetry-manifest.txt
+          else
+            echo "forked-analyze-outcome.md: MISSING" >> telemetry/telemetry-manifest.txt
+            echo "::warning::forked analyze outcome file was not created; consult the GitHub job log for T1 evidence."
+          fi
 
           for f in ${expected_files}; do
             total=$((total + 1))
