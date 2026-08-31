@@ -5,12 +5,13 @@
 
 ## 根拠と対象
 
-- 対象 run: [falco-live 33311769634](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33311769634)、[sensor-monitor 33311807928](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33311807928)、[falco-analyze 33345976191](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33345976191)。
+- 対象 run: [falco-live 33311769634](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33311769634)、[sensor-monitor 33311807928](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33311807928)、[falco-analyze 33345976191](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33345976191)、[falco-analyze 33346627573](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33346627573)。
 - 最初の2 run は `workflow_dispatch`、実行時のコミット SHA は
   `7cbe678195aa2f53a7b9543ea33d000fcf0149d2`。falco-analyze も
   `workflow_dispatch` で、実行時 SHA は `74ee160d13b5b8af34d839818222477b5e9640bf`。
-- `be2c13e`（telemetry に replay outcome を保存する修正）は analyze run より後の
-  ため未検証である。ここに明記した run 以外の変更を、実測根拠に混ぜない。
+- 2回目の falco-analyze は `658ae96c90b2c6b42b08dd99b30884a35c471a34` で実行し、
+  `be2c13e`（telemetry に replay outcome を保存する修正）を含む。ここに明記した
+  run 以外の変更を、実測根拠に混ぜない。
 - `gh run view` でジョブ・ステップを確認し、`gh run download` で telemetry
   artifact を展開した。カナリア比較には `tools/scan-leaks.sh` を使った。
 
@@ -131,8 +132,22 @@ path を含む。カナリア以外の runner 環境情報も artifact に残る
 この run で `telemetry-falco-analyze/job-summary.md` が 0 byte だった。
 `$GITHUB_STEP_SUMMARY` は step ごとに別ファイルであり、次 step が前 step の
 内容をコピーできないためである。`be2c13e` で専用の
-`forked-analyze-outcome.md` を telemetry に保存するよう修正した。この修正は
-まだ GitHub Actions で未検証である。
+`forked-analyze-outcome.md` を telemetry に保存するよう修正した。
+
+### Falco analyze — run 33346627573（修正の再検証）
+
+`658ae96` で成功した。`/etc/falco/rules.d/cicd_rules.yaml` の schema validation、
+CI/CD rules の load guard、`Events detected: 4` が job log で確認でき、replay の
+クラッシュはなかった。4件の内訳は前 run と同じである。
+
+`telemetry-falco-analyze/forked-analyze-outcome.md` は 688 byte で回収され、
+manifest も `OK` となった。従って `be2c13e` の修正は実機で有効である。artifact
+は telemetry だけ（12,080 byte、7日）で、`capture` と `hashes` の削除も job log
+で確認した。`capture.scap` は既定どおり再アップロードされなかった。
+
+再走査の結果も DNS と path カナリアだけが検出された。なお
+`CANARY_ARGV_SHORT` は期待値が `leak` である一方、Falco telemetry では未検出であり、
+既知の「Falco は curl の argv を出力しない」という制約と整合する。
 
 ## 現時点の結論と次の確認
 
@@ -141,7 +156,7 @@ path を含む。カナリア以外の runner 環境情報も artifact に残る
 - cicd-sensor は検知・report/attestation 回収まで動作した。ただし standalone
   の predicate は集計であり、HTML report の露出範囲を別途確認する必要がある。
 - 今回は runner token の形式検出が0件だった。しかし `falco-analyze.yml` の
-  raw `capture.scap` は別のリスク面であり、この3 run は安全性の証明にならない。
+  raw `capture.scap` は別のリスク面であり、この4 run は安全性の証明にならない。
 - 現行 workflow が再アップロードする telemetry の保持期間はコード上7日。
   raw `capture.scap` を含む `telemetry-falco-analyze` だけは1日である。
 - 次回 Falco run では、シナリオ後に drain window を置き、イベントの遅延と
