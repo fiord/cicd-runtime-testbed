@@ -8,10 +8,9 @@
 - 対象 run: [falco-live 33311769634](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33311769634)、[sensor-monitor 33311807928](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33311807928)。
 - どちらも `workflow_dispatch`、実行時のコミット SHA は
   `7cbe678195aa2f53a7b9543ea33d000fcf0149d2`。
-- 現在のローカル `HEAD` はこの run より後の修正を含む。`falco-live.yml` の
-  観測追記は `b38f9c3`、fork analyze を使う変更は `fe4be82`、文書更新は
-  `f9d7d71` としてコミット済みである。これらは GitHub Actions で未検証のため、
-  この文書の実測根拠には含めない。
+- この run より後に、`falco-live.yml` の観測追記 (`b38f9c3`) と fork analyze を
+  使う変更 (`fe4be82`) を含む修正が加わっている。**実行時 SHA より後の変更は
+  GitHub Actions で未検証**であり、この文書の実測根拠には含めない。
 - `gh run view` でジョブ・ステップを確認し、`gh run download` で telemetry
   artifact を展開した。カナリア比較には `tools/scan-leaks.sh` を使った。
 
