@@ -25,7 +25,7 @@
 #   この結果、monitor_mode はリポジトリ全体で1つの値しか持てず、
 #   sensor-monitor.yml と本ワークフローで切り替えることはできない
 #   (sensor-monitor.yml への影響は同ワークフローのコメントと
-#   README.md「既知の制約」を参照)。
+#   docs/SPEC.md §5 と docs/SAFETY.md を参照)。
 #
 #   なお、ジョブ内のプロセスがワークスペース上の設定ファイルを書き換えて
 #   自分自身への監視を無効化できない、というこの action の挙動自体は
@@ -173,9 +173,9 @@ jobs:
                 echo "未対応のイベント型を使っていないか確認すること。**1本でも無効な"
                 echo "ルールがあると、プロジェクト設定全体 (\`monitor_mode\` を含む) が"
                 echo "agent に届かなくなる** (run 32544606013 で実機確認済み。"
-                echo "README.md \"既知の制約\" 参照)。"
+                echo "docs/SPEC.md §5 / docs/SAFETY.md 参照)。"
               } | tee -a "$GITHUB_STEP_SUMMARY"
-              echo "::error::cicd-sensorctl rule validate failed (exit ${status}). Check whether a rule uses an event type unsupported by the pinned cicd-sensor release (e.g. http_request). Even a single invalid rule discards the ENTIRE project config bundle at agent startup — not just that one rule — so monitor_mode and every other custom rule silently fail to reach the agent too. See README.md known limitations (run 32544606013)."
+              echo "::error::cicd-sensorctl rule validate failed (exit ${status}). Check whether a rule uses an event type unsupported by the pinned cicd-sensor release (e.g. http_request). Even a single invalid rule discards the ENTIRE project config bundle at agent startup — not just that one rule — so monitor_mode and every other custom rule silently fail to reach the agent too. See docs/SPEC.md §5 and docs/SAFETY.md (run 32544606013)."
               exit "${status}"
             fi
           else
@@ -188,7 +188,7 @@ jobs:
               echo "NOT be caught here — it would only surface later, as a project-config"
               echo "fetch failure inside the \"Start cicd-sensor\" step below, which"
               echo "silently discards \`monitor_mode\` and all custom rules if it happens"
-              echo "(see README.md known limitations, run 32544606013)."
+              echo "(see docs/SPEC.md §5 / docs/SAFETY.md, run 32544606013)."
             } | tee -a "$GITHUB_STEP_SUMMARY"
             echo "::warning::cicd-sensorctl not available; rule validation skipped (see job summary — this means an invalid rule would not be caught locally)"
           fi
@@ -508,8 +508,8 @@ jobs:
                           "value is already `false`, then the project config (including "
                           "`monitor_mode`) may not have reached the agent at all — check "
                           "the `Start cicd-sensor` step log in the `enforce` job for a "
-                          "`project config fetch failed` warning (see README.md known "
-                          "limitations, run 32544606013 / 32545681004).\n"
+                          "`project config fetch failed` warning (see docs/SPEC.md §5, "
+                          "run 32544606013 / 32545681004).\n"
                       )
 
           if verdict == "inconclusive":

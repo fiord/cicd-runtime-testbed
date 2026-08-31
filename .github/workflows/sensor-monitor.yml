@@ -24,7 +24,7 @@
 #   ワークフローからは実行しない (sensor-enforce.yml 専用) ため発火しない。
 #   ベースラインルールで action: terminate を持つものの列挙と、この
 #   ワークフローが実行する scenarios/00〜07 がそれらに触れないことの
-#   根拠は .cicd-sensor/config.yaml のコメントと README.md「既知の制約」
+#   根拠は .cicd-sensor/config.yaml のコメントと docs/SPEC.md §5
 #   を参照。万一将来シナリオが変更されてベースラインの terminate 条件に
 #   触れた場合、このワークフローのジョブも実際に kill されるリスクが
 #   残ることをここに明記しておく。
@@ -89,7 +89,7 @@ jobs:
       # リポジトリにコミットされている .cicd-sensor/config.yaml の内容
       # (現在 monitor_mode: false) だった。読む人を誤解させるだけなので
       # 削除した。詳細は .cicd-sensor/config.yaml のコメントと
-      # docs/SPEC.md §5、README.md「既知の制約」を参照。
+      # docs/SPEC.md §5 と docs/SAFETY.md を参照。
 
       - name: Install cicd-sensorctl
         env:
@@ -160,9 +160,9 @@ jobs:
                 echo "未対応のイベント型を使っていないか確認すること。**1本でも無効な"
                 echo "ルールがあると、プロジェクト設定全体 (\`monitor_mode\` を含む) が"
                 echo "agent に届かなくなる** (run 32544606013 で実機確認済み。"
-                echo "README.md \"既知の制約\" 参照)。"
+                echo "docs/SPEC.md §5 / docs/SAFETY.md 参照)。"
               } | tee -a "$GITHUB_STEP_SUMMARY"
-              echo "::error::cicd-sensorctl rule validate failed (exit ${status}). Check whether a rule uses an event type unsupported by the pinned cicd-sensor release (e.g. http_request). Even a single invalid rule discards the ENTIRE project config bundle at agent startup — not just that one rule — so monitor_mode and every other custom rule silently fail to reach the agent too. See README.md known limitations (run 32544606013)."
+              echo "::error::cicd-sensorctl rule validate failed (exit ${status}). Check whether a rule uses an event type unsupported by the pinned cicd-sensor release (e.g. http_request). Even a single invalid rule discards the ENTIRE project config bundle at agent startup — not just that one rule — so monitor_mode and every other custom rule silently fail to reach the agent too. See docs/SPEC.md §5 and docs/SAFETY.md (run 32544606013)."
               exit "${status}"
             fi
           else
@@ -175,7 +175,7 @@ jobs:
               echo "NOT be caught here — it would only surface later, as a project-config"
               echo "fetch failure inside the \"Start cicd-sensor\" step below, which"
               echo "silently discards \`monitor_mode\` and all custom rules if it happens"
-              echo "(see README.md known limitations, run 32544606013)."
+              echo "(see docs/SPEC.md §5 / docs/SAFETY.md, run 32544606013)."
             } | tee -a "$GITHUB_STEP_SUMMARY"
             echo "::warning::cicd-sensorctl not available; rule validation skipped (see job summary — this means an invalid rule would not be caught locally)"
           fi
@@ -239,7 +239,7 @@ jobs:
       contents: read
       # cicd-sensor-report.html / cicd-sensor-attestation (monitor ジョブが
       # アップロードした, retention 未指定のアーティファクト) を回収し、
-      # retention-days: 1 の telemetry-cicd-sensor-monitor に詰め直したうえで
+      # retention-days: 7 の telemetry-cicd-sensor-monitor に詰め直したうえで
       # 元のアーティファクトを削除するため write が必要。
       actions: write
     steps:
@@ -367,8 +367,9 @@ jobs:
 
       - name: Enforce artifact retention (delete original cicd-sensor-report.html / cicd-sensor-attestation)
         # cicd-sensor-action uploads these itself with no retention-days
-        # override we control (docs/SPEC.md §1-5 requires retention-days: 1
-        # everywhere). We keep our own copy above and delete the originals.
+        # override we control. docs/SPEC.md §1-5 requires explicitly setting
+        # retention by artifact sensitivity. We keep our own copy above and
+        # delete the originals.
         # if: always() so cleanup still runs even if "Summarize telemetry
         # collection" above failed the job (0 artifacts collected case).
         if: always()

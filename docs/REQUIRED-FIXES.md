@@ -55,9 +55,10 @@ T1/T2/T3 のいずれも、falco 側の数字は「検知性能が低い」で�
 > `/etc/falco/rules.d/cicd_rules.yaml | schema validation: ok` が出ることを
 > CI 実機で確認済み。
 >
-> ただし **upstream への PR・issue は一切出しておらず、ブランチ
-> (`fix/cicd-rules-mount-path`) 自体も push していない**。draft の PR 文面は
-> fork 側の `PR_BODY.md` に用意済み。4節「F-1 を upstream に PR」は
+> ただし **upstream への PR・issue は一切出していない**。fork branch
+> `fix/cicd-rules-mount-path` は GitHub 上で `2d2cbda` を指し、testbed の
+> live run から参照済みである。draft の PR 文面は fork 側の `PR_BODY.md` に
+> 用意済み。4節「F-1 を upstream に PR」は
 > 依然として最優先で未着手のまま。
 
 `start/action.yaml` (upstream `main`, 2026-08-28 時点):
@@ -373,9 +374,8 @@ step summary は **check-runs API から取得できない**ため、
 > 戻す条件式にした:
 > `retention-days: ${{ (inputs.upload_raw_capture == true || inputs.upload_raw_capture == 'true') && 1 || 7 }}`
 > (boolean 入力が boolean で来る場合と文字列で来る場合の両方を受ける)。
-> fork stop action に `capture-retention-days` / `hashes-retention-days`
-> 入力を加え、workflow は両方を 1 日に設定した。使用後の即時削除処理も
-> 維持する。
+> OSS action の既定保持期間を testbed 用に変えることは互換性を損なうため行わない。
+> workflow 側で使用後の即時削除処理を維持する。
 
 変更前は `retention-days: 1` のため、数日で全証跡が消えていた。
 public repo での secret 露出を避ける設計意図は理解できるが、

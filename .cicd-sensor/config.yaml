@@ -83,6 +83,6 @@
 #         monitor_mode: false のこの状態では実際にジョブが kill される。**
 #         これは sensor-monitor.yml が本来「検知のみで kill しない」こと
 #         を目的としたワークフローであることに対するリスクとして、
-#         正直に記載しておく (README.md「既知の制約」参照)。
+#         正直に記載しておく (docs/SPEC.md §5、docs/SAFETY.md 参照)。
 monitor_mode: false
 default_max_alerts_per_rule: 50

@@ -128,9 +128,8 @@ public repo でこれを常時公開すると、意図しない情報漏洩の�
 
 **ただし完全な「既定でアップロードしない」は達成できていない**: fork の
 stop action (analyze モード) は `capture.scap` を無条件にアップロードする。
-fork で `capture-retention-days` / `hashes-retention-days` 入力を追加し、
-この workflow はともに 1 日を渡す。それでも capture のアップロード自体を抑止する
-入力はないため、`falco-analyze.yml` は使用直後に GitHub API で削除する。
+OSS action の既定保持期間を testbed 都合で短縮しないため、capture のアップロード
+自体を抑止・短縮する入力はない。`falco-analyze.yml` は使用直後に GitHub API で削除する。
 削除が完了するまでの数秒〜数十秒は、public repo では誰でもダウンロードできる。
 
 **`falco-analyze.yml` は public repo で実行してよく、ジョブを停止するガードは
@@ -188,7 +187,8 @@ public repo で実行すると、`Notice: raw capture exposure on a public repos
 - [ ] `falco-analyze.yml` を public repo で走らせる前提 (本物の secret が無い、
       `actions: write` は raw artifact cleanup に限定される、`actions/cache` を使っていない) を
       fork 先で崩していないか。崩した場合は public repo での実行可否を再評価したか
-- [ ] トリガーを `push` / `pull_request` に変えていないか (`workflow_dispatch` のみを維持する)
+- [ ] トリガーを `push` / `pull_request` に変えていないか（検知 workflow は
+      `workflow_dispatch` のみ、`leak-scan.yml` の `workflow_run` は意図した例外）
 - [ ] fork のブランチ参照 (`falco-live.yml` の `live-forked` と
       `falco-analyze.yml` が使う
       `fiord/falco-actions/*@fix/cicd-rules-mount-path`) が、

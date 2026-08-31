@@ -19,7 +19,8 @@
 
 ## 実行するワークフロー
 
-すべて `workflow_dispatch` のみで起動します。
+検知 workflow は `workflow_dispatch` のみで起動します。`leak-scan.yml` は
+手動起動に加え、検知 workflow の完了時に `workflow_run` で自動起動します。
 
 | workflow | 内容 | 正常とみなす条件 |
 | --- | --- | --- |
@@ -44,9 +45,9 @@
 
 ## 証跡の扱い
 
-このリポジトリが再アップロードする telemetry artifact は、現行コードでは
-`retention-days: 7` です。元 action が作る artifact は回収後に削除を試みますが、
-アップロードから削除までの短時間は閲覧可能です。生の `capture.scap` を扱う
-`falco-analyze.yml` は特に注意してください。
+加工済み telemetry は `retention-days: 7` です。`upload_raw_capture: true` で
+生の `capture.scap` を含めた `telemetry-falco-analyze` だけは 1 日です。元 action
+が作る artifact は回収後に削除を試みますが、アップロードから削除までの短時間は
+閲覧可能です。
 
 詳細な証跡形式、カナリアごとの期待値、過去の障害経緯は `docs/` に置きます。

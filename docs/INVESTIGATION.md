@@ -6,9 +6,12 @@
 ## 根拠と対象
 
 - 対象 run: [falco-live 33311769634](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33311769634)、[sensor-monitor 33311807928](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33311807928)。
-- どちらも `workflow_dispatch`、コミット SHA は `7cbe678195aa2f53a7b9543ea33d000fcf0149d2`。
-- ローカル `HEAD` も同じ SHA。`falco-live.yml` の未コミット 394 行の追記は
-  この run の**後**に加えられたもので、実測の根拠には含めない。
+- どちらも `workflow_dispatch`、実行時のコミット SHA は
+  `7cbe678195aa2f53a7b9543ea33d000fcf0149d2`。
+- 現在のローカル `HEAD` はこの run より後の修正を含む。`falco-live.yml` の
+  観測追記は `b38f9c3`、fork analyze を使う変更は `fe4be82`、文書更新は
+  `f9d7d71` としてコミット済みである。これらは GitHub Actions で未検証のため、
+  この文書の実測根拠には含めない。
 - `gh run view` でジョブ・ステップを確認し、`gh run download` で telemetry
   artifact を展開した。カナリア比較には `tools/scan-leaks.sh` を使った。
 

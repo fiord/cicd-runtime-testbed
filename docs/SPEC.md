@@ -1006,8 +1006,9 @@ predicate（集計レベル）しか無い状況では原理的に観測でき�
 - `permissions:` は各ワークフローで明示的に最小化する
 - `runs-on` は §8 の表に従う
 - すべての `uses:` は**コミット SHA でピン留め**し、行末コメントにバージョンを書く。
-  **例外 (検証用・一時的)**: `falco-live.yml` の `live-forked` ジョブが使う
-  `fiord/falco-actions/start` / `stop`（自分 (fiord) が管理する fork）のみ、
+  **例外 (検証用・一時的)**: `falco-live.yml` の `live-forked` と
+  `falco-analyze.yml` が使う `fiord/falco-actions/start` / `stop` / `analyze`
+  （自分 (fiord) が管理する fork）のみ、
   `fix/cicd-rules-mount-path` ブランチへの継続的な追加修正を追随するため、
   SHA pin ではなくブランチ参照にしている。upstream
   (`falcosecurity/falco-actions`、`live` ジョブ) 側は SHA pin のまま維持する。
@@ -1018,7 +1019,7 @@ predicate（集計レベル）しか無い状況では原理的に観測でき�
 | ワークフロー | runs-on | 目的 | 特記事項 |
 | --- | --- | --- | --- |
 | `falco-live.yml` | `ubuntu-latest` | falco live モードでの検知、および upstream falco-actions の cicd-rules マウントパスバグと fork 修正版の比較 | **2 ジョブ / 3 leg 構成。** `live` ジョブ: upstream `falcosecurity/falco-actions` を使い、`falco-version` を `0.39.0` と `0.39.2` の matrix にする（使用イメージは `falcosecurity/falco-no-driver` にハードコードされている）。`live-forked` ジョブ: fork 修正版 `fiord/falco-actions@fix/cicd-rules-mount-path`（ブランチ参照。**検証用の一時的な例外** — 上記「全ワークフロー共通」参照。修正の起点は commit 360d62c72985b790bff96abde043b14ae053efe5、https://github.com/fiord/falco-actions/commit/360d62c72985b790bff96abde043b14ae053efe5 ）を使う。この fork ブランチは cicd-rules のマウントパス修正に加え、使用イメージ自体も `falcosecurity/falco-no-driver` から、維持されている `falcosecurity/falco` に切り替えているため、`live-forked` ジョブの `falco-version` は `0.44.1`（falcosecurity/falco の Docker Hub 上の実際の最新）固定の 1 leg にする（`uses:` に式を使えないため、action 参照先を matrix で切り替えられず別ジョブにする必要がある）。upstream の `start/action.yaml:70` は CI/CD ルール（`cicd-rules`、既定 `true`）のマウント元パスが `github.action_path`（`start/` を指す）からの相対パスになっており、実体であるリポジトリ直下の `rules/` を指せず、CI/CD ルールが一度もロードされない（デフォルト動作で検知が 0 件になるバグ）。fork 修正版はこのパスを `../rules/...` に修正済み。両ジョブとも起動ログ（`falco_start_logs.txt`）から `cicd_rules.yaml` / `rules.d` への言及の有無を判定し job summary に記録する（観測目的でジョブは失敗させない）。**なぜ upstream leg (`live` ジョブ) は 0.39.x が上限か**: falcosecurity/falco-no-driver イメージ（falco-actions がハードコードして使う）は Docker Hub 上の数値タグが `0.39.2` で公開停止しているため、`required_engine_version: 0.43.0` を満たすバージョンはそもそも指定できない。`live-forked` ジョブは維持されている `falcosecurity/falco` イメージを使うため、`required_engine_version: 0.43.0` を満たす `0.44.1` を指定できる。**`live-forked` ジョブが検証したいのは次の3点**: (1) 維持されているイメージの新しい Falco (0.44.1) が現在のランナーのカーネル (6.17) で起動し続けられるか、(2) `cicd-rules` のパス修正により CI/CD 特化ルールがロードされるか、(3) 実際に検知イベントが出るか。各ジョブは falco-actions を呼ぶ前に Docker Hub のタグ API を叩く preflight ステップでタグの実在を確認する（`live` ジョブは `falcosecurity/falco-no-driver`、`live-forked` ジョブは `falcosecurity/falco` を対象にする）。`fail-fast: false`（ただし preflight 自体がタグ不在で失敗した場合はそのジョブを fail-fast させてよい。原因が明確なため）。3 leg はそれぞれ異なるテレメトリアーティファクト名（`telemetry-falco-live-0.39.0` / `telemetry-falco-live-0.39.2` / `telemetry-falco-live-forked-0.44.1`）を使う |
-| `falco-analyze.yml` | `ubuntu-latest` | falco analyze モードでの検知と生キャプチャ | fork `fiord/falco-actions@fix/cicd-rules-mount-path` の `start` / `stop` / `analyze` を使う一時的な branch 参照。`analyze` には `falcosecurity/falco:0.44.1` と `cicd-rules: true` を渡し、同梱 CI/CD ルールを自動ロードする。外部 checkout と `custom-rule-file` は不要。preflight はこのイメージタグの実在を確認する。`upload_raw_capture` 入力で scap の再アップロードを制御（既定 `false`）。fork stop action の `capture` / `hashes` artifact は `retention-days: 1` を明示し、analyze job が使用後に削除する。cleanup と telemetry 回収のため replay は一時的に `continue-on-error` とするが、最終ステップで replay failure を必ず job failure とする。`record` job は `contents: read`、raw artifact を削除する `analyze` job は `contents: read, actions: write` を持つ。public リポジトリで実行された場合は、`capture.scap` に何が入りうるかを `::warning::` と job summary で告知する情報提供ステップのみを置く |
+| `falco-analyze.yml` | `ubuntu-latest` | falco analyze モードでの検知と生キャプチャ | fork `fiord/falco-actions@fix/cicd-rules-mount-path` の `start` / `stop` / `analyze` を使う一時的な branch 参照。`analyze` には `falcosecurity/falco:0.44.1` と `cicd-rules: true` を渡し、同梱 CI/CD ルールを自動ロードする。外部 checkout と `custom-rule-file` は不要。preflight はこのイメージタグの実在を確認する。`upload_raw_capture` 入力で scap の再アップロードを制御（既定 `false`）。stop action が作る `capture` / `hashes` artifact は通常の保持期間で一度アップロードされるが、analyze job が使用後に削除する。cleanup と telemetry 回収のため replay は一時的に `continue-on-error` とするが、最終ステップで replay failure を必ず job failure とする。`record` job は `contents: read`、raw artifact を削除する `analyze` job は `contents: read, actions: write` を持つ。public リポジトリで実行された場合は、`capture.scap` に何が入りうるかを `::warning::` と job summary で告知する情報提供ステップのみを置く |
 | `sensor-monitor.yml` | `ubuntu-24.04` | cicd-sensor の検知（自作ルールでの kill は起きない想定） | `monitor_mode` はコミット値で `false`（§5。config.yaml はコミット SHA から取得されるため、`monitor_mode` はワークフローごとに切り替えられずリポジトリ全体で共通。§5「sensor-monitor.yml への影響」参照）。全シナリオを実行 |
 | `sensor-enforce.yml` | `ubuntu-24.04` | cicd-sensor の kill 動作 | `monitor_mode` はコミット値で `false`（上記と同一の値。§5）。§5 の 2 ジョブ構成。`90-killme.sh` は `load_canaries` を呼ばずカナリアを注入しないため、**この run の run_id は `leak-scan.yml` の対象にできない**（§4、§7） |
 | `leak-scan.yml` | `ubuntu-latest` | 漏洩マトリクスの生成 | 対象 run のアーティファクトを DL して走査。起動方法は 2 つ: (1) `workflow_run` で `falco-live` / `falco-analyze` / `sensor-monitor` の完了時に自動起動（対象は `github.event.workflow_run.id`）、(2) `workflow_dispatch` で run_id を手入力（過去 run の測り直し用）。両者はワークフローレベルの `env: TARGET_RUN_ID` に一本化する。`conclusion` が cancelled / skipped の run はスキップするが **failure はスキップしない**（テレメトリのアップロードは `if: always()` のため残っており走査価値がある）。ダウンロード結果が空、または `telemetry-cicd-sensor-enforce` のみだった場合はジョブを早期に落とすガードを持つ（§7）。**`gh workflow run` による自動起動は採れない**: GITHUB_TOKEN で起動した `workflow_dispatch` は GitHub の再帰防止により新しい run を作らない（docs/REQUIRED-FIXES.md R-10） |
@@ -1035,8 +1036,8 @@ predicate（集計レベル）しか無い状況では原理的に観測でき�
 - `falco-actions`: upstream は `558a3ceeee9403e1c875ffbeb704c34c93e24752` に pin する。
   タグがないため更新時は実在する commit SHA を確認して置換する。推測の SHA や
   プレースホルダを実行可能な workflow に残さない。
-- `live-forked` ジョブが使う fork (`fiord/falco-actions`) のみ、検証用の一時的な
-  例外としてブランチ参照 (`fix/cicd-rules-mount-path`) を使ってよい。検証完了後は
+- `live-forked` と `falco-analyze.yml` が使う fork (`fiord/falco-actions`) のみ、
+  検証用の一時的な例外としてブランチ参照 (`fix/cicd-rules-mount-path`) を使ってよい。検証完了後は
   SHA pin に戻すこと（上記「全ワークフロー共通」参照）
 
 ---
