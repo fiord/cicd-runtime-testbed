@@ -15,8 +15,8 @@
 # 安全性 (docs/SPEC.md §1-6):
 #   falco-actions の stop action (analyze モード) は capture.scap を
 #   無条件に "capture" という名前のアーティファクトとしてアップロードする
-#   (falco-actions のコードにハードコードされており、抑止する入力は無い。
-#   元リポジトリは変更しないため、この動作自体は変えられない)。
+#   (falco-actions のコードにハードコードされており、抑止する入力は無い)。
+#   fork も OSS 利用者との互換性のため、この upload と保持期間の既定を変えない。
 #   このワークフローは、それを埋め合わせるため:
 #     1. workflow_dispatch 入力 `upload_raw_capture` が true のときだけ、
 #        capture.scap を自分たち自身のアーティファクト
@@ -44,16 +44,16 @@
 #     1. capture.scap に入りうるカナリア値はすべて偽物で、リポジトリに
 #        コミット済み。公開されても失うものがない (docs/SAFETY.md 1節)。
 #     2. このワークフローが実際に持つ本物の認証情報は次の2つだけ:
-#        - GITHUB_TOKEN: 宣言している権限は `contents: read` のみ。
-#          public リポジトリではこれは「誰でも読み取れる情報」に対する
-#          権限に過ぎず、しかもジョブ完了時に失効する。
+#        - GITHUB_TOKEN: record job は `contents: read` のみだが、analyze job は
+#          artifact cleanup のため `actions: write` も持つ。どちらもジョブ
+#          完了時に失効するが、後者が漏れれば artifact を削除できる。
 #        - ACTIONS_RUNTIME_TOKEN: run 中のみ有効な内部トークン。悪用の
 #          本命経路は actions/cache への汚染だが、このリポジトリは
 #          actions/cache を使っていないため、その経路自体が存在しない。
 #     3. `id-token: write` を宣言していないため、
 #        ACTIONS_ID_TOKEN_REQUEST_TOKEN は存在しない。
 #     4. 残るリスクは「このテストリポジトリ自身のアーティファクトを
-#        他人が上書きできるかもしれない」程度であり、T3 (capture.scap
+#        削除できる」程度であり、T3 (capture.scap
 #        から実際に何が漏れるかを自分の目で確かめる) の検証価値の
 #        ほうが上回る。
 #
@@ -64,7 +64,8 @@
 #
 #   再評価が必要な条件 (次のいずれかが起きたら、この判断を見直すこと):
 #     - リポジトリに本物の secret を追加した場合
-#     - `contents: write` や `id-token: write` を宣言した場合
+#     - `contents: write`、`id-token: write`、または cleanup 以外の
+#       `actions: write` を宣言した場合
 #     - `actions/cache` を使い始めた場合
 #
 #   下の "Notice: raw capture exposure on a public repository" ステップは
@@ -146,14 +147,15 @@ jobs:
             echo
             echo "| トークン | 宣言権限 / 有効範囲 | 失効タイミング | 悪用の本命経路 |"
             echo "| --- | --- | --- | --- |"
-            echo "| \`GITHUB_TOKEN\` | \`contents: read\` のみ (このリポジトリの permissions 宣言)。public repo では誰でも同じ読み取りができる情報への権限に過ぎない | ジョブ完了時に失効 | (該当なし。write 系権限を宣言していない) |"
+            echo "| \`GITHUB_TOKEN\` (record job) | \`contents: read\` のみ。capture を作る job の token | ジョブ完了時に失効 | public 情報の読取り |"
+            echo "| \`GITHUB_TOKEN\` (analyze job) | \`contents: read, actions: write\`。capture / hashes artifact の削除に限定 | ジョブ完了時に失効 | このリポジトリの Actions artifact を削除可能 |"
             echo "| \`ACTIONS_RUNTIME_TOKEN\` | run 中のみ有効な内部トークン | run 終了時 | \`actions/cache\` への汚染が本命だが、このリポジトリは \`actions/cache\` を使っていないためその経路は存在しない |"
             echo
             echo "\`id-token: write\` を宣言していないため \`ACTIONS_ID_TOKEN_REQUEST_TOKEN\`"
             echo "は存在しない。"
             echo
             echo "**この評価はこのリポジトリの現状に依存する。** リポジトリに本物の secret を"
-            echo "追加した場合、\`contents: write\` / \`id-token: write\` を宣言した場合、"
+            echo "追加した場合、\`contents: write\` / \`id-token: write\` / cleanup 以外の \`actions: write\` を宣言した場合、"
             echo "\`actions/cache\` を使い始めた場合は、この判断を再評価すること"
             echo "(詳細は docs/SAFETY.md 6節 / このファイル冒頭のコメント)。"
           } | tee -a "$GITHUB_STEP_SUMMARY"
@@ -208,10 +210,6 @@ jobs:
         with:
           mode: analyze
           verbose: true
-          # The fork explicitly bounds the temporary raw artifacts. They are
-          # still deleted by the analyze job after it consumes them.
-          capture-retention-days: 1
-          hashes-retention-days: 1
 
   analyze:
     name: "analyze (falco replay)"
@@ -463,9 +461,8 @@ jobs:
           retention-days: ${{ (inputs.upload_raw_capture == true || inputs.upload_raw_capture == 'true') && 1 || 7 }}
 
       - name: Enforce artifact retention (delete raw "capture" / "hashes" uploaded by falco-actions)
-        # The forked stop action uploads "capture" (capture.scap) and "hashes"
-        # with the explicit one-day retention passed above. We already folded
-        # the information we want to
+        # The stop action uploads "capture" (capture.scap) and "hashes" with
+        # the repository's normal artifact retention. We already folded the information we want to
         # keep into telemetry-falco-analyze (retention-days: 1, and only
         # containing capture.scap when upload_raw_capture=true), so the
         # originals are deleted here to minimize retention/exposure
