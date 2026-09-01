@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cicd-sensor report — sanitized example</title>
+  <style>
+    body { font-family: system-ui, sans-serif; line-height: 1.5; margin: 2rem auto; max-width: 900px; padding: 0 1rem; color: #18212f; }
+    h1, h2 { color: #0b4f6c; }
+    .notice { background: #fff4cc; border-left: 4px solid #d39e00; padding: 1rem; }
+    .meta, th { background: #eef5f8; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+    th, td { border: 1px solid #c8d5dc; padding: .6rem; text-align: left; vertical-align: top; }
+    code { background: #f2f4f5; padding: .1rem .25rem; }
+    .collect { color: #126b37; font-weight: 600; }
+    .detect { color: #8a3b00; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>cicd-sensor HTML report（サニタイズ済みの形式例）</h1>
+  <p class="notice">
+    これは実測 report の構造を説明するためのサンプルです。actor、commit、runner ID、
+    完全な argv、path、接続先は意図的に伏せています。生 report を repository に
+    恒久保存してはいけません。
+  </p>
+
+  <h2>実行の識別情報</h2>
+  <table class="meta">
+    <tr><th>provider</th><td>github-actions</td></tr>
+    <tr><th>project</th><td>owner/repository（実値は伏せる）</td></tr>
+    <tr><th>workflow / run</th><td>workflow 名、run ID、attempt、runner tracking ID</td></tr>
+    <tr><th>revision / actor</th><td>commit SHA、ref、起動者（実値は伏せる）</td></tr>
+  </table>
+
+  <h2>ルール hit の例</h2>
+  <p>実際の report は rule ごとに、event 種別、process、payload、判定 action を保持します。</p>
+  <table>
+    <thead>
+      <tr><th>rule</th><th>event</th><th>process / payload の例</th><th>action</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>testbed_canary_argv_carrier</code></td>
+        <td><code>process_exec</code></td>
+        <td><code>/usr/bin/curl --referer CNRY…</code><br>ancestors: bash → Runner.Worker</td>
+        <td class="collect">collect</td>
+      </tr>
+      <tr>
+        <td><code>testbed_canary_path_probe</code></td>
+        <td><code>file_open</code></td>
+        <td>path: <code>/tmp/CNRY…/marker</code><br>read/write フラグ、実行 process</td>
+        <td class="detect">detect</td>
+      </tr>
+      <tr>
+        <td><code>testbed_canary_http_host</code></td>
+        <td><code>http_request</code></td>
+        <td>host、method、source process（実値は伏せる）</td>
+        <td class="collect">collect</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>この形式から分かること</h2>
+  <ul>
+    <li>検知結果は「何の rule が、どの event に一致したか」を調査できる。</li>
+    <li>同時に argv、path、ネットワーク先、CI/CD メタデータを含み得る。</li>
+    <li>したがって artifact はログではなく、アクセス制御すべき調査データである。</li>
+  </ul>
+</body>
+</html>
