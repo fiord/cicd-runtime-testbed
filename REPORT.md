@@ -6,6 +6,47 @@
 一般化できない箇所は明記する。run と artifact の詳細は
 [docs/INVESTIGATION.md](docs/INVESTIGATION.md) を参照する。
 
+## まず押さえる用語と観測できる範囲
+
+GitHub Actions の **workflow** は YAML で書く自動処理であり、各 **job** は通常、
+一時的な Linux 仮想マシン（**runner**）で実行される。Falco/cicd-sensor は、この
+runner 上で動く process やファイル操作、通信を観察する security action である。
+
+```text
+workflow 開始 → runner 作成 → checkout → security action を起動
+                                      ↓
+                           以後の build/test/deploy を観測
+                                      ↓
+                           post step で artifact を保存
+```
+
+この順序が重要である。security action を起動する**前**の checkout や setup で起きた
+挙動は、原則として観測できない。また runner は job 終了後に破棄されるため、調査用の
+データは **artifact**（Actions に保存するファイル）として明示的に残さなければ失われる。
+
+- **rule（ルール）**: 「どの行為を不審とみなすか」を表す条件。例: 特定の workflow
+  ファイルへの書込み、秘密情報らしい値を含む argv、未知の外部通信。
+- **event（イベント）**: rule 判定の材料となる実行記録。Falco/cicd-sensor は OS が
+  process 実行・file open・network 接続等を行う際の情報を利用する。
+- **eBPF**: Linux kernel の event を比較的低い粒度で取得する仕組み。便利だが、通常の
+  application log より runner の権限・kernel・性能への依存が大きい。
+- **post step**: Actions の通常 step が終わった後にも action が実行する後処理。report
+  upload はここで行われるため、process を terminate すると後処理が途中で欠ける場合がある。
+
+### Falco の二つの mode
+
+- **live mode**: Falco を先に起動し、その後に続く build/test 等をリアルタイムに監視する。
+  ルールに一致した event をその場で JSON/log に記録する。runtime を止める機能は持たない。
+- **analyze mode**: 別 job で syscall の記録（**capture**）を取り、後続 job でそのファイルを
+  replay して解析する。抽出条件を変えて再調査しやすい一方、capture は情報量が大きい。
+
+### cicd-sensor の `monitor_mode`
+
+cicd-sensor は config と rule の action を組み合わせる。本 testbed では
+`monitor_mode: true` を観測中心、`false` を `terminate` を許可する enforcement 側として
+扱う。名前だけで安全性を判断せず、実際に rule hit の `action` と `result` を report で
+確認することが必要である。
+
 ## 先に結論
 
 - **Falco** は syscall/capture から低レベルの行動を広く採取し、後追い解析する。
