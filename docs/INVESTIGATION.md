@@ -1,17 +1,18 @@
 # 実行実態と調査記録
 
-最終確認: 2026-08-31 (JST)。この文書は、説明文ではなくワークフロー・
+最終確認: 2026-09-01 (JST)。この文書は、説明文ではなくワークフロー・
 シナリオ・アーティファクトを読んだ結果を簡潔に記録する。
 
 ## 根拠と対象
 
-- 対象 run: [falco-live 33311769634](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33311769634)、[sensor-monitor 33311807928](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33311807928)、[falco-analyze 33345976191](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33345976191)、[falco-analyze 33346627573](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33346627573)。
+- 対象 run: [falco-live 33311769634](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33311769634)、[sensor-monitor 33311807928](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33311807928)、[falco-analyze 33345976191](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33345976191)、[falco-analyze 33346627573](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33346627573)、[falco-live 33460618900](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33460618900)、[sensor-enforce 33460630300](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33460630300)、[sensor-monitor 33460651460](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33460651460)。
 - 最初の2 run は `workflow_dispatch`、実行時のコミット SHA は
   `7cbe678195aa2f53a7b9543ea33d000fcf0149d2`。falco-analyze も
   `workflow_dispatch` で、実行時 SHA は `74ee160d13b5b8af34d839818222477b5e9640bf`。
 - 2回目の falco-analyze は `658ae96c90b2c6b42b08dd99b30884a35c471a34` で実行し、
   `be2c13e`（telemetry に replay outcome を保存する修正）を含む。ここに明記した
   run 以外の変更を、実測根拠に混ぜない。
+- 直近3 run はすべて `4145b9b9a6b6ce602a470d07b21c48730643ca53` で実行した。
 - `gh run view` でジョブ・ステップを確認し、`gh run download` で telemetry
   artifact を展開した。カナリア比較には `tools/scan-leaks.sh` を使った。
 
@@ -88,6 +89,23 @@ fork の起動ログには、いくつかの TOCTOU mitigation 用 tracepoint �
 live telemetry に生キャプチャが無く、fork のイベントが主に file write に
 限られた今回の観測結果であって、Falco 一般が secret を出力しない証明ではない。
 
+### Falco live — run 33460618900（現行 fork の再検証）
+
+全3 job は success。fork 0.44.1 leg は `cicd_rules.yaml` を実際にロードし、
+`falco_events.json` に8件（scenario 4件、runner の file-command 書込みという
+harness 4件）を保存した。tracepoint の attach 警告は残るが、検知は継続し crash は
+見られなかった。upstream 0.39.0 / 0.39.2 は起動するが同ファイルをロードせず、
+イベントファイルも生成しない。これは比較 workflow が意図する mount-path 差の結果である。
+
+live artifact は3個とも7日保持で、手動の `scan-leaks.sh` では token/JWT形式を
+検出しなかった。Falco の出力テンプレートに依存するカナリアは informational であり、
+生 capture を含まないため `CANARY_SCAP` は N/A となった。
+
+`leak-scan.yml` は falco-live 完了でも自動起動する定義だが、この run には対応する
+自動 run が作成されなかった。一方 sensor-monitor 完了時には自動 run が作成された。
+workflow 名・default branch SHA は定義と一致しており、リポジトリ側で原因を確定できて
+いないため、falco-live の漏洩評価は上記の手動走査で補った。
+
 ### cicd-sensor monitor — run 33311807928
 
 monitor と telemetry collection は success。rule validation も成功し、
@@ -107,6 +125,25 @@ HTML report の解析では 67 rules、warnings 0、`http_request` 対応あり�
 示す。いずれも今回の値は偽カナリアだが、本物の値を同じ経路に載せれば artifact
 へ出る前提で扱う必要がある。predicate には project path、commit SHA、actor、
 runner tracking ID、job/run link、接続先 IP と domain も含まれる。
+
+### cicd-sensor enforce — run 33460630300
+
+workflow は success で、enforce job の exit 130 / failure は想定どおりである。assert は
+`REACHED_AFTER_KILLME` が無いことに加え、HTML report の `testbed_kill_marker` が
+`action: terminate`、`result: terminated` であることを確認して success になった。
+
+report は telemetry に回収できたが、attestation は upload 開始後に finalize されず
+MISSING だった。kill に伴う post-step の中断で起きる既知の race であり、現行コードは
+report を一次証跡、attestation を補助として扱うため、assert の誤成功ではない。
+収集は 1/2 の warning として正しく記録された。
+
+### cicd-sensor monitor — run 33460651460（現行設定の再検証）
+
+rule validation は成功し、report と attestation を2/2回収した。report は67 rules、
+warnings 0、`http_request` の実ヒットあり。自動 leak-scan
+([33460684875](https://github.com/fiord/cicd-runtime-testbed/actions/runs/33460684875)) も成功し、
+argv-short、DNS、path、URL path は意図どおり露出、ENV / file / argv-long /
+argv-flag / URL query / token形式 / JWT形式は未検出だった。
 
 ### Falco analyze — run 33345976191
 
@@ -156,7 +193,7 @@ manifest も `OK` となった。従って `be2c13e` の修正は実機で有効
 - cicd-sensor は検知・report/attestation 回収まで動作した。ただし standalone
   の predicate は集計であり、HTML report の露出範囲を別途確認する必要がある。
 - 今回は runner token の形式検出が0件だった。しかし `falco-analyze.yml` の
-  raw `capture.scap` は別のリスク面であり、この4 run は安全性の証明にならない。
+  raw `capture.scap` は別のリスク面であり、この7 run は安全性の証明にならない。
 - 現行 workflow が再アップロードする telemetry の保持期間はコード上7日。
   raw `capture.scap` を含む `telemetry-falco-analyze` だけは1日である。
 - 次回 Falco run では、シナリオ後に drain window を置き、イベントの遅延と
